@@ -53,7 +53,8 @@ scripts/check-no-media.sh                            # 衛生だけ
 復元（temporal.zig / restore）を変えたときは、合成の較正もやり直す:
 
 ```sh
-scripts/restore-calibrate.sh -j 6    # 3 分前後。結果は tmp/out/restore-calibrate/results.txt
+scripts/restore-calibrate.sh -j 6 -M affine        # 数分。結果は tmp/out/restore-calibrate/affine/results.txt
+scripts/restore-calibrate.sh -j 6 -M translation   # 比較用
 ```
 
 毎フレーム別の模様・静止の行で coverage が 0 でなければ FAIL（動きで説明できない画素を貼っている）。

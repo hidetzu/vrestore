@@ -18,7 +18,8 @@
 - `vrestore restore --roi detection.json --raw out.rgb --provenance out.prov input.mp4` — 検出した ROI の画素を、
   背景が動いて見えている別のフレームの実画素で戻す（Temporal Recovery）。戻せなかった画素は焼かれたまま残し、
   各画素の由来（provenance: 戻した `temporal_real` / 戻せなかった `unrecovered`）と coverage（戻せた割合）で
-  報告する。出力は RGB24 の生フレーム（ffmpeg でエンコードする）。
+  報告する。動きは画面全体の affine（平行移動 + 回転 + 拡大縮小）で追う（`--motion translation` で平行移動だけ）。
+  出力は RGB24 の生フレーム（ffmpeg でエンコードする）。
   背景が動かない動画（固定カメラ）では何も戻らない
 - `vrestore compare --rect x,y,w,h <original> <processed>` — 処理後の動画が元の動画にどれだけ一致するかを、
   矩形の中で SSIM / PSNR で出す（復元の良さを測るためのもの）
@@ -48,7 +49,7 @@ zig-out/bin/vrestore-gui input.mp4
 ```
 
 操作: ドラッグで範囲を選ぶ / Enter で検出 / R で表示中のフレームを復元 / Space で処理前・処理後（戻せなかった画素はマゼンタ）/
-P で各画素の由来を色で重ねる /
+P で各画素の由来を色で重ねる / M で動きのモデル（affine / translation）を切り替える /
 ← → で 1 フレーム（Shift で 1 秒、↑ ↓ で 10 秒）/ 下の帯のクリックで移動 / Esc で消す / Q で終了
 
 ```sh
