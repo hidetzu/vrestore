@@ -29,7 +29,8 @@ README・CI・ここにコマンドを写さない。
 
 ## 3. 境界
 
-- 背景復元は、映像内にある実画素だけを戻す。戻せない画素は埋めずに未復元として残し、マスクで返す
+- 背景復元は、映像内にある実画素だけを戻す。戻せない画素は埋めずに未復元として残す。
+  各画素は由来（provenance）を持ち、推測した画素を「戻した」と数えない（[ADR 0006](docs/adr/0006-every-restored-pixel-carries-its-provenance.md)）
   （[ADR 0005](docs/adr/0005-temporal-recovery-copies-real-pixels-and-leaves-the-rest-unrecovered.md)）
 - **ROI 検出と背景復元を分ける**（[ADR 0002](docs/adr/0002-roi-detection-is-separate-from-background-recovery.md)）。
   復元アルゴリズムを変えても ROI 検出を触らない

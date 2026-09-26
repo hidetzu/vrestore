@@ -7,7 +7,7 @@
 //!   roi_fixture check  <truth.json> <detection.json>   dx / dy / IoU / reliable を判定する
 //!   roi_fixture check-restore <name> <restore.json> <compare.json> <conditions>
 //!                     復元の結果を条件で判定する。conditions は "coverage>=0.99,ssim>=0.9" のような並び。
-//!                     キーは restore.json と compare.json のどちらかにある数値
+//!                     キーは restore.json と compare.json のどちらかにある数値。入れ子は "provenance.unrecovered.fraction"
 //!   roi_fixture crossmetrics <compare.jsonl> <ffmpeg-ssim.log> <ffmpeg-psnr.log>
 //!                     `vrestore compare --per-frame` の値が FFmpeg の ssim / psnr フィルタと一致するかを見る
 //!
@@ -370,6 +370,17 @@ fn check(arena: std.mem.Allocator, io: Io, out: *Io.Writer, truth_path: []const 
     return if (ok) 0 else 1;
 }
 
+/// "a.b.c" をたどる
+fn lookup(root: std.json.Value, dotted: []const u8) ?std.json.Value {
+    var cur = root;
+    var it = std.mem.splitScalar(u8, dotted, '.');
+    while (it.next()) |k| {
+        if (cur != .object) return null;
+        cur = cur.object.get(k) orelse return null;
+    }
+    return cur;
+}
+
 fn jsonNumber(v: std.json.Value) ?f64 {
     return switch (v) {
         .float => |f| f,
@@ -399,7 +410,7 @@ fn checkRestore(arena: std.mem.Allocator, io: Io, out: *Io.Writer, name: []const
         const key = cond[0..at];
         const want = try std.fmt.parseFloat(f64, cond[at + 2 ..]);
         const got: ?f64 = for (docs) |d| {
-            if (d.object.get(key)) |v| break jsonNumber(v);
+            if (lookup(d, key)) |v| break jsonNumber(v);
         } else null;
         const pass = if (got) |g| (if (ge != null) g >= want else g <= want) else false;
         ok = ok and pass;

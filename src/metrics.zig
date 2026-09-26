@@ -60,9 +60,22 @@ pub fn score(reference: Image, test_img: Image, rect: Rect) Error!FrameScore {
 /// 画素ごとの誤差はほぼこの内側に収まる（docs/SPEC.md §4 の restore の測定で確認する）
 pub const bad_pixel_error = 32;
 
-/// `mask`（1 画素 1 バイト、画像全体）が 0 でない画素だけの、R/G/B 平均の二乗誤差と、外れた画素の数。
-/// 復元方式が「戻した」と言った画素がどれだけ正しいかを測る。数えた画素の数も返す
-pub fn mseMasked(reference: Image, test_img: Image, rect: Rect, mask: []const u8) Error!struct { mse: f64, pixels: usize, bad: usize } {
+/// `labels`（1 画素 1 バイト、画像全体）が `label` の画素だけの、R/G/B 平均の二乗誤差と、外れた画素の数。
+/// 復元方式が画素ごとに付けた由来（provenance）で分けて、「戻した」と言った画素がどれだけ正しいかを測る。
+/// 数えた画素の数も返す
+pub fn mseWhere(reference: Image, test_img: Image, rect: Rect, labels: []const u8, label: u8) Error!Where {
+    return where(reference, test_img, rect, labels, label);
+}
+
+/// 矩形の中の全画素で、外れた画素（どれかの色で bad_pixel_error より大きい差）の数
+pub fn badPixels(reference: Image, test_img: Image, rect: Rect) Error!usize {
+    return (try where(reference, test_img, rect, null, 0)).bad;
+}
+
+pub const Where = struct { mse: f64, pixels: usize, bad: usize };
+
+/// `labels` が null なら矩形の中の全画素
+fn where(reference: Image, test_img: Image, rect: Rect, labels: ?[]const u8, label: u8) Error!Where {
     if (reference.width != test_img.width or reference.height != test_img.height) return error.SizeMismatch;
     if (@as(u64, rect.x) + rect.w > reference.width or @as(u64, rect.y) + rect.h > reference.height) return error.RectOutside;
     var sum: u64 = 0;
@@ -70,7 +83,7 @@ pub fn mseMasked(reference: Image, test_img: Image, rect: Rect, mask: []const u8
     var bad: usize = 0;
     for (rect.y..rect.y + rect.h) |y| {
         for (rect.x..rect.x + rect.w) |x| {
-            if (mask[y * reference.width + x] == 0) continue;
+            if (labels) |l| if (l[y * reference.width + x] != label) continue;
             var worst: u64 = 0;
             for (0..3) |c| {
                 const d = px(reference, x, y, c) - px(test_img, x, y, c);
@@ -215,24 +228,36 @@ test "metrics: noise lowers SSIM, symmetric in its arguments" {
     try std.testing.expectEqual(ab.mseAvg(), ba.mseAvg());
 }
 
-test "metrics: mseMasked counts only masked pixels inside the rect" {
+test "metrics: mseWhere counts only pixels with the label inside the rect" {
     var a = [_]u8{100} ** (16 * 16 * 3);
     var b = [_]u8{100} ** (16 * 16 * 3);
     var mask = [_]u8{0} ** (16 * 16);
-    // (2,2) は 10 ずれ、マスクあり。(3,2) は 50 ずれ、マスクなし。(15,15) はマスクありだが矩形の外
+    // (2,2) は 10 ずれ、ラベル 2。(3,2) は 50 ずれ、ラベル 0。(15,15) はラベル 2 だが矩形の外。(3,3) はラベル 1
     b[(2 * 16 + 2) * 3 ..][0..3].* = .{ 110, 110, 110 };
     b[(2 * 16 + 3) * 3 ..][0..3].* = .{ 150, 150, 150 };
-    mask[2 * 16 + 2] = 255;
-    mask[2 * 16 + 1] = 255;
-    mask[15 * 16 + 15] = 255;
+    mask[2 * 16 + 2] = 2;
+    mask[2 * 16 + 1] = 2;
+    mask[15 * 16 + 15] = 2;
+    mask[3 * 16 + 3] = 1; // 別のラベル
     const img_a: Image = .{ .width = 16, .height = 16, .rgb = &a };
     const img_b: Image = .{ .width = 16, .height = 16, .rgb = &b };
-    const r = try mseMasked(img_a, img_b, .{ .x = 0, .y = 0, .w = 8, .h = 8 }, &mask);
+    const r = try mseWhere(img_a, img_b, .{ .x = 0, .y = 0, .w = 8, .h = 8 }, &mask, 2);
     try std.testing.expectEqual(@as(usize, 2), r.pixels);
     try std.testing.expectEqual(@as(f64, 50), r.mse); // (100 + 0) / 2
     try std.testing.expectEqual(@as(usize, 0), r.bad); // 10 は外れではない
     b[(2 * 16 + 1) * 3 ..][0..3].* = .{ 100, 100 + bad_pixel_error + 1, 100 };
-    try std.testing.expectEqual(@as(usize, 1), (try mseMasked(img_a, img_b, .{ .x = 0, .y = 0, .w = 8, .h = 8 }, &mask)).bad);
+    try std.testing.expectEqual(@as(usize, 1), (try mseWhere(img_a, img_b, .{ .x = 0, .y = 0, .w = 8, .h = 8 }, &mask, 2)).bad);
+    try std.testing.expectEqual(@as(usize, 1), (try mseWhere(img_a, img_b, .{ .x = 0, .y = 0, .w = 8, .h = 8 }, &mask, 1)).pixels);
+}
+
+test "metrics: badPixels counts pixels off by more than bad_pixel_error in any color" {
+    var a = [_]u8{100} ** (8 * 8 * 3);
+    var b = [_]u8{100} ** (8 * 8 * 3);
+    b[0..3].* = .{ 100, 100, 100 + bad_pixel_error }; // ちょうど境界は外れではない
+    b[3..6].* = .{ 100 - bad_pixel_error - 1, 100, 100 };
+    const ia: Image = .{ .width = 8, .height = 8, .rgb = &a };
+    const ib: Image = .{ .width = 8, .height = 8, .rgb = &b };
+    try std.testing.expectEqual(@as(usize, 1), try badPixels(ia, ib, .{ .x = 0, .y = 0, .w = 8, .h = 8 }));
 }
 
 test "metrics: rejects mismatched sizes and bad rects" {
