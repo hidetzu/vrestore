@@ -39,7 +39,12 @@
 | GUI | ドラッグの向きによらず同じ矩形を選ぶ。クリックだけ（大きさ 0）は前の選択を消さない | test `"gui: selection works in any drag direction and ignores a plain click"` |
 | GUI | タイムラインの横位置から時刻を出す（端に寄せる）。選択範囲を表示中のフレームから切り出して参照画像にする | test `"gui: timeline maps position to time and clamps"`、`"gui: crop cuts the selected pixels"` |
 | GUI（E2E） | `vrestore-gui` が動画を開いて指定時刻のフレームを出し、選択範囲から CLI と同じ検出（`detect_roi.detectInVideo`）を回して、既知の位置を `dx=0, dy=0, reliable=true` で返す。SDL のダミー描画で窓を開かずに回す | `zig build gui` の `roi check gui` |
-| GUI | マウスのドラッグ・キー操作・タイムラインのクリック | ⚠ 自動の検査は無い（[ADR 0004](adr/0004-the-gui-is-a-separate-sdl2-executable-that-only-calls-the-detector.md) の帰結） |
+| GUI（プレイヤー） | 操作パネルは映像の下寄り中央に出て、ドラッグで動かしても映像の外へ出ない。映像の領域が縮んだら押し戻す | `src/player_state.zig` の test `"player: the panel starts at the bottom centre and stays inside the video when dragged"`、`"player: the panel is pushed back inside when the video area shrinks"` |
+| GUI（プレイヤー） | パネルの上で押した操作は ROI の選択にならない（再生 / シーク / パネルの移動）。パネルを隠していれば選択になる。ROI を選んでいる間はパネルを描かない | test `"player: presses on the panel never start an ROI selection"` |
+| GUI（プレイヤー） | シークバーの横位置から時刻。再生の時計は再生中だけ進む。進めるべきフレーム数を決め、1 秒以上遅れたら・戻ったら seek | test `"player: seek bar maps position to time"`、`"player: the clock advances with wall time only while playing"`、`"player: advance reads the frames that are due, and seeks when far behind"` |
+| GUI（プレイヤー） | 時刻の表示（`2:03.456`、1 時間以上は `1:57:22`）、フレーム番号、共有用の 1 行 `<名前> t=<秒> frame=<番号>` | test `"player: time, frame number and the share line"`、`src/glyphs.zig` の test（パネルの文字） |
+| GUI（プレイヤー、E2E） | `--frame` で指定したフレームを開き、再生と同じ経路で N フレーム進め、末尾では止まり、共有用の 1 行を出す | `zig build gui` の `gui share frame` `gui share play` `gui share end` |
+| GUI | マウスのドラッグ・キー操作・タイムラインのクリック・操作パネルのドラッグと再生 | ⚠ 自動の検査は無い（[ADR 0004](adr/0004-the-gui-is-a-separate-sdl2-executable-that-only-calls-the-detector.md) の帰結） |
 | 復元 | 位相相関（低い周波数だけ）で隣り合うフレームの平行移動を推定する。上下左右どちら向きでも、固定のウォーターマークがあっても正しい | `src/temporal.zig` の test `"temporal: estimateShift finds a pan in every direction, ignoring a fixed watermark"` |
 | 復元 | affine の合成・逆変換。最小二乗で正確な affine を当て、独自に動くブロックを外れ値として除く（乱数を使わない RANSAC）。ばらばらに動くブロックなら推定できなかったと返す | `src/motion.zig` の test `"motion: compose and inverse"`、`"motion: least squares recovers an exact affine, and RANSAC ignores a block that moves on its own"`、`"motion: too few consistent blocks means not estimated"` |
 | 復元 | ブロックの動きから、1% の拡大 + 0.5 度の回転を画面の四隅で 1 px 未満の誤差で推定する | test `"motion: estimateAffine finds a small zoom and rotation between two frames"` |
@@ -58,7 +63,7 @@
 | 復元（合成 E2E） | 画面全体の平行移動ではない動き（ズーム）で、戻した画素のうち外れた画素が 2% 以下 | `zig build restore-e2e` の `restore-zoom` |
 | 復元（合成 E2E） | 回転 + パンで、affine（既定）が ROI の 8 割以上を戻し、SSIM ≥ 0.75、外れた画素 ≤ 1% | `zig build restore-e2e` の `restore-rotpan`（平行移動では coverage 0.57・SSIM 0.44 で FAIL） |
 | 復元（合成 E2E） | `--motion translation` でもパン 7,3 を戻す | `zig build restore-e2e` の `restore-pan7-translation` |
-| GUI | F で戻せなかった画素を埋めるか（none / harmonic）を切り替え、M で動きのモデル（affine / translation）を切り替え、窓のタイトルに出す。R で表示中のフレームを戻し（CLI と同じ部品・閾値）、Space で処理前 / 処理後を切り替える。戻せなかった画素はマゼンタ。P で各画素の由来の色（`temporal_real` 緑、`unrecovered` マゼンタ）を重ね、窓のタイトルに由来ごとの割合を出す | `zig build gui` の `gui restore check`（coverage のみ）。表示は `--screenshot` で目視。キー操作は自動の検査なし |
+| GUI | Space で再生 / 一時停止、H で操作パネルを隠す、C で場面（動画名・時刻・フレーム番号）をクリップボードと標準出力へ。B で処理前 / 処理後。F で戻せなかった画素を埋めるか（none / harmonic）を切り替え、M で動きのモデル（affine / translation）を切り替え、窓のタイトルに出す。R で表示中のフレームを戻し（CLI と同じ部品・閾値）、戻せなかった画素はマゼンタで見せる。P で各画素の由来の色（`temporal_real` 緑、`unrecovered` マゼンタ）を重ね、窓のタイトルに由来ごとの割合を出す | `zig build gui` の `gui restore check`（coverage のみ）。表示は `--screenshot` で目視。キー操作は自動の検査なし |
 | リポジトリ衛生 | 動画・巨大ファイルが git の管理下に無い | `scripts/check-no-media.sh` |
 
 ## 2. ROI 検出の契約

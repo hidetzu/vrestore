@@ -28,7 +28,7 @@ zig build check
 |---|---|
 | `zig fmt --check` | `build.zig` `build.zig.zon` `src/` の整形 |
 | `zig build test` | ユニットテスト（動画は ffmpeg で合成してから）と、実行ファイルを起動する `cli_*` |
-| `zig build gui` | `vrestore-gui` をビルドし、SDL のダミー描画で「フレーム表示 → 選択 → 検出」を回して正解と照合する（`roi check gui`） |
+| `zig build gui` | `vrestore-gui` をビルドし、SDL のダミー描画で「フレーム表示 → 選択 → 検出」を回して正解と照合する（`roi check gui`）。`--frame` / `--play-frames` で場面を動かし、共有用の 1 行を照合する（`gui share *`） |
 | `zig build restore-e2e` | Temporal Recovery の合成 E2E。ケースは `build.zig` の `restore_cases`。合成 → エンコード → detect-roi → restore → 正解と compare → 条件で判定 |
 | `zig build metrics` | `vrestore compare` の SSIM / MSE を FFmpeg の ssim / psnr フィルタとフレームごとに突き合わせる |
 | `zig build e2e` | ROI の合成 E2E。ケースは `build.zig` の `roi_cases`。1 ケース = 合成 → エンコード → 参照画像を切る → `detect-roi` → 正解と照合 |
