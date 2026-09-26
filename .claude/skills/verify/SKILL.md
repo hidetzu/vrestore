@@ -14,7 +14,7 @@ description: vrestore の変更が壊れていないと言うために何を実�
 - ⚠ `zig version` がそれと一致することを最初に確かめる。Zig は版ごとに std が大きく変わる
 - FFmpeg: `ffmpeg` コマンド（テスト用動画の合成）と、pkg-config で見つかる libavformat / libavcodec /
   libswscale / libavutil（リンク）。CI で入れているものは `.github/workflows/ci.yml`
-- SDL2: pkg-config の `sdl2`（`vrestore-gui` だけが使う）
+- SDL2: pkg-config の `sdl2`、SDL2_ttf（`vrestore-gui` だけが使う）
 
 ## fast
 
