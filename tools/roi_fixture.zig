@@ -28,7 +28,8 @@ pub const Case = struct {
     height: u32 = 360,
     frames: u32 = 30,
     /// pan: 模様がパンする / cut: 毎フレーム別の模様 / flat: 動かない滑らかなグラデーション
-    bg: enum { pan, cut, flat } = .pan,
+    /// zoom: 画面中央を中心に 1 フレームあたり 1% ずつ拡大する（画面全体の平行移動ではない動き）
+    bg: enum { pan, cut, flat, zoom } = .pan,
     /// 1 フレームあたりのパン量 (px)
     pan_x: i32 = 7,
     pan_y: i32 = 3,
@@ -253,6 +254,15 @@ fn synth(gpa: std.mem.Allocator, io: Io, c: Case, out_path: []const u8, truth_pa
             var rgb: [3]f32 = undefined;
             for (0..3) |ch| rgb[ch] = switch (c.bg) {
                 .pan => tex[ch][(y + oy) * tw + x + ox],
+                .zoom => blk: {
+                    // 出力の (x, y) は、模様の中央から 1 / (1 + 0.01k) 倍の位置
+                    const s = 1 + 0.01 * @as(f32, @floatFromInt(k));
+                    const fx = @as(f32, @floatFromInt(tw)) / 2 + (@as(f32, @floatFromInt(x)) - @as(f32, @floatFromInt(w)) / 2) / s;
+                    const fy = @as(f32, @floatFromInt(th)) / 2 + (@as(f32, @floatFromInt(y)) - @as(f32, @floatFromInt(h)) / 2) / s;
+                    const ix: usize = @intFromFloat(std.math.clamp(fx, 0, @as(f32, @floatFromInt(tw - 1))));
+                    const iy: usize = @intFromFloat(std.math.clamp(fy, 0, @as(f32, @floatFromInt(th - 1))));
+                    break :blk tex[ch][iy * tw + ix];
+                },
                 .cut => cut_tex[ch][y * w + x],
                 .flat => (@as(f32, @floatFromInt(x)) / @as(f32, @floatFromInt(w)) * 0.6 +
                     @as(f32, @floatFromInt(y)) / @as(f32, @floatFromInt(h)) * 0.3 + 0.05 * @as(f32, @floatFromInt(ch))),

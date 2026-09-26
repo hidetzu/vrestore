@@ -330,6 +330,9 @@ const restore_cases = [_]RestoreCase{
     // 遅いパン × 強い圧縮。全帯域の位相相関だと x264 のブロックの格子が (0,0) のピークを作り、動いていないと
     // 推定した（CLAUDE.md §7）。実測（低い周波数だけ）: coverage 0.680、戻した画素の PSNR 32.2
     .{ .roi = .{ .spec = "name=restore-pan3-crf35,bg=pan,pan_x=3,pan_y=1,x=240,y=150,frames=60", .crf = 35 }, .expect = "coverage>=0.6,masked_psnr>=30" },
+    // ズームする背景（画面全体の平行移動ではない動き）。平行移動で近似して借りると外れた画素を貼る。
+    // ROI の周りの帯が合わないフレームからは借りないので、戻した画素のほとんどは正しいこと
+    .{ .roi = .{ .spec = "name=restore-zoom,bg=zoom,x=240,y=150,frames=60", .crf = 23 }, .expect = "masked_bad_fraction<=0.02" },
     // 毎フレーム別の模様: 動きで説明できないので、1 画素も貼らない
     .{ .roi = .{ .spec = "name=restore-cut,bg=cut,x=240,y=150,frames=60", .crf = 23 }, .expect = "coverage<=0" },
     // 動かない背景: 隠れた画素はどのフレームにも写っていないので、1 画素も戻らない
