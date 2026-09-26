@@ -52,14 +52,16 @@
 | 復元 | ブロックの動きから、1% の拡大 + 0.5 度の回転を画面の四隅で 1 px 未満の誤差で推定する | test `"motion: estimateAffine finds a small zoom and rotation between two frames"` |
 | 補間 | `--fill` は unrecovered の画素だけを埋めて `spatial_inpainted` にし、見えている画素（ROI の外・Temporal の実画素）は変えない | `src/spatial.zig` の test `"spatial: fills only unrecovered pixels and labels them spatial_inpainted"` |
 | 補間 | harmonic は埋めた各画素を上下左右の平均にする（ラプラス方程式を解く）。directional はそうならない。線形の勾配は harmonic で正解との差 1 以内 | test `"spatial: harmonic makes every filled pixel the average of its neighbours, directional does not"`、`"spatial: harmonic reproduces a linear gradient exactly, directional is close"` |
-| マスク | 背景が変わる中で変わらない画素（ウォーターマーク）を見分け、1 px 広げる。背景も変わらなければ見分けられないとして ROI 全体を隠す。大津の二値化で 2 つの塊を分ける | `src/wmask.zig` の test `"wmask: finds the pixels that stay the same while the background changes"`、`"wmask: falls back to hiding the whole ROI when the background does not move either"`、`"wmask: otsu splits two clusters"` |
+| マスク | 背景が変わる中で変わらない画素（ウォーターマーク）を見分け、2 px 広げる（縁取りの外側の圧縮のにじみまで隠す）。背景も変わらなければ見分けられないとして ROI 全体を隠す。大津の二値化で 2 つの塊を分ける | `src/wmask.zig` の test `"wmask: finds the pixels that stay the same while the background changes"`、`"wmask: falls back to hiding the whole ROI when the background does not move either"`、`"wmask: otsu splits two clusters"` |
 | マスク（縁） | 勾配の時間方向の中央値が大きい画素（どのフレームでも同じ縁）も隠す。背景と一緒に色が変わる不透明度 30% の棒を、変わりにくさだけでは 55% しか隠せないが、縁を足すとすべて隠す | `src/wmask.zig` の test `"wmask: the edges catch a translucent watermark that the stillness alone misses"` |
+| マスクの範囲 | マスクを使うときは、推定して埋める範囲を ROI の周り 8 px まで広げる（動画の端で止める）。ROI の外でもマスクの内側なら埋め、マスクの外は入力のまま。Temporal の範囲は広げない | test `"maskArea: widens only with the mask, and stops at the frame edge"`、`"fillAndTally: fills the watermark pixels outside the ROI too, and keeps the rest as input"` |
 | マスク（ROI 全体に戻す判定） | 隠す割合の判定（2%〜95%）は、縁を足す前・広げる前の変わりにくい画素で行う。縁と広げた分で 100% になっても、見分けられていればマスクを使う | `src/wmask.zig` の test `"wmask: whether the mask is used is judged before the edges and the dilation widen it"` |
-| マスク（合成 E2E） | `--mask auto` で、毎フレーム別の模様の背景を harmonic で埋めて SSIM ≥ 0.72、本物のウォーターマークの画素の再現率 ≥ 0.99 | `zig build restore-e2e` の `restore-cut-mask`（check-mask を含む） |
+| マスク（合成 E2E） | `--mask auto` で、毎フレーム別の模様の背景を harmonic で埋めて SSIM ≥ 0.67（ROI 全体を埋めると 0.649）、本物のウォーターマークの画素の再現率 ≥ 0.99 | `zig build restore-e2e` の `restore-cut-mask`（check-mask を含む） |
 | 補間（合成 E2E） | 動かない滑らかな背景を harmonic で埋めると SSIM ≥ 0.95、coverage は 0 のまま。パンでは Temporal の実画素を変えずに残りを埋める | `zig build restore-e2e` の `restore-flat-fill` `restore-pan7-fill` |
 | 復元 | 位相相関の窓をウォーターマークの ROI と重ならない所から取る | test `"temporal: chooseWindow keeps the window off the ROI and takes the largest"` |
 | 復元 | 相関のピークが閾値未満のペアで鎖を切り、動いていないとは見なさない | test `"temporal: Track cuts the chain at an unestimated pair instead of assuming no motion"` |
 | 復元 | 戻したと言った画素（由来 `temporal_real`）は正解と一致し、戻せなかった画素は焼かれたまま残って由来が `unrecovered` になる。ROI の外は `original`。推定した移動量が間違っていれば、ROI の周りの帯が合わないのでそのフレームからは借りない。動かない背景では何も戻らない | test `"temporal: recoverFrame restores the exact background under a pan, refuses frames whose surroundings do not match, and reports what it could not"` |
+| 復元（明るさ） | 借りた画素に、ROI の周りの帯で測った明るさの差（表示中 − 借りたフレーム、R/G/B の平均）を足す。露出がフレームごとに 1 ずつ変わる動画でも、戻した画素は表示中のフレームの正解と一致する | test `"temporal: recoverFrame matches the brightness of the borrowed pixels to the frame shown"` |
 | 由来 | 各画素の由来（provenance）を 1 バイトで表す: 0 `original`（ROI の外）、1 `unrecovered`、2 `temporal_real`、4 `spatial_inpainted`。3 は予約（`alpha_recovered`）。知らない値は読まない | `src/provenance.zig` の test `"provenance: byte values are part of the file format"` |
 | 由来 | coverage は ROI の中の画素のうち、証拠から戻した由来（今は `temporal_real` だけ）の割合。ROI の外と、推測で埋めた `spatial_inpainted` は数えない | test `"provenance: coverage counts recovered pixels over the ROI, not pixels outside it"` |
 | CLI | `vrestore restore (--roi <detection.json> \| --rect) --raw <out.rgb> [--provenance <out>] [--motion affine\|translation] [--fill none\|directional\|harmonic] [--mask none\|auto] <video>` が RGB24 の生フレームと由来を書き、coverage と由来ごとの画素数を JSON で出す | `zig build restore-e2e`（`restore-pan15` で `temporal_real` の割合 ≥ 0.99、`restore-cut` で `unrecovered` の割合 = 1） |
@@ -341,52 +343,71 @@ affine で戻る割合が小さいのは正しい。平行移動が「戻した�
 
 ### ウォーターマークのマスク（`--mask auto`）
 
-2026-09-26、同じ環境。harmonic で埋める。
+2026-09-26〜27、同じ環境。harmonic で埋める。列の意味:
+「変わりにくさ」= hidetzu/vrestore#11、「+ 縁（1 px）」= 縁を ROI の中央値基準で足し 1 px 広げたもの、
+「今回」= 縁を背景の中央値基準（5 倍、下限 8）で足し、全体を 2 px 広げ、マスクの範囲を ROI の周り 8 px まで広げたもの（ADR 0011）。
 
 合成（640x360 / 10 fps / 60 フレーム / crf 23、中央の ROI、各 1 ケース）。再現率 = 本物のウォーターマークの画素のうち
-隠れている扱いにした割合、適合率 = 隠した画素のうち本物だった割合（`roi_fixture check-mask`）:
+隠れている扱いにした割合（`roi_fixture check-mask`）。「今回」は Temporal の明るさ合わせ（ADR 0012）込み:
 
-| 背景 | SSIM: ROI 全体 → マスク | 外れた画素 | 再現率 | 適合率: ROI 全体 → マスク |
-|---|---|---|---|---|
-| パン 7,3 | 0.942 → 0.942 | 0.01% → 0.00% | 1.0000 | 0.44 → 0.46 |
-| 遅いパン 3,1 | 0.855 → 0.881 | 6.36% → 1.14% | 1.0000 | 0.44 → 0.51 |
-| 毎フレーム別の模様 | 0.649 → 0.758 | 29.89% → 2.92% | 1.0000 | 0.44 → 0.65 |
-| 回転 0.2 度 + パン 5,2 | 0.920 → 0.923 | 0.71% → 0.09% | 1.0000 | 0.44 → 0.47 |
-| 静止（見分けられないので ROI 全体） | 0.997 → 0.997 | 0 → 0 | 1.0000 | 0.44 → 0.44 |
+| 背景 | SSIM: ROI 全体 → 変わりにくさ → 今回 | 外れた画素: ROI 全体 → 変わりにくさ → 今回 | 再現率 |
+|---|---|---|---|
+| パン 7,3 | 0.942 → 0.942 → 0.942 | 0.01% → 0.00% → 0.00% | 1.0000 |
+| パン 7,3（不透明度 50%） | — → 0.942 → 0.942 | — → 0.00% → 0.00% | 1.0000 |
+| 遅いパン 3,1 | 0.855 → 0.881 → 0.856 | 6.36% → 1.14% → 6.08% | 1.0000 |
+| 毎フレーム別の模様 | 0.649 → 0.758 → 0.689 | 29.89% → 2.92% → 19.87% | 1.0000 |
+| 回転 0.2 度 + パン 5,2 | 0.920 → 0.923 → 0.920 | 0.71% → 0.09% → 0.67% | 1.0000 |
+| 静止（見分けられないので ROI 全体） | 0.997 → 0.997 → 0.997 | 0 → 0 → 0 | 1.0000 |
 
 手持ちの実写に焼き込んだ 3 区間と固定カメラ（各 24 ケース、「Spatial Inpainting」と同じ条件、動きは affine）。
 ウォーターマークの外接矩形の SSIM（24 ケースの平均）と、焼いた PNG の不透明な画素に対する再現率。
-「マスク（変わりにくさ）」は縁を足す前（hidetzu/vrestore#11）、「マスク（+ 縁）」は縁を足し、ROI 全体に戻す判定を縁を足す前の割合で
-するようにした後（ADR 0011）:
+「今回」の実写は明るさ合わせ（ADR 0012）の前に測った（実写では Temporal で戻る画素が外接矩形のほぼ 0% なので、影響は小さいと見込む。未測定）:
 
-| 素材 | 焼き込んだまま | harmonic（ROI 全体） | マスク（変わりにくさ） | マスク（+ 縁） | 参考: delogo（ぴったりの矩形） |
-|---|---|---|---|---|---|
-| A 600 秒 | 0.234 | 0.360 | 0.441 | 0.402 | 0.443 |
-| A 2500 秒 | 0.185 | 0.673 | 0.781 | 0.753 | 0.709 |
-| A 5000 秒 | 0.186 | 0.545 | 0.656 | 0.629 | 0.622 |
-| 固定カメラ 200 秒 | 0.379 | 0.485 | 0.530 | 0.570 | 0.519 |
+| 素材 | 焼き込んだまま | harmonic（ROI 全体） | 変わりにくさ | + 縁（1 px） | 今回 | 参考: delogo（ぴったりの矩形） |
+|---|---|---|---|---|---|---|
+| A 600 秒 | 0.234 | 0.360 | 0.441 | 0.402 | 0.380 | 0.443 |
+| A 2500 秒 | 0.185 | 0.673 | 0.781 | 0.753 | 0.741 | 0.709 |
+| A 5000 秒 | 0.186 | 0.545 | 0.656 | 0.629 | 0.602 | 0.622 |
+| 固定カメラ 200 秒 | 0.379 | 0.485 | 0.530 | 0.570 | 0.549 | 0.519 |
 
-| 素材 | マスクを使えた | 再現率 最小 / 平均 | 適合率 平均 | 隠す割合 平均 | 入力のまま残して正解から外れた画素 / 外接矩形 |
-|---|---|---|---|---|---|
-| A 600 秒 | 22 → 24 / 24 | 0.930 / 0.992 → 1.0000 / 1.0000 | 0.30 → 0.30 | 87% → 90% | 0.28% → 0.02% |
-| A 2500 秒 | 24 → 24 / 24 | 0.976 / 0.997 → 1.0000 / 1.0000 | 0.37 → 0.34 | 75% → 80% | 0.27% → 0.04% |
-| A 5000 秒 | 24 → 24 / 24 | 0.985 / 0.996 → 0.9998 / 1.0000 | 0.43 → 0.39 | 65% → 71% | 0.13% → 0.01% |
-| 固定カメラ 200 秒 | 24 → 24 / 24 | 0.644 / 0.950 → 0.9987 / 0.9999 | 0.42 → 0.40 | 75% → 82% | 2.37% → 0.31% |
+| 素材 | マスクを使えた（変わりにくさ → 今回） | 再現率 最小（変わりにくさ → + 縁 → 今回） | 入力のまま残して正解から外れた画素 / 外接矩形（変わりにくさ → + 縁 → 今回） |
+|---|---|---|---|
+| A 600 秒 | 22 → 24 / 24 | 0.930 → 1.0000 → 1.0000 | 0.28% → 0.02% → 0.01% |
+| A 2500 秒 | 24 → 24 / 24 | 0.976 → 1.0000 → 1.0000 | 0.27% → 0.04% → 0.03% |
+| A 5000 秒 | 24 → 23 / 24 | 0.985 → 0.9998 → 0.9988 | 0.13% → 0.01% → 0.01% |
+| 固定カメラ 200 秒 | 24 → 24 / 24 | 0.644 → 0.9987 → 0.9997 | 2.37% → 0.31% → 0.24% |
 
 「入力のまま残して正解から外れた画素」は、由来が `original` の画素のうち誤差 > 32 のもの（残ったウォーターマークの見積もり）。
-適合率・隠す割合は ROI（余白込み）に対して、再現率は焼いた PNG の不透明な画素に対して。
 
 | 何を測ったか | 値 |
 |---|---|
 | A の 72 ケースでのマスク（変わりにくさ）の効果（SSIM の差、マスク − ROI 全体） | 平均 +0.100、最小 −0.057、最大 +0.326。下がったのは 9 / 72 |
+| 今回のマスクの効果（SSIM の差、今回 − ROI 全体） | A 600 / 2500 / 5000 秒・固定カメラ: 平均 +0.019 / +0.068 / +0.058 / +0.064。下がったのは 4 / 4 / 0 / 1（各 24 ケース中） |
 | 縁を足した効果（SSIM の差、+ 縁 − 変わりにくさ） | A 600 / 2500 / 5000 秒: 平均 −0.039 / −0.028 / −0.028。固定カメラ: 平均 +0.040、最小 −0.088、最大 +0.609（不透明度 50% の URL、0.155 → 0.763） |
-| 焼き込んだままより SSIM が低いケース（変わりにくさ → + 縁） | A 600 秒 4 → 4、固定カメラ 4 → 5（どちらも 24 ケース中） |
-| PSNR の平均（3 区間）: ROI 全体 → マスク | 16.10 → 18.31、19.54 → 23.33、21.06 → 24.94 dB |
+| 隠す割合の平均（今回、マスクの範囲 = ROI の周り 8 px まで に対して） | 92% / 81% / 73% / 83% |
+| PSNR の平均: ROI 全体 → 変わりにくさ → 今回 | A 600 秒 16.10 → 18.31 → 17.05、A 2500 秒 19.54 → 23.33 → 21.36、A 5000 秒 21.06 → 24.94 → 23.10、固定カメラ 16.87 → 17.91 → 18.81 dB |
 | 最初の設計（Temporal の範囲もマスクで絞る）での合成のパン 7,3 | SSIM 0.942 → 0.804（採らなかった、ADR 0010） |
+| Temporal の範囲まで ROI の周り 8 px に広げた場合の合成の遅いパン（同じ範囲の temporal_real） | 430049 → 307902 画素、SSIM 0.856 → 0.801（採らなかった、ADR 0011） |
 
 解釈: 取りこぼし（再現率 < 1）の画素はウォーターマークが残る。縁を足すと取りこぼしがほぼ無くなり、残るウォーターマークは
-7〜13 分の 1 になるが、隠す（推測で埋める）画素が増えるので、背景が動く A では外接矩形の SSIM が下がる。
-SSIM は少数の画素に残るウォーターマークをほとんど罰しない。
+減るが、隠す（推測で埋める）画素が増えるので、背景が動く素材では外接矩形の SSIM が下がる。
+SSIM は少数の画素に残るウォーターマークをほとんど罰しない。この評価のウォーターマーク（PNG を焼いたもの）は縁のにじみが少なく、
+手持ちの実写に元から焼かれていた縁取り付きの文字で見えた点線の縁取り（2 px 広げると消えた、目視）は、この表には出にくい。
+
+### Temporal Recovery: 借りた画素の明るさ合わせ（ADR 0012）
+
+2026-09-27、同じ環境。手持ちの実写 A の 2500 秒に焼いた 1 ケース（logo・中央・不透明・crf 20、600 フレーム）を、
+今回のマスク + harmonic で、明るさ合わせの有無だけを変えて復元。比べる相手は元の動画:
+
+| 何を測ったか | 合わせない → 合わせる |
+|---|---|
+| 戻した画素（由来 `temporal_real`）の誤差の絶対値の平均（検出した ROI + 周り 4 px、50 フレームおきの 12 フレーム、1 フレームあたり 710 画素） | 3.15 → 2.31 |
+| 同じ画素の誤差の符号付き平均 | +0.41 → +0.21 |
+| SSIM（検出した ROI）/（ウォーターマークの外接矩形） | 0.9356 → 0.9370 / 0.9419 → 0.9421 |
+| 合成 6 ケース（上の「ウォーターマークのマスク」の表） | SSIM の差 0.001 以内（合成の動画は明るさが変わらない） |
+
+観測のきっかけ: 合わせないと、ROI の下端に沿った 3 行が別フレームから戻され、正解より +2.2 / +1.2 / +0.3 明るく、線に見えた
+（入力はその行で正解との差 0.0）。
 
 ### Temporal Recovery: 実写（固定カメラ）
 
