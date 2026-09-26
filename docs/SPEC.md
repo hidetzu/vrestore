@@ -32,6 +32,9 @@
 | ROI（合成 E2E） | 既知の位置に焼いたウォーターマークを、yuv420p にエンコードした動画から `dx=0, dy=0, IoU=1, reliable=true` で見つける（背景のパン・毎フレーム変わる背景・滑らかな背景、crf 16〜35、不透明度 0.35〜1、余白なしの参照、一部だけの参照） | `zig build e2e` の `roi check pan-full` `pan-faint-crf35` `cut-full` `flat-full` `pan-tight` `pan-part` |
 | ROI（合成 E2E） | 繰り返す文字列の途中を切った参照で、得票率も PSR も高いまま別の行に当たるとき、reliable=false を返す | `zig build e2e` の `roi check repeat-mid` |
 | ROI（合成 E2E） | ウォーターマークの無い（背景が動く）動画では reliable=false を返す | `zig build e2e` の `roi check absent` |
+| 指標 | 矩形の中で、R/G/B ごとの MSE と SSIM（x264 / FFmpeg vf_ssim と同じ 8x8 窓・4px 刻み）を出す。同じ画像なら SSIM 1・MSE 0、矩形の外は数えない | `src/metrics.zig` の test `"metrics: identical images score SSIM 1 and MSE 0"`、`"metrics: only pixels inside the rect count"`、`"metrics: MSE and PSNR of a uniform offset"` |
+| 指標（外部照合） | `vrestore compare --per-frame` の SSIM（R/G/B/全体）と MSE（R/G/B/平均）が、FFmpeg の `ssim` / `psnr` フィルタとフレームごとに一致する（SSIM は差 2e-6 以内、MSE は 0.006 以内。FFmpeg の出力桁の丸め分）。素材は RGB の可逆（ffv1 gbrp）なので、色変換の違いはこの照合に含まれない | `zig build metrics` の `metrics crosscheck` |
+| CLI | `vrestore compare [--rect x,y,w,h] [--per-frame] <reference> <test>` が、フレーム数と大きさが同じ 2 本を先頭から順に比べ、SSIM の平均と最小・MSE の平均・PSNR（平均 MSE から）を JSON 1 行で出す。フレーム数が違えばエラー | `src/compare.zig` の test `"compare: parseRect"`、`zig build metrics`（出力の値）。フレーム数違いのエラーは手で確かめただけ |
 | リポジトリ衛生 | 動画・巨大ファイルが git の管理下に無い | `scripts/check-no-media.sh` |
 
 ## 2. ROI 検出の契約
@@ -130,6 +133,27 @@ PIL と実フォントで描画）× 位置 4（左上・上中央・中央・�
 
 解釈: 合成素材と同じく、位置違いを止めているのは margin。ウォーターマークの無い動画での reliable=true は
 誤検出ではなく、静止した背景を正しく見つけている。参照画像がウォーターマークかどうかはこのツールでは判定できない。
+
+### 復元率の基準（`scripts/restore-real.sh`）
+
+「復元率」= 処理後の動画が、ウォーターマークを焼く前の元の動画にどれだけ一致するか。
+ウォーターマークの外接矩形の中で `vrestore compare` の SSIM（フレーム平均）を見る。
+
+2026-09-26、同じ環境。手元の実写 1 本（1920x1080、固定カメラ）の 5 秒を可逆（ffv1）で固定したものを正解とし、
+ウォーターマーク 3 種（日本語 4 行 / URL 1 行 / 図形 + 語）× 位置 2（左上の暗い所・中央の人と照明が動く所）×
+不透明度 {1, 0.5} × crf {20, 32} の 24 ケース。各 1 回。復元方式の出力は可逆で保存。
+
+| 行 | SSIM（24 ケースの平均） | 範囲（ケースごとの平均） |
+|---|---|---|
+| 焼き込んだまま（下限） | 0.379 | 0.159〜0.663 |
+| 元の動画を同じ crf で再エンコードしただけ（上限） | 0.927 | 0.880〜0.970 |
+| FFmpeg delogo（detect-roi の検出矩形 = 余白 12px 込み） | 0.471 | 0.306〜0.722 |
+| FFmpeg delogo（ウォーターマークぴったりの矩形） | 0.519 | 0.336〜0.806 |
+
+観測: delogo は左上の暗い所では焼き込んだままより上がる（例: URL 不透明度 1 / crf 20 で 0.190 → 0.806）が、
+中央では下がることがある（例: 図形 + 語 不透明度 0.5 / crf 20 で 0.663 → 0.344）。
+解釈（未検証）: 中央は人や照明の模様があり、delogo の内挿がそれを塗りつぶす。半透明のウォーターマークは
+背景が透けて残っているので、塗りつぶすより焼き込んだままの方が元に近い。
 
 ### ROI 検出: 合成でない素材で見たもの
 

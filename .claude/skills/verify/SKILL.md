@@ -27,6 +27,7 @@ zig build check
 |---|---|
 | `zig fmt --check` | `build.zig` `build.zig.zon` `src/` の整形 |
 | `zig build test` | ユニットテスト（動画は ffmpeg で合成してから）と、実行ファイルを起動する `cli_*` |
+| `zig build metrics` | `vrestore compare` の SSIM / MSE を FFmpeg の ssim / psnr フィルタとフレームごとに突き合わせる |
 | `zig build e2e` | ROI の合成 E2E。ケースは `build.zig` の `roi_cases`。1 ケース = 合成 → エンコード → 参照画像を切る → `detect-roi` → 正解と照合 |
 | `scripts/check-no-media.sh` | 動画・1 MiB 超のファイルが git の管理下（ステージ含む）に無いこと。件数を出す |
 | `zig build`（install） | 実行ファイルが作れること |
@@ -67,6 +68,12 @@ zig-out/bin/vrestore detect-roi --ref tmp/media/<参照画像>.png --debug-dir t
 
 ```sh
 scripts/roi-real.sh -j 6 tmp/media/<動画>     # 10 分前後。結果は tmp/out/real/
+```
+
+復元率の基準（焼き込んだまま / 再エンコードだけ / delogo）を実写で出す:
+
+```sh
+scripts/restore-real.sh -j 6 tmp/media/<動画>  # 5 分前後。結果は tmp/out/restore/
 ```
 
 `frame-overlay.png` と `roi-crop.png` を開いて、消したい場所を囲んでいるかを見る。実素材には正解が無いので、
