@@ -5,10 +5,14 @@
 //! （docs/adr/0004）。
 //!
 //! 操作:
-//!   ドラッグ（フレーム上）   ウォーターマークの範囲を選ぶ
+//!   Space                    再生 / 一時停止（操作パネルの ▶ でも同じ）
+//!   操作パネル               映像の上に重なる。シークバーで移動、地の部分をドラッグでパネルを動かす
+//!   H                        操作パネルを隠す / 出す
+//!   C                        今の場面（動画名・時刻・フレーム番号）をクリップボードにコピーし、標準出力にも出す
+//!   ドラッグ（フレーム上）   ウォーターマークの範囲を選ぶ（パネルの上では選択にならない。選択中はパネルを隠す）
 //!   Enter / D                選んだ範囲を参照画像にして検出する
 //!   R                        検出した ROI を、前後のフレームの実画素で戻す（Temporal Recovery）
-//!   Space                    処理前 / 処理後を切り替える（処理後で戻せなかった画素はマゼンタ）
+//!   B                        処理前 / 処理後を切り替える（処理後で戻せなかった画素はマゼンタ）
 //!   P                        処理後の画面に、各画素の由来（provenance）を色で重ねる / 外す
 //!   M                        動きのモデルを切り替える（translation / affine）。次の R から使う
 //!   F                        戻せなかった画素を周囲から推測して埋めるか切り替える（none / harmonic）。次の R から使う
@@ -30,16 +34,21 @@ const restore_cmd = @import("restore_cmd.zig");
 const provenance = @import("provenance.zig");
 const Provenance = provenance.Provenance;
 const spatial = @import("spatial.zig");
+const ps = @import("player_state.zig");
+const glyphs = @import("glyphs.zig");
 
 const sdl = @cImport({
     @cInclude("SDL.h");
 });
 
 const usage =
-    \\usage: vrestore-gui [--at <sec>] [--select x,y,w,h --detect-and-exit] <video>
+    \\usage: vrestore-gui [--at <sec> | --frame <n>] [--select x,y,w,h --detect-and-exit] <video>
     \\
     \\Drag over the watermark, then press Enter to find where it is fixed in the video.
     \\  --at <sec>              start at this time
+    \\  --frame <n>             start at this frame (0 = first; as printed by C)
+    \\  --play-frames <n>       with --share-and-exit, play n frames first (the same path as playback)
+    \\  --share-and-exit        print the current scene as "name t=<sec> frame=<n>" and exit (as C)
     \\  --select x,y,w,h        start with this selection (frame pixels)
     \\  --detect-and-exit       run the detection on --select once, print the JSON and exit
     \\                          (the same path as pressing Enter; used by the tests)
@@ -79,6 +88,12 @@ const App = struct {
     fill: spatial.Method = restore_cmd.default_fill,
     /// 表示用の画素（処理後で、戻せなかった画素をマゼンタにしたもの）
     display: []u8,
+    /// 映像の上に重ねる操作パネルと、再生の時計
+    panel: ps.Panel = .{ .x = 0, .y = 0 },
+    clock: ps.Clock = .{},
+    fps: f64,
+    /// 共有用の 1 行に出す動画の名前（パスの最後）
+    video_name: []const u8,
     /// 検出できなかったときの理由（窓のタイトルに出す）
     problem: [256]u8 = undefined,
     problem_len: usize = 0,
@@ -159,7 +174,54 @@ const App = struct {
         return app.display;
     }
 
+    fn togglePlay(app: *App) void {
+        if (app.clock.playing) {
+            app.clock.pause();
+        } else {
+            app.clearRestored();
+            // 末尾で押したら先頭から
+            const at = if (app.time_sec >= app.duration - app.frame_dur) 0 else app.time_sec;
+            app.clock.play(sdl.SDL_GetTicks64(), at);
+        }
+    }
+
+    fn pause(app: *App) void {
+        app.clock.pause();
+    }
+
+    /// 再生中の 1 刻み: 時計が指す時刻まで、フレームを読み進めるか seek する（player_state.advance）
+    fn tickTo(app: *App, target: f64) !bool {
+        switch (ps.advance(app.time_sec, target, app.frame_dur)) {
+            .wait => return false,
+            .frames => |n| {
+                for (0..n) |_| {
+                    const f = (try app.dec.next(app.rgb)) orelse {
+                        // 末尾に着いた
+                        app.clock.pause();
+                        return true;
+                    };
+                    app.time_sec = f.time_sec;
+                }
+                app.clearRestored();
+                return true;
+            },
+            .seek => |t| {
+                const playing = app.clock.playing;
+                try app.showAt(t);
+                // showAt は時計を合わせ直すので、再生中ならそのまま続ける
+                app.clock.playing = playing;
+                return true;
+            },
+        }
+    }
+
+    fn shareLine(app: *const App, buf: []u8) []const u8 {
+        return ps.shareLine(buf, app.video_name, app.time_sec, app.fps);
+    }
+
     fn showAt(app: *App, sec: f64) !void {
+        // 再生中にシークしたら、そこから再生を続ける
+        if (app.clock.playing) app.clock.play(sdl.SDL_GetTicks64(), std.math.clamp(sec, 0, app.duration));
         app.clearRestored();
         const t = std.math.clamp(sec, 0, @max(0, app.duration - app.frame_dur));
         try app.dec.seek(t);
@@ -220,6 +282,9 @@ pub fn main(init: std.process.Init) !u8 {
     var select: ?state.Rect = null;
     var detect_and_exit = false;
     var restore_too = false;
+    var frame_arg: ?u64 = null;
+    var play_frames: u64 = 0;
+    var share_and_exit = false;
     var show_prov = false;
     var motion_model = restore_cmd.default_motion;
     var fill_method = restore_cmd.default_fill;
@@ -229,6 +294,14 @@ pub fn main(init: std.process.Init) !u8 {
         const a = args[i];
         if (std.mem.eql(u8, a, "--detect-and-exit")) {
             detect_and_exit = true;
+        } else if (std.mem.eql(u8, a, "--frame") and i + 1 < args.len) {
+            i += 1;
+            frame_arg = std.fmt.parseInt(u64, args[i], 10) catch return badArg(&err.interface, "--frame needs a frame number", args[i]);
+        } else if (std.mem.eql(u8, a, "--play-frames") and i + 1 < args.len) {
+            i += 1;
+            play_frames = std.fmt.parseInt(u64, args[i], 10) catch return badArg(&err.interface, "--play-frames needs a number", args[i]);
+        } else if (std.mem.eql(u8, a, "--share-and-exit")) {
+            share_and_exit = true;
         } else if (std.mem.eql(u8, a, "--restore")) {
             restore_too = true;
         } else if (std.mem.eql(u8, a, "--show-provenance")) {
@@ -279,9 +352,11 @@ pub fn main(init: std.process.Init) !u8 {
         .duration = dec.info.duration_sec orelse 0,
         .motion_model = motion_model,
         .fill = fill_method,
+        .fps = fps,
+        .video_name = std.fs.path.basename(p),
         .frame_dur = 1 / fps,
     };
-    try app.showAt(at);
+    try app.showAt(if (frame_arg) |n| ps.frameToSec(n, fps) else at);
     if (select) |r| {
         if (r.w == 0 or r.h == 0 or @as(u64, r.x) + r.w > dec.info.width or @as(u64, r.y) + r.h > dec.info.height)
             return badArg(&err.interface, "--select goes outside the frame", "--select");
@@ -320,6 +395,18 @@ pub fn main(init: std.process.Init) !u8 {
     defer sdl.SDL_DestroyTexture(tex);
 
     defer app.clearRestored();
+    if (share_and_exit) {
+        // 再生と同じ経路（tickTo）で play_frames 枚ぶん進める
+        if (play_frames > 0) _ = try app.tickTo(app.time_sec + @as(f64, @floatFromInt(play_frames)) * app.frame_dur);
+        draw(&app, win, ren, tex);
+        if (screenshot) |png_path| saveScreenshot(arena, io, ren, png_path) catch |e| {
+            try err.interface.print("vrestore-gui: could not save the screenshot '{s}': {s}\n", .{ png_path, @errorName(e) });
+            return 1;
+        };
+        var line_buf: [512]u8 = undefined;
+        try out.interface.print("{s}\n", .{app.shareLine(&line_buf)});
+        return 0;
+    }
     if (detect_and_exit) {
         try app.detect();
         if (restore_too and app.detection != null) {
@@ -350,84 +437,135 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     var scrubbing = false;
+    var panel_seeking = false;
     var running = true;
     render(&app, win, ren, tex);
     while (running) {
         var ev: sdl.SDL_Event = undefined;
-        if (sdl.SDL_WaitEvent(&ev) == 0) break;
-        var dirty = true;
-        const v = viewOf(ren, &app);
-        switch (ev.type) {
-            sdl.SDL_QUIT => running = false,
-            sdl.SDL_MOUSEBUTTONDOWN => if (ev.button.button == sdl.SDL_BUTTON_LEFT) {
-                const mx: f32 = @floatFromInt(ev.button.x);
-                const my: f32 = @floatFromInt(ev.button.y);
-                if (my >= v.y + v.h) {
-                    scrubbing = true;
-                    try app.showAt(state.timelineToSec(mx, 0, windowWidth(ren), app.duration));
-                } else app.selection.begin(v.toFrame(mx, my));
-            },
-            sdl.SDL_MOUSEMOTION => {
-                const mx: f32 = @floatFromInt(ev.motion.x);
-                const my: f32 = @floatFromInt(ev.motion.y);
-                if (scrubbing) {
-                    try app.showAt(state.timelineToSec(mx, 0, windowWidth(ren), app.duration));
-                } else if (app.selection.anchor != null) {
-                    app.selection.move(v.toFrame(mx, my));
-                } else dirty = false;
-            },
-            sdl.SDL_MOUSEBUTTONUP => if (ev.button.button == sdl.SDL_BUTTON_LEFT) {
-                if (scrubbing) {
-                    scrubbing = false;
-                } else app.selection.end(v.toFrame(@floatFromInt(ev.button.x), @floatFromInt(ev.button.y)));
-            },
-            sdl.SDL_KEYDOWN => {
-                const shift = (ev.key.keysym.mod & sdl.KMOD_SHIFT) != 0;
-                switch (ev.key.keysym.scancode) {
-                    sdl.SDL_SCANCODE_Q => running = false,
-                    sdl.SDL_SCANCODE_ESCAPE => {
-                        app.clearRestored();
-                        app.selection = .{};
-                        app.detection = null;
-                        app.problem_len = 0;
-                    },
-                    sdl.SDL_SCANCODE_RETURN, sdl.SDL_SCANCODE_D => {
-                        sdl.SDL_SetWindowTitle(win, "vrestore-gui | detecting...");
-                        try app.detect();
-                    },
-                    sdl.SDL_SCANCODE_R => {
-                        sdl.SDL_SetWindowTitle(win, "vrestore-gui | restoring...");
-                        try app.restore();
-                    },
-                    sdl.SDL_SCANCODE_SPACE => {
-                        if (app.restored != null) app.show_after = !app.show_after;
-                    },
-                    sdl.SDL_SCANCODE_M => {
-                        app.clearRestored();
-                        app.motion_model = if (app.motion_model == .translation) .affine else .translation;
-                    },
-                    sdl.SDL_SCANCODE_F => {
-                        app.clearRestored();
-                        app.fill = if (app.fill == .none) .harmonic else .none;
-                    },
-                    sdl.SDL_SCANCODE_P => {
-                        if (app.restored != null) {
-                            app.show_provenance = !app.show_provenance;
-                            app.show_after = true;
-                        }
-                    },
-                    sdl.SDL_SCANCODE_RIGHT => if (shift) try app.showAt(app.time_sec + 1) else try app.step(),
-                    sdl.SDL_SCANCODE_LEFT => try app.showAt(app.time_sec - if (shift) 1 else app.frame_dur),
-                    sdl.SDL_SCANCODE_UP => try app.showAt(app.time_sec + 10),
-                    sdl.SDL_SCANCODE_DOWN => try app.showAt(app.time_sec - 10),
-                    sdl.SDL_SCANCODE_HOME => try app.showAt(0),
-                    sdl.SDL_SCANCODE_END => try app.showAt(app.duration),
-                    else => dirty = false,
-                }
-            },
-            sdl.SDL_WINDOWEVENT => {},
-            else => dirty = false,
+        // 再生中は、次のフレームの時刻までだけイベントを待つ
+        const got = if (app.clock.playing)
+            sdl.SDL_WaitEventTimeout(&ev, @intFromFloat(@max(1, app.frame_dur * 1000 / 2)))
+        else
+            sdl.SDL_WaitEvent(&ev);
+        var dirty = false;
+        if (got != 0) {
+            dirty = true;
+            const v = viewOf(ren, &app);
+            const area = areaOf(v);
+            switch (ev.type) {
+                sdl.SDL_QUIT => running = false,
+                sdl.SDL_MOUSEBUTTONDOWN => if (ev.button.button == sdl.SDL_BUTTON_LEFT) {
+                    const mx: f32 = @floatFromInt(ev.button.x);
+                    const my: f32 = @floatFromInt(ev.button.y);
+                    if (my >= v.y + v.h) {
+                        scrubbing = true;
+                        try app.showAt(state.timelineToSec(mx, 0, windowWidth(ren), app.duration));
+                    } else switch (ps.routePress(app.panel, area, mx, my)) {
+                        .toggle_play => app.togglePlay(),
+                        .seek => {
+                            panel_seeking = true;
+                            try app.showAt(ps.seekToSec(app.panel.seekBar(area), mx, app.duration));
+                        },
+                        .move_panel => app.panel.beginDrag(area, mx, my),
+                        .select => {
+                            app.pause();
+                            app.selection.begin(v.toFrame(mx, my));
+                        },
+                        .nothing => dirty = false,
+                    }
+                },
+                sdl.SDL_MOUSEMOTION => {
+                    const mx: f32 = @floatFromInt(ev.motion.x);
+                    const my: f32 = @floatFromInt(ev.motion.y);
+                    if (scrubbing) {
+                        try app.showAt(state.timelineToSec(mx, 0, windowWidth(ren), app.duration));
+                    } else if (panel_seeking) {
+                        try app.showAt(ps.seekToSec(app.panel.seekBar(area), mx, app.duration));
+                    } else if (app.panel.grab != null) {
+                        app.panel.drag(area, mx, my);
+                    } else if (app.selection.anchor != null) {
+                        app.selection.move(v.toFrame(mx, my));
+                    } else dirty = false;
+                },
+                sdl.SDL_MOUSEBUTTONUP => if (ev.button.button == sdl.SDL_BUTTON_LEFT) {
+                    if (scrubbing) {
+                        scrubbing = false;
+                    } else if (panel_seeking) {
+                        panel_seeking = false;
+                    } else if (app.panel.grab != null) {
+                        app.panel.endDrag();
+                    } else app.selection.end(v.toFrame(@floatFromInt(ev.button.x), @floatFromInt(ev.button.y)));
+                },
+                sdl.SDL_KEYDOWN => {
+                    const shift = (ev.key.keysym.mod & sdl.KMOD_SHIFT) != 0;
+                    switch (ev.key.keysym.scancode) {
+                        sdl.SDL_SCANCODE_Q => running = false,
+                        sdl.SDL_SCANCODE_SPACE => app.togglePlay(),
+                        sdl.SDL_SCANCODE_H => app.panel.hidden = !app.panel.hidden,
+                        sdl.SDL_SCANCODE_C => {
+                            var line_buf: [512]u8 = undefined;
+                            const line = app.shareLine(&line_buf);
+                            var z: [513]u8 = undefined;
+                            @memcpy(z[0..line.len], line);
+                            z[line.len] = 0;
+                            _ = sdl.SDL_SetClipboardText(@ptrCast(&z));
+                            try out.interface.print("{s}\n", .{line});
+                            try out.interface.flush();
+                            app.setProblem("copied: {s}", .{line});
+                        },
+                        sdl.SDL_SCANCODE_ESCAPE => {
+                            app.clearRestored();
+                            app.selection = .{};
+                            app.detection = null;
+                            app.problem_len = 0;
+                        },
+                        sdl.SDL_SCANCODE_RETURN, sdl.SDL_SCANCODE_D => {
+                            app.pause();
+                            sdl.SDL_SetWindowTitle(win, "vrestore-gui | detecting...");
+                            try app.detect();
+                        },
+                        sdl.SDL_SCANCODE_R => {
+                            app.pause();
+                            sdl.SDL_SetWindowTitle(win, "vrestore-gui | restoring...");
+                            try app.restore();
+                        },
+                        sdl.SDL_SCANCODE_B => {
+                            if (app.restored != null) app.show_after = !app.show_after;
+                        },
+                        sdl.SDL_SCANCODE_M => {
+                            app.clearRestored();
+                            app.motion_model = if (app.motion_model == .translation) .affine else .translation;
+                        },
+                        sdl.SDL_SCANCODE_F => {
+                            app.clearRestored();
+                            app.fill = if (app.fill == .none) .harmonic else .none;
+                        },
+                        sdl.SDL_SCANCODE_P => {
+                            if (app.restored != null) {
+                                app.show_provenance = !app.show_provenance;
+                                app.show_after = true;
+                            }
+                        },
+                        sdl.SDL_SCANCODE_RIGHT => {
+                            app.pause();
+                            if (shift) try app.showAt(app.time_sec + 1) else try app.step();
+                        },
+                        sdl.SDL_SCANCODE_LEFT => {
+                            app.pause();
+                            try app.showAt(app.time_sec - if (shift) 1 else app.frame_dur);
+                        },
+                        sdl.SDL_SCANCODE_UP => try app.showAt(app.time_sec + 10),
+                        sdl.SDL_SCANCODE_DOWN => try app.showAt(app.time_sec - 10),
+                        sdl.SDL_SCANCODE_HOME => try app.showAt(0),
+                        sdl.SDL_SCANCODE_END => try app.showAt(app.duration),
+                        else => dirty = false,
+                    }
+                },
+                sdl.SDL_WINDOWEVENT => {},
+                else => dirty = false,
+            }
         }
+        if (app.clock.playing and try app.tickTo(app.clock.target(sdl.SDL_GetTicks64()))) dirty = true;
         if (dirty) render(&app, win, ren, tex);
     }
     return 0;
@@ -489,7 +627,9 @@ fn draw(app: *App, win: *sdl.SDL_Window, ren: *sdl.SDL_Renderer, tex: *sdl.SDL_T
         fill(ren, .{ .x = tick - 1, .y = by + bar_h / 2, .w = 2, .h = bar_h / 2 }, .{ 255, 255, 255 });
     }
 
-    // 数値は窓のタイトルに出す（SDL2 には文字を描く機能が無い。docs/adr/0004）
+    if (ps.panelVisible(app.panel, app.selection.anchor != null)) drawPanel(app, ren, areaOf(v));
+
+    // 数値は窓のタイトルにも出す（パネルの文字は数字と記号だけ。docs/adr/0009）
     var title_buf: [512]u8 = undefined;
     var w: Io.Writer = .fixed(&title_buf);
     title(&w, app) catch {};
@@ -497,15 +637,63 @@ fn draw(app: *App, win: *sdl.SDL_Window, ren: *sdl.SDL_Renderer, tex: *sdl.SDL_T
     sdl.SDL_SetWindowTitle(win, @ptrCast(&title_buf));
 }
 
+/// 映像を描いている領域（パネルはこの中に収める）
+fn areaOf(v: state.View) ps.Box {
+    return .{ .x = v.x, .y = v.y, .w = v.w, .h = v.h };
+}
+
+/// 映像の上に重ねる操作パネル: 半透明の地、再生 / 一時停止、シークバー、時刻とフレーム番号
+fn drawPanel(app: *App, ren: *sdl.SDL_Renderer, area: ps.Box) void {
+    const b = app.panel.box(area);
+    _ = sdl.SDL_SetRenderDrawBlendMode(ren, sdl.SDL_BLENDMODE_BLEND);
+    defer _ = sdl.SDL_SetRenderDrawBlendMode(ren, sdl.SDL_BLENDMODE_NONE);
+    _ = sdl.SDL_SetRenderDrawColor(ren, 20, 20, 20, 170);
+    _ = sdl.SDL_RenderFillRectF(ren, &.{ .x = b.x, .y = b.y, .w = b.w, .h = b.h });
+
+    // 再生中は ❚❚、止まっていれば ▶
+    const pb = app.panel.playButton(area);
+    const white = sdl.SDL_Color{ .r = 240, .g = 240, .b = 240, .a = 255 };
+    if (app.clock.playing) {
+        fill(ren, .{ .x = pb.x + 9, .y = pb.y + 8, .w = 6, .h = pb.h - 16 }, .{ 240, 240, 240 });
+        fill(ren, .{ .x = pb.x + pb.w - 15, .y = pb.y + 8, .w = 6, .h = pb.h - 16 }, .{ 240, 240, 240 });
+    } else {
+        const tri = [3]sdl.SDL_Vertex{
+            .{ .position = .{ .x = pb.x + 10, .y = pb.y + 7 }, .color = white, .tex_coord = .{ .x = 0, .y = 0 } },
+            .{ .position = .{ .x = pb.x + 10, .y = pb.y + pb.h - 7 }, .color = white, .tex_coord = .{ .x = 0, .y = 0 } },
+            .{ .position = .{ .x = pb.x + pb.w - 7, .y = pb.y + pb.h / 2 }, .color = white, .tex_coord = .{ .x = 0, .y = 0 } },
+        };
+        _ = sdl.SDL_RenderGeometry(ren, null, &tri, 3, null, 0);
+    }
+
+    // シークバー: 地、再生済み、つまみ
+    const sb = app.panel.seekBar(area);
+    fill(ren, .{ .x = sb.x, .y = sb.y + sb.h / 2 - 2, .w = sb.w, .h = 4 }, .{ 110, 110, 110 });
+    const progress: f32 = if (app.duration > 0) @floatCast(std.math.clamp(app.time_sec / app.duration, 0, 1)) else 0;
+    fill(ren, .{ .x = sb.x, .y = sb.y + sb.h / 2 - 2, .w = sb.w * progress, .h = 4 }, .{ 240, 240, 240 });
+    fill(ren, .{ .x = sb.x + sb.w * progress - 4, .y = sb.y, .w = 8, .h = sb.h }, .{ 255, 255, 255 });
+
+    // 時刻 / 長さ  #フレーム番号
+    var text_buf: [64]u8 = undefined;
+    const text = ps.panelText(&text_buf, app.time_sec, app.duration, app.fps);
+    const lb = app.panel.label(area);
+    const Ctx = struct { ren: *sdl.SDL_Renderer, x: f32, y: f32 };
+    _ = sdl.SDL_SetRenderDrawColor(ren, 235, 235, 235, 255);
+    glyphs.render(text, 2, Ctx{ .ren = ren, .x = lb.x, .y = lb.y }, struct {
+        fn f(c: Ctx, x: u32, y: u32) void {
+            _ = sdl.SDL_RenderFillRectF(c.ren, &.{ .x = c.x + @as(f32, @floatFromInt(x)), .y = c.y + @as(f32, @floatFromInt(y)), .w = 2, .h = 2 });
+        }
+    }.f);
+}
+
 fn title(w: *Io.Writer, app: *const App) !void {
-    try w.print("vrestore-gui | {d:.3}s / {d:.1}s | motion {s} fill {s}", .{ app.time_sec, app.duration, @tagName(app.motion_model), @tagName(app.fill) });
+    try w.print("vrestore-gui | {d:.3}s / {d:.1}s frame {d} | motion {s} fill {s}", .{ app.time_sec, app.duration, ps.frameIndex(app.time_sec, app.fps), @tagName(app.motion_model), @tagName(app.fill) });
     if (app.restored != null) {
         try w.print(" | {s} | restored {d:.1}% of the ROI", .{ if (app.show_after) "AFTER" else "BEFORE", app.recovered.coverage() * 100 });
         // 由来ごとの割合（ROI の中）。色は P で重ねたときのもの
         for (std.enums.values(Provenance)) |p| if (p.inRoi()) {
             try w.print(" {s} {d:.1}%", .{ @tagName(p), app.recovered.fraction(p) * 100 });
         };
-        try w.writeAll(if (app.show_provenance) " (green: temporal_real, orange: spatial_inpainted, magenta: unrecovered) | Space: before/after, P: provenance off" else " (magenta: unrecovered) | Space: before/after, P: provenance");
+        try w.writeAll(if (app.show_provenance) " (green: temporal_real, orange: spatial_inpainted, magenta: unrecovered) | B: before/after, P: provenance off" else " (magenta: unrecovered) | B: before/after, P: provenance");
     }
     if (app.selection.rect) |r| try w.print(" | selected {d},{d} {d}x{d}", .{ r.x, r.y, r.w, r.h });
     if (app.detection) |d| {
