@@ -74,4 +74,4 @@ ln -s ~/path/to/実素材.mp4 tmp/media/
 
 | 何が起きたか | 代わりにどうするか |
 |---|---|
-| — | — |
+| Zig 0.16 の `std.Io.File.Writer.init` で stdout に書いたら、`{ echo; vrestore ...; } > file` のように前の出力があるファイルで先頭から上書きした（位置指定書き込み）。`zig build` の Run ステップは stdout をパイプで受けるので、テストでは見えなかった | stdout / stderr は `.initStreaming` で開く。`build.zig` の `cli_stdout_file` が止める |

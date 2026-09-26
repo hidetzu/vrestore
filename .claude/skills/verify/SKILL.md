@@ -12,6 +12,8 @@ description: vrestore の変更が壊れていないと言うために何を実�
 
 - Zig: `build.zig.zon` の `minimum_zig_version`（CI も同じ値を読む）
 - ⚠ `zig version` がそれと一致することを最初に確かめる。Zig は版ごとに std が大きく変わる
+- FFmpeg: `ffmpeg` コマンド（テスト用動画の合成）と、pkg-config で見つかる libavformat / libavcodec /
+  libswscale / libavutil（リンク）。CI で入れているものは `.github/workflows/ci.yml`
 
 ## fast
 
@@ -24,7 +26,7 @@ zig build check
 | 中身 | 何を見るか |
 |---|---|
 | `zig fmt --check` | `build.zig` `build.zig.zon` `src/` の整形 |
-| `zig build test` | ユニットテスト |
+| `zig build test` | ユニットテスト（動画は ffmpeg で合成してから）と、実行ファイルを起動する `cli_*` |
 | `scripts/check-no-media.sh` | 動画・1 MiB 超のファイルが git の管理下（ステージ含む）に無いこと。件数を出す |
 | `zig build`（install） | 実行ファイルが作れること |
 
@@ -44,5 +46,9 @@ scripts/check-no-media.sh                            # 衛生だけ
 
 ## 実素材
 
-`tmp/media/` の動画に対して手で回し、デバッグ画像を見る。CI では回らない。
+`tmp/media/` の動画に対して手で回す。CI では回らない。
+
+```sh
+for f in tmp/media/*; do echo "$f"; zig-out/bin/vrestore probe "$f"; done
+```
 報告では「実素材では見ていない」を `Not verified` に書く。
