@@ -94,12 +94,6 @@ pub fn normalize(a: [2]u32, b: [2]u32) Rect {
     return .{ .x = x0, .y = y0, .w = @max(a[0], b[0]) - x0, .h = @max(a[1], b[1]) - y0 };
 }
 
-/// タイムライン（窓の下端の帯）上の横位置から時刻を出す
-pub fn timelineToSec(sx: f32, bar_x: f32, bar_w: f32, duration: f64) f64 {
-    const t = std.math.clamp((sx - bar_x) / bar_w, 0, 1);
-    return @as(f64, t) * duration;
-}
-
 /// RGB24 のフレームから矩形を切り出す（参照画像を作る）
 pub fn crop(gpa: std.mem.Allocator, rgb: []const u8, frame_w: u32, r: Rect) ![]u8 {
     const row = @as(usize, r.w) * 3;
@@ -147,12 +141,6 @@ test "gui: selection works in any drag direction and ignores a plain click" {
     s.begin(.{ 5, 5 });
     s.end(.{ 5, 5 });
     try std.testing.expectEqual(Rect{ .x = 100, .y = 150, .w = 200, .h = 50 }, s.rect.?);
-}
-
-test "gui: timeline maps position to time and clamps" {
-    try std.testing.expectEqual(@as(f64, 0), timelineToSec(-5, 10, 100, 60));
-    try std.testing.expectApproxEqAbs(@as(f64, 30), timelineToSec(60, 10, 100, 60), 1e-6);
-    try std.testing.expectEqual(@as(f64, 60), timelineToSec(500, 10, 100, 60));
 }
 
 test "gui: crop cuts the selected pixels" {

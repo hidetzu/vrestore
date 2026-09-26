@@ -18,7 +18,6 @@
 //!   F                        戻せなかった画素を周囲から推測して埋めるか切り替える（none / harmonic）。次の R から使う
 //!   ← / →                    1 フレーム戻る / 進む（Shift で 1 秒、↑ / ↓ で 10 秒）
 //!   Home / End               先頭 / 末尾
-//!   クリック・ドラッグ（下の帯）  その時刻へ移動
 //!   Esc                      選択と検出結果を消す
 //!   Q / 窓を閉じる           終了
 
@@ -61,8 +60,8 @@ const usage =
     \\
 ;
 
-/// 下端の帯（タイムラインと検出結果の表示）の高さ
-const bar_h = 28;
+/// 下端の帯（検出の得票率の棒）の高さ。時刻の移動は操作パネルのシークバーで行う
+const bar_h = 14;
 
 const App = struct {
     gpa: std.mem.Allocator,
@@ -436,7 +435,6 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     }
 
-    var scrubbing = false;
     var panel_seeking = false;
     var running = true;
     render(&app, win, ren, tex);
@@ -457,10 +455,7 @@ pub fn main(init: std.process.Init) !u8 {
                 sdl.SDL_MOUSEBUTTONDOWN => if (ev.button.button == sdl.SDL_BUTTON_LEFT) {
                     const mx: f32 = @floatFromInt(ev.button.x);
                     const my: f32 = @floatFromInt(ev.button.y);
-                    if (my >= v.y + v.h) {
-                        scrubbing = true;
-                        try app.showAt(state.timelineToSec(mx, 0, windowWidth(ren), app.duration));
-                    } else switch (ps.routePress(app.panel, area, mx, my)) {
+                    switch (ps.routePress(app.panel, area, mx, my)) {
                         .toggle_play => app.togglePlay(),
                         .seek => {
                             panel_seeking = true;
@@ -477,9 +472,7 @@ pub fn main(init: std.process.Init) !u8 {
                 sdl.SDL_MOUSEMOTION => {
                     const mx: f32 = @floatFromInt(ev.motion.x);
                     const my: f32 = @floatFromInt(ev.motion.y);
-                    if (scrubbing) {
-                        try app.showAt(state.timelineToSec(mx, 0, windowWidth(ren), app.duration));
-                    } else if (panel_seeking) {
+                    if (panel_seeking) {
                         try app.showAt(ps.seekToSec(app.panel.seekBar(area), mx, app.duration));
                     } else if (app.panel.grab != null) {
                         app.panel.drag(area, mx, my);
@@ -488,9 +481,7 @@ pub fn main(init: std.process.Init) !u8 {
                     } else dirty = false;
                 },
                 sdl.SDL_MOUSEBUTTONUP => if (ev.button.button == sdl.SDL_BUTTON_LEFT) {
-                    if (scrubbing) {
-                        scrubbing = false;
-                    } else if (panel_seeking) {
+                    if (panel_seeking) {
                         panel_seeking = false;
                     } else if (app.panel.grab != null) {
                         app.panel.endDrag();
@@ -615,16 +606,14 @@ fn draw(app: *App, win: *sdl.SDL_Window, ren: *sdl.SDL_Renderer, tex: *sdl.SDL_T
     if (app.selection.dragging() orelse app.selection.rect) |r| drawRect(ren, v, r, .{ 0, 220, 255 }, 1);
     if (app.detection) |d| drawRect(ren, v, .{ .x = @intCast(d.x), .y = @intCast(d.y), .w = @intCast(d.width), .h = @intCast(d.height) }, if (d.reliable) .{ 255, 32, 32 } else .{ 255, 210, 0 }, 3);
 
-    // 下端の帯: 上半分がタイムライン、下半分が得票率の棒（閾値の位置に白い目盛り）
+    // 下端の帯: 検出の得票率の棒（reliable なら赤、そうでなければ黄。閾値の位置に白い目盛り）
     const by = v.y + v.h;
     fill(ren, .{ .x = 0, .y = by, .w = ww, .h = bar_h }, .{ 48, 48, 48 });
-    const progress: f32 = if (app.duration > 0) @floatCast(app.time_sec / app.duration) else 0;
-    fill(ren, .{ .x = 0, .y = by + 2, .w = ww * progress, .h = bar_h / 2 - 3 }, .{ 120, 160, 220 });
     if (app.detection) |d| {
         const col: [3]u8 = if (d.reliable) .{ 255, 32, 32 } else .{ 255, 210, 0 };
-        fill(ren, .{ .x = 0, .y = by + bar_h / 2 + 1, .w = ww * @as(f32, @floatCast(d.confidence)), .h = bar_h / 2 - 3 }, col);
+        fill(ren, .{ .x = 0, .y = by + 2, .w = ww * @as(f32, @floatCast(d.confidence)), .h = bar_h - 4 }, col);
         const tick = ww * @as(f32, @floatCast(detect_roi.default_thresholds.min_confidence));
-        fill(ren, .{ .x = tick - 1, .y = by + bar_h / 2, .w = 2, .h = bar_h / 2 }, .{ 255, 255, 255 });
+        fill(ren, .{ .x = tick - 1, .y = by, .w = 2, .h = bar_h }, .{ 255, 255, 255 });
     }
 
     if (ps.panelVisible(app.panel, app.selection.anchor != null)) drawPanel(app, ren, areaOf(v));
