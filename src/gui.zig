@@ -16,6 +16,7 @@
 //!   P                        処理後の画面に、各画素の由来（provenance）を色で重ねる / 外す
 //!   M                        動きのモデルを切り替える（translation / affine）。次の R から使う
 //!   F                        戻せなかった画素を周囲から推測して埋めるか切り替える（none / harmonic）。次の R から使う
+//!   K                        ROI の中のウォーターマークの画素だけを隠す（auto）か、ROI 全体を隠す（none）か。次の R から使う
 //!   ← / →                    1 フレーム戻る / 進む（Shift で 1 秒、↑ / ↓ で 10 秒）
 //!   Home / End               先頭 / 末尾
 //!   Esc                      選択と検出結果を消す
@@ -33,6 +34,7 @@ const restore_cmd = @import("restore_cmd.zig");
 const provenance = @import("provenance.zig");
 const Provenance = provenance.Provenance;
 const spatial = @import("spatial.zig");
+const wmask = @import("wmask.zig");
 const ps = @import("player_state.zig");
 const glyphs = @import("glyphs.zig");
 const fonts = @import("fonts.zig");
@@ -147,6 +149,7 @@ const usage =
     \\  --show-provenance       with --restore, show the provenance colors (as pressing P)
     \\  --motion <m>            translation or affine (as pressing M)
     \\  --fill <f>              none, directional or harmonic (F toggles none / harmonic)
+    \\  --mask <m>              none or auto (K toggles): hide only the watermark's own pixels
     \\  --screenshot <png>      with --detect-and-exit, also save what the window shows
     \\
 ;
@@ -173,6 +176,9 @@ const App = struct {
     motion_model: restore_cmd.MotionModel = restore_cmd.default_motion,
     /// 戻せなかった画素を埋める方式（F で切り替え）
     fill: spatial.Method = restore_cmd.default_fill,
+    /// ROI の中のウォーターマークの画素だけを隠すか（K で切り替え）と、検出のたびに推定したマスク
+    mask_mode: restore_cmd.MaskMode = restore_cmd.default_mask,
+    mask: ?wmask.Estimate = null,
     /// 表示用の画素（処理後で、戻せなかった画素をマゼンタにしたもの）
     display: []u8,
     /// 映像の上に重ねる操作パネルと、再生の時計
@@ -238,7 +244,7 @@ const App = struct {
         errdefer app.gpa.free(out);
         const prov = try app.gpa.alloc(Provenance, @as(usize, d.info.width) * d.info.height);
         errdefer app.gpa.free(prov);
-        app.recovered = try restore_cmd.recoverInWindow(app.gpa, app.motion_model, app.fill, images, t, roi_rect, restore_cmd.default_min_peak, restore_cmd.default_max_ring_diff, out, prov);
+        app.recovered = try restore_cmd.recoverInWindow(app.gpa, app.motion_model, app.fill, images, t, roi_rect, try app.hiddenMask(roi_rect), restore_cmd.default_min_peak, restore_cmd.default_max_ring_diff, out, prov);
         app.restored = out;
         app.restored_prov = prov;
         app.show_after = true;
@@ -324,7 +330,25 @@ const App = struct {
     }
 
     /// 選択範囲を参照画像にして検出する。Enter と --detect-and-exit はどちらもここを通る
+    /// 復元の後、戻せなかった画素のうち埋めるものを絞るマスク。使うなら、必要になった時に一度だけ推定する
+    fn hiddenMask(app: *App, area: temporal.Rect) !?[]const bool {
+        if (app.mask_mode == .none) return null;
+        if (app.mask == null) {
+            var d = try video.Decoder.open(app.path);
+            defer d.close();
+            app.mask = try restore_cmd.estimateMask(app.gpa, &d, area);
+        }
+        const m = app.mask.?;
+        return if (m.accepted) m.hidden else null;
+    }
+
+    fn clearMask(app: *App) void {
+        if (app.mask) |m| m.deinit(app.gpa);
+        app.mask = null;
+    }
+
     fn detect(app: *App) !void {
+        app.clearMask();
         app.clearRestored();
         app.detection = null;
         app.problem_len = 0;
@@ -378,6 +402,7 @@ pub fn main(init: std.process.Init) !u8 {
     var show_prov = false;
     var motion_model = restore_cmd.default_motion;
     var fill_method = restore_cmd.default_fill;
+    var mask_mode = restore_cmd.default_mask;
     var screenshot: ?[]const u8 = null;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -399,6 +424,9 @@ pub fn main(init: std.process.Init) !u8 {
             restore_too = true;
         } else if (std.mem.eql(u8, a, "--show-provenance")) {
             show_prov = true;
+        } else if (std.mem.eql(u8, a, "--mask") and i + 1 < args.len) {
+            i += 1;
+            mask_mode = std.meta.stringToEnum(restore_cmd.MaskMode, args[i]) orelse return badArg(&err.interface, "--mask needs none or auto", args[i]);
         } else if (std.mem.eql(u8, a, "--fill") and i + 1 < args.len) {
             i += 1;
             fill_method = std.meta.stringToEnum(spatial.Method, args[i]) orelse return badArg(&err.interface, "--fill needs none, directional or harmonic", args[i]);
@@ -445,6 +473,7 @@ pub fn main(init: std.process.Init) !u8 {
         .duration = dec.info.duration_sec orelse 0,
         .motion_model = motion_model,
         .fill = fill_method,
+        .mask_mode = mask_mode,
         .fps = fps,
         .video_name = std.fs.path.basename(p),
         .frame_dur = 1 / fps,
@@ -502,6 +531,7 @@ pub fn main(init: std.process.Init) !u8 {
     app.text = &text;
 
     defer app.clearRestored();
+    defer app.clearMask();
     if (share_and_exit) {
         // 再生と同じ経路（tickTo）で play_frames 枚ぶん進める
         if (play_frames > 0) _ = try app.tickTo(app.time_sec + @as(f64, @floatFromInt(play_frames)) * app.frame_dur);
@@ -641,6 +671,10 @@ pub fn main(init: std.process.Init) !u8 {
                             app.clearRestored();
                             app.motion_model = if (app.motion_model == .translation) .affine else .translation;
                         },
+                        sdl.SDL_SCANCODE_K => {
+                            app.clearRestored();
+                            app.mask_mode = if (app.mask_mode == .none) .auto else .none;
+                        },
                         sdl.SDL_SCANCODE_F => {
                             app.clearRestored();
                             app.fill = if (app.fill == .none) .harmonic else .none;
@@ -750,6 +784,9 @@ fn info(w: *Io.Writer, app: *const App) !void {
         try w.print("{s}  restored {d:.1}%", .{ if (app.show_after) "AFTER" else "BEFORE", app.recovered.coverage() * 100 });
         if (app.recovered.counts.get(.spatial_inpainted) > 0) try w.print("  inpainted {d:.1}%", .{app.recovered.fraction(.spatial_inpainted) * 100});
         try w.print("  unrecovered {d:.1}%  {s}/{s}", .{ app.recovered.fraction(.unrecovered) * 100, @tagName(app.motion_model), @tagName(app.fill) });
+        if (app.mask) |m| {
+            if (m.accepted) try w.print("  mask {d:.0}%", .{m.fraction * 100}) else try w.writeAll("  mask: whole ROI");
+        }
         return;
     }
     if (app.detection) |d| {
