@@ -290,14 +290,17 @@ pub fn recoverFrame(frames: []const Image, track: Track, target: usize, roi: Rec
     std.debug.assert(frames.len <= max_window_frames);
     var usable: [max_window_frames]bool = undefined;
     var to_s: [max_window_frames]Affine = undefined;
+    // 借りる画素に足す明るさの差（帯での平均、表示中 − s、R/G/B）。フレームごとの露出や圧縮の差で、
+    // 借りた画素だけ少し明るい / 暗いと、ROI の縁に沿って線に見える（実写で +2 程度の段差を観測）
+    var offset: [max_window_frames][3]f64 = undefined;
     for (0..frames.len) |s| {
         usable[s] = s != target and track.segment[s] == track.segment[target];
+        offset[s] = .{ 0, 0, 0 };
         if (!usable[s]) continue;
         to_s[s] = track.transform(target, s);
-        if (max_ring_diff) |limit| {
-            const d = ringDiff(t, frames[s], roi, to_s[s]);
-            usable[s] = if (d) |v| v <= limit else false;
-        }
+        const r = ringDiff(t, frames[s], roi, to_s[s]);
+        if (max_ring_diff) |limit| usable[s] = if (r) |v| v.mad <= limit else false;
+        if (r) |v| offset[s] = v.offset;
     }
     for (roi.y..roi.y + roi.h) |y| {
         for (roi.x..roi.x + roi.w) |x| {
@@ -311,7 +314,8 @@ pub fn recoverFrame(frames: []const Image, track: Track, target: usize, roi: Rec
                     if (!usable[s]) continue;
                     // 背景の同じ点は、フレーム s では to_s[s](x, y) にある
                     const q = to_s[s].apply(@floatFromInt(x), @floatFromInt(y));
-                    const px = sample(frames[s], roi, q[0], q[1]) orelse continue;
+                    var px = sample(frames[s], roi, q[0], q[1]) orelse continue;
+                    for (&px, offset[s]) |*v, o| v.* = @intFromFloat(std.math.clamp(@round(@as(f64, @floatFromInt(v.*)) + o), 0, 255));
                     out[(y * w + x) * 3 ..][0..3].* = px;
                     prov[y * w + x] = .temporal_real;
                     break :search;
@@ -337,7 +341,7 @@ const ring_band = 6;
 /// 動きが画面全体の平行移動でない（手持ちの揺れ・被写体の動き・ズーム）と、累積した移動量は ROI の近くで
 /// 合わない。そのフレームから画素を借りると、正しくない画素を「戻した」と言ってしまう（手持ちの実写で観測）。
 /// 比べられる画素が帯の 1/4 未満なら確かめられないとして null
-fn ringDiff(t: Image, s: Image, roi: Rect, to_s: Affine) ?f64 {
+fn ringDiff(t: Image, s: Image, roi: Rect, to_s: Affine) ?struct { mad: f64, offset: [3]f64 } {
     const w: i64 = t.width;
     const h: i64 = t.height;
     const x0: i64 = @as(i64, roi.x) - ring_band;
@@ -345,6 +349,7 @@ fn ringDiff(t: Image, s: Image, roi: Rect, to_s: Affine) ?f64 {
     const x1: i64 = @as(i64, roi.x) + roi.w + ring_band;
     const y1: i64 = @as(i64, roi.y) + roi.h + ring_band;
     var sum: f64 = 0;
+    var signed = [3]f64{ 0, 0, 0 };
     var n: u64 = 0;
     var total: u64 = 0;
     var y = y0;
@@ -357,12 +362,17 @@ fn ringDiff(t: Image, s: Image, roi: Rect, to_s: Affine) ?f64 {
             const q = to_s.apply(@floatFromInt(x), @floatFromInt(y));
             const sp = sample(s, roi, q[0], q[1]) orelse continue;
             const it = (@as(usize, @intCast(y)) * t.width + @as(usize, @intCast(x))) * 3;
-            for (0..3) |c| sum += @abs(@as(f64, @floatFromInt(t.rgb[it + c])) - @as(f64, @floatFromInt(sp[c])));
+            for (0..3) |c| {
+                const d = @as(f64, @floatFromInt(t.rgb[it + c])) - @as(f64, @floatFromInt(sp[c]));
+                sum += @abs(d);
+                signed[c] += d;
+            }
             n += 3;
         }
     }
     if (n / 3 * 4 < total) return null;
-    return sum / @as(f64, @floatFromInt(n));
+    const px: f64 = @floatFromInt(n / 3);
+    return .{ .mad = sum / @as(f64, @floatFromInt(n)), .offset = .{ signed[0] / px, signed[1] / px, signed[2] / px } };
 }
 
 // ---- tests -------------------------------------------------------------------
@@ -385,6 +395,41 @@ fn view(gpa: Allocator, s: []const u8, sw: u32, ox: u32, oy: u32, w: u32, h: u32
     const out = try gpa.alloc(u8, @as(usize, w) * h * 3);
     for (0..h) |y| @memcpy(out[y * w * 3 ..][0 .. w * 3], s[((oy + y) * sw + ox) * 3 ..][0 .. w * 3]);
     return out;
+}
+
+test "temporal: recoverFrame matches the brightness of the borrowed pixels to the frame shown" {
+    // 背景が 1 フレームに +6 px 動き、フレーム k は明るさが k - 4 ずれる（露出の変化。帯の確認の閾値 6 より小さい）
+    const gpa = std.testing.allocator;
+    const sw = 400;
+    const s = try scene(gpa, sw, 200, 3);
+    defer gpa.free(s);
+    for (s) |*v| v.* = 40 + v.* / 2; // 40..167: ずらしても 0 / 255 で切れない
+    const w = 120;
+    const h = 64;
+    const roi: Rect = .{ .x = 40, .y = 20, .w = 30, .h = 16 };
+    var bufs: [9][]u8 = undefined;
+    var frames: [9]Image = undefined;
+    var shifts: [8]Shift = undefined;
+    defer for (bufs) |b| gpa.free(b);
+    for (0..9) |k| {
+        bufs[k] = try view(gpa, s, sw, @intCast(200 - 6 * k), 60, w, h);
+        for (bufs[k]) |*v| v.* = @intCast(@as(i32, v.*) + @as(i32, @intCast(k)) - 4);
+        frames[k] = .{ .width = w, .height = h, .rgb = bufs[k] };
+    }
+    for (0..8) |k| shifts[k] = .{ .dx = 6, .dy = 0, .peak = 1 };
+    const track = try Track.build(gpa, &shifts, 0.1);
+    defer track.deinit(gpa);
+    const out = try gpa.alloc(u8, w * h * 3);
+    defer gpa.free(out);
+    const prov = try gpa.alloc(Provenance, w * h);
+    defer gpa.free(prov);
+    const r = recoverFrame(&frames, track, 4, roi, 6, out, prov);
+    try std.testing.expectEqual(r.roiPixels(), r.recovered());
+    // 戻した画素は、表示中のフレーム（ずれ 0）の正解と一致する
+    for (roi.y..roi.y + roi.h) |y| for (roi.x..roi.x + roi.w) |x| {
+        const i = (y * w + x) * 3;
+        try std.testing.expectEqualSlices(u8, bufs[4][i..][0..3], out[i..][0..3]);
+    };
 }
 
 test "temporal: fft round-trips" {
