@@ -15,6 +15,13 @@
 |---|---|---|
 | CLI | `vrestore --version` が `build.zig.zon` の版を `vrestore <version>` と表示し、終了コード 0 で終わる | `build.zig` の `cli_version`（`zig build test` で実行ファイルを起動して stdout と終了コードを照合） |
 | CLI | 知らない引数にはその引数名と使い方を stderr に出し、終了コード 2 で終わる | `build.zig` の `cli_unknown`（stderr に引数名入りのエラー文が含まれることと終了コードを照合） |
+| 動画 | 動画を開き、幅・高さ・尺・コーデック名を返す。尺が取れない入力では尺を返さない | `src/video.zig` の test `"video: open reports size, duration and codec"` |
+| 動画 | 先頭から全フレームを順に RGB24 でデコードし、終端を報告する | test `"video: next decodes every frame in order, then reports the end"` |
+| 動画 | 指定時刻以降の最初のフレームへ seek する（キーフレームでない位置、後ろから前への seek を含む） | test `"video: seek lands on the exact frame, including non-keyframes"` |
+| 動画 | 尺全体から等間隔に N 枚取り出す | test `"video: sampleFrames spreads over the whole duration"` |
+| 動画 | 動画でないファイルは開けないと報告する | test `"video: a file that is not a video fails to open"`、`build.zig` の `cli_probe_bad` |
+| CLI | `vrestore probe <video>` が 1 フレーム目までデコードしてから、幅・高さ・尺・コーデックを JSON 1 行で出す | `build.zig` の `cli_probe`（stdout 全体を照合） |
+| CLI | stdout が他の出力と共有された通常ファイルでも、前の出力を上書きしない | `build.zig` の `cli_stdout_file` |
 | リポジトリ衛生 | 動画・巨大ファイルが git の管理下に無い | `scripts/check-no-media.sh` |
 
 ## 2. 次に実装すること（契約）
@@ -74,4 +81,8 @@ debug/
 
 ⚠ 分母・日付・条件の無い数値は、直すのではなく消す。
 
-まだ無い。ROI 検出が入ったら、合成素材での結果をここに置く。
+| 何を測ったか | 値 | いつ | 条件 |
+|---|---|---|---|
+| yuv420p を経由した灰色の往復誤差（RGB24 で見た値 − 合成時の値） | 最大 1（全 10 フレーム、全画素） | 2026-09-26 | 64x48 / 10 fps / libx264 `-qp 0` / 灰色 16+20k（k=0..9）。ffmpeg 8.1.1 コマンドの rawvideo rgb24 出力で観測。テストの許容差 2 はこれに基づく |
+
+ROI 検出が入ったら、合成素材での結果をここに置く。

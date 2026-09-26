@@ -10,8 +10,8 @@
 
 ## 現在できること
 
-- プロジェクトの骨組み（ビルド・テスト・CI）
-- `vrestore --version`
+- `vrestore probe <video>` — 動画を FFmpeg で開いて 1 フレーム目までデコードし、幅・高さ・尺・コーデックを JSON で出す
+- 内部: 動画から任意時刻のフレームを RGB24 で取り出す（ROI 検出の土台）
 
 ## 現在できないこと
 
@@ -21,7 +21,8 @@
 
 ## Build / Test
 
-Zig が必要です（版は [`build.zig.zon`](build.zig.zon) の `minimum_zig_version`）。
+Zig（版は [`build.zig.zon`](build.zig.zon) の `minimum_zig_version`）と FFmpeg が必要です。
+FFmpeg は `ffmpeg` コマンドと、pkg-config で見つかる開発用ライブラリ（libavformat / libavcodec / libswscale / libavutil）を使います。
 
 ```sh
 zig build            # zig-out/bin/vrestore
