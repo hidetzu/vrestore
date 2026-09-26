@@ -148,6 +148,10 @@ pub fn build(b: *std.Build) void {
     });
     linkFfmpeg(gui_mod);
     gui_mod.linkSystemLibrary("sdl2", .{ .use_pkg_config = .force });
+    // パネルの文字（docs/adr/0009）。pkg-config を使うと SDL2 と SDL2_ttf の両方が SDL2 本体をリンクし、
+    // macOS で「duplicate linked dylib」として起動時に止まった（Homebrew の sdl2-compat）。
+    // ヘッダは SDL2 と同じ場所にあるので、ライブラリだけを直接リンクする
+    gui_mod.linkSystemLibrary("SDL2_ttf", .{ .use_pkg_config = .no });
     const gui = b.addExecutable(.{ .name = "vrestore-gui", .root_module = gui_mod });
     const gui_step = b.step("gui", "Build and install vrestore-gui (needs SDL2)");
     gui_step.dependOn(&b.addInstallArtifact(gui, .{}).step);

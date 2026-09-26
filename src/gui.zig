@@ -35,9 +35,99 @@ const Provenance = provenance.Provenance;
 const spatial = @import("spatial.zig");
 const ps = @import("player_state.zig");
 const glyphs = @import("glyphs.zig");
+const fonts = @import("fonts.zig");
+
+/// パネルの文字。SDL_ttf でシステムのフォントを描く（ASCII のグリフを一度だけテクスチャにして使い回す）。
+/// フォントが見つからなければ、内蔵のビットマップフォント（数字と記号だけ）で描く（docs/adr/0009）
+const Text = struct {
+    ren: *sdl.SDL_Renderer,
+    font: ?*sdl.TTF_Font,
+    glyph: [95]?Glyph = .{null} ** 95,
+    /// 数字の送り幅（すべての数字をこの幅で並べ、再生中に時刻の文字が揺れないようにする）
+    digit_adv: f32 = 0,
+    line_h: f32,
+
+    const Glyph = struct { tex: *sdl.SDL_Texture, w: f32, h: f32, adv: f32 };
+    /// ビットマップフォントのときの倍率
+    const bitmap_scale = 2;
+
+    fn init(ren: *sdl.SDL_Renderer, path: ?[]const u8, pt: c_int) Text {
+        var t: Text = .{ .ren = ren, .font = null, .line_h = glyphs.height * bitmap_scale };
+        const p = path orelse return t;
+        if (sdl.TTF_WasInit() == 0 and sdl.TTF_Init() != 0) return t;
+        var zbuf: [1024]u8 = undefined;
+        if (p.len >= zbuf.len) return t;
+        @memcpy(zbuf[0..p.len], p);
+        zbuf[p.len] = 0;
+        const font = sdl.TTF_OpenFont(@ptrCast(&zbuf), pt) orelse return t;
+        t.font = font;
+        t.line_h = @floatFromInt(sdl.TTF_FontHeight(font));
+        const white: sdl.SDL_Color = .{ .r = 255, .g = 255, .b = 255, .a = 255 };
+        for (32..127) |c| {
+            var minx: c_int = 0;
+            var maxx: c_int = 0;
+            var miny: c_int = 0;
+            var maxy: c_int = 0;
+            var adv: c_int = 0;
+            if (sdl.TTF_GlyphMetrics(font, @intCast(c), &minx, &maxx, &miny, &maxy, &adv) != 0) continue;
+            const surf = sdl.TTF_RenderGlyph_Blended(font, @intCast(c), white) orelse continue;
+            defer sdl.SDL_FreeSurface(surf);
+            const tex = sdl.SDL_CreateTextureFromSurface(ren, surf) orelse continue;
+            t.glyph[c - 32] = .{ .tex = tex, .w = @floatFromInt(surf.*.w), .h = @floatFromInt(surf.*.h), .adv = @floatFromInt(adv) };
+            if (c >= '0' and c <= '9') t.digit_adv = @max(t.digit_adv, @as(f32, @floatFromInt(adv)));
+        }
+        return t;
+    }
+
+    fn deinit(t: *Text) void {
+        for (t.glyph) |g| if (g) |gg| sdl.SDL_DestroyTexture(gg.tex);
+        if (t.font) |f| sdl.TTF_CloseFont(f);
+    }
+
+    fn advance(t: *const Text, c: u8) f32 {
+        if (t.font == null) return (glyphs.width + glyphs.spacing) * bitmap_scale;
+        if (c >= '0' and c <= '9') return t.digit_adv;
+        if (c < 32 or c > 126) return 0;
+        return if (t.glyph[c - 32]) |g| g.adv else 0;
+    }
+
+    fn width(t: *const Text, s: []const u8) f32 {
+        var w: f32 = 0;
+        for (s) |c| w += t.advance(c);
+        return w;
+    }
+
+    /// (x, 行の上端 y) から、高さ h の行の縦中央に描く
+    fn draw(t: *const Text, s: []const u8, x: f32, y: f32, h: f32, col: [3]u8, alpha: u8) void {
+        const top = y + (h - t.line_h) / 2;
+        if (t.font == null) {
+            const Ctx = struct { ren: *sdl.SDL_Renderer, x: f32, y: f32 };
+            _ = sdl.SDL_SetRenderDrawColor(t.ren, col[0], col[1], col[2], alpha);
+            glyphs.render(s, bitmap_scale, Ctx{ .ren = t.ren, .x = x, .y = top }, struct {
+                fn f(c: Ctx, px: u32, py: u32) void {
+                    _ = sdl.SDL_RenderFillRectF(c.ren, &.{ .x = c.x + @as(f32, @floatFromInt(px)), .y = c.y + @as(f32, @floatFromInt(py)), .w = bitmap_scale, .h = bitmap_scale });
+                }
+            }.f);
+            return;
+        }
+        var cx = x;
+        for (s) |c| {
+            const adv = t.advance(c);
+            if (c >= 32 and c <= 126) if (t.glyph[c - 32]) |g| {
+                _ = sdl.SDL_SetTextureColorMod(g.tex, col[0], col[1], col[2]);
+                _ = sdl.SDL_SetTextureAlphaMod(g.tex, alpha);
+                // 数字は送り幅の中で中央に置く
+                const off = if (c >= '0' and c <= '9') (adv - g.adv) / 2 else 0;
+                _ = sdl.SDL_RenderCopyF(t.ren, g.tex, null, &.{ .x = cx + off, .y = top, .w = g.w, .h = g.h });
+            };
+            cx += adv;
+        }
+    }
+};
 
 const sdl = @cImport({
     @cInclude("SDL.h");
+    @cInclude("SDL_ttf.h");
 });
 
 const usage =
@@ -48,6 +138,7 @@ const usage =
     \\  --frame <n>             start at this frame (0 = first; as printed by C)
     \\  --play-frames <n>       with --share-and-exit, play n frames first (the same path as playback)
     \\  --share-and-exit        print the current scene as "name t=<sec> frame=<n>" and exit (as C)
+    \\  --font <path>           font for the control panel (also VRESTORE_FONT); default: a system font
     \\  --select x,y,w,h        start with this selection (frame pixels)
     \\  --detect-and-exit       run the detection on --select once, print the JSON and exit
     \\                          (the same path as pressing Enter; used by the tests)
@@ -93,6 +184,8 @@ const App = struct {
     fps: f64,
     /// 共有用の 1 行に出す動画の名前（パスの最後）
     video_name: []const u8,
+    /// パネルの文字（SDL の初期化の後に入れる）
+    text: ?*const Text = null,
     /// 検出できなかったときの理由（窓のタイトルに出す）
     problem: [256]u8 = undefined,
     problem_len: usize = 0,
@@ -284,6 +377,7 @@ pub fn main(init: std.process.Init) !u8 {
     var frame_arg: ?u64 = null;
     var play_frames: u64 = 0;
     var share_and_exit = false;
+    var font_arg: ?[]const u8 = null;
     var show_prov = false;
     var motion_model = restore_cmd.default_motion;
     var fill_method = restore_cmd.default_fill;
@@ -299,6 +393,9 @@ pub fn main(init: std.process.Init) !u8 {
         } else if (std.mem.eql(u8, a, "--play-frames") and i + 1 < args.len) {
             i += 1;
             play_frames = std.fmt.parseInt(u64, args[i], 10) catch return badArg(&err.interface, "--play-frames needs a number", args[i]);
+        } else if (std.mem.eql(u8, a, "--font") and i + 1 < args.len) {
+            i += 1;
+            font_arg = args[i];
         } else if (std.mem.eql(u8, a, "--share-and-exit")) {
             share_and_exit = true;
         } else if (std.mem.eql(u8, a, "--restore")) {
@@ -393,6 +490,20 @@ pub fn main(init: std.process.Init) !u8 {
     };
     defer sdl.SDL_DestroyTexture(tex);
 
+    // パネルの文字のフォント: --font、VRESTORE_FONT、システムのフォントの順
+    const font_path = fonts.pick(font_arg orelse init.environ_map.get("VRESTORE_FONT"), io, struct {
+        fn f(ioo: Io, candidate: []const u8) bool {
+            Io.Dir.cwd().access(ioo, candidate, .{}) catch return false;
+            return true;
+        }
+    }.f);
+    if (font_arg != null and font_path == null) try err.interface.print("vrestore-gui: font '{s}' not found; using the built-in digits\n", .{font_arg.?});
+    var text = Text.init(ren, font_path, 14);
+    // defer は逆順に動く。フォントを閉じてから TTF_Quit する（逆だと TTF_CloseFont が落ちる）
+    defer if (text.font != null) sdl.TTF_Quit();
+    defer text.deinit();
+    app.text = &text;
+
     defer app.clearRestored();
     if (share_and_exit) {
         // 再生と同じ経路（tickTo）で play_frames 枚ぶん進める
@@ -450,16 +561,20 @@ pub fn main(init: std.process.Init) !u8 {
             dirty = true;
             const v = viewOf(ren, &app);
             const area = areaOf(v);
+            app.panel.info = infoLen(&app) > 0;
+            const tw = textWidths(&app);
             switch (ev.type) {
                 sdl.SDL_QUIT => running = false,
                 sdl.SDL_MOUSEBUTTONDOWN => if (ev.button.button == sdl.SDL_BUTTON_LEFT) {
                     const mx: f32 = @floatFromInt(ev.button.x);
                     const my: f32 = @floatFromInt(ev.button.y);
-                    switch (ps.routePress(app.panel, area, mx, my)) {
+                    switch (ps.routePress(app.panel, area, tw, mx, my)) {
                         .toggle_play => app.togglePlay(),
+                        .skip_back => try app.showAt(app.time_sec - ps.skip_sec),
+                        .skip_forward => try app.showAt(app.time_sec + ps.skip_sec),
                         .seek => {
                             panel_seeking = true;
-                            try app.showAt(ps.seekToSec(app.panel.seekBar(area), mx, app.duration));
+                            try app.showAt(ps.seekToSec(app.panel.seekBar(area, tw), mx, app.duration));
                         },
                         .move_panel => app.panel.beginDrag(area, mx, my),
                         .select => {
@@ -473,7 +588,7 @@ pub fn main(init: std.process.Init) !u8 {
                     const mx: f32 = @floatFromInt(ev.motion.x);
                     const my: f32 = @floatFromInt(ev.motion.y);
                     if (panel_seeking) {
-                        try app.showAt(ps.seekToSec(app.panel.seekBar(area), mx, app.duration));
+                        try app.showAt(ps.seekToSec(app.panel.seekBar(area, tw), mx, app.duration));
                     } else if (app.panel.grab != null) {
                         app.panel.drag(area, mx, my);
                     } else if (app.selection.anchor != null) {
@@ -512,12 +627,14 @@ pub fn main(init: std.process.Init) !u8 {
                         },
                         sdl.SDL_SCANCODE_RETURN, sdl.SDL_SCANCODE_D => {
                             app.pause();
-                            sdl.SDL_SetWindowTitle(win, "vrestore-gui | detecting...");
+                            app.setProblem("detecting...", .{});
+                            render(&app, win, ren, tex);
                             try app.detect();
                         },
                         sdl.SDL_SCANCODE_R => {
                             app.pause();
-                            sdl.SDL_SetWindowTitle(win, "vrestore-gui | restoring...");
+                            app.setProblem("restoring...", .{});
+                            render(&app, win, ren, tex);
                             try app.restore();
                         },
                         sdl.SDL_SCANCODE_B => {
@@ -618,7 +735,7 @@ fn draw(app: *App, win: *sdl.SDL_Window, ren: *sdl.SDL_Renderer, tex: *sdl.SDL_T
 
     if (ps.panelVisible(app.panel, app.selection.anchor != null)) drawPanel(app, ren, areaOf(v));
 
-    // 数値は窓のタイトルにも出す（パネルの文字は数字と記号だけ。docs/adr/0009）
+    // 窓のタイトルはファイル名だけ。検出・復元の数値はパネルの 3 段目に出す（docs/adr/0009）
     var title_buf: [512]u8 = undefined;
     var w: Io.Writer = .fixed(&title_buf);
     title(&w, app) catch {};
@@ -631,76 +748,137 @@ fn areaOf(v: state.View) ps.Box {
     return .{ .x = v.x, .y = v.y, .w = v.w, .h = v.h };
 }
 
-/// 映像の上に重ねる操作パネル: 半透明の地、再生 / 一時停止、シークバー、時刻とフレーム番号
+fn textWidths(app: *const App) ps.TextWidths {
+    const t = app.text orelse return .{ .time = 96 };
+    return .{ .time = t.width("00:00:00") };
+}
+
+/// パネルの 3 段目に出す 1 行（検出・復元の結果や、操作の案内・エラー）。無ければ長さ 0
+fn infoText(app: *const App, buf: []u8) []const u8 {
+    var w: Io.Writer = .fixed(buf);
+    info(&w, app) catch {};
+    return w.buffered();
+}
+
+fn infoLen(app: *const App) usize {
+    var buf: [256]u8 = undefined;
+    return infoText(app, &buf).len;
+}
+
+fn info(w: *Io.Writer, app: *const App) !void {
+    if (app.problem_len > 0) return w.writeAll(app.problem[0..app.problem_len]);
+    if (app.restored != null) {
+        try w.print("{s}  restored {d:.1}%", .{ if (app.show_after) "AFTER" else "BEFORE", app.recovered.coverage() * 100 });
+        if (app.recovered.counts.get(.spatial_inpainted) > 0) try w.print("  inpainted {d:.1}%", .{app.recovered.fraction(.spatial_inpainted) * 100});
+        try w.print("  unrecovered {d:.1}%  {s}/{s}", .{ app.recovered.fraction(.unrecovered) * 100, @tagName(app.motion_model), @tagName(app.fill) });
+        return;
+    }
+    if (app.detection) |d| {
+        try w.print("ROI {d},{d} {d}x{d}  confidence {d:.3}  {s}", .{ d.x, d.y, d.width, d.height, d.confidence, if (d.reliable) "RELIABLE" else "NOT RELIABLE" });
+        return;
+    }
+    if (app.selection.rect) |r| return w.print("selected {d},{d} {d}x{d}  Enter: detect", .{ r.x, r.y, r.w, r.h });
+}
+
+/// 角の丸い矩形を塗る（三角形の扇で描く）
+fn fillRounded(ren: *sdl.SDL_Renderer, b: ps.Box, r: f32, col: sdl.SDL_Color) void {
+    const seg = 6;
+    var verts: [4 * (seg + 1) + 1]sdl.SDL_Vertex = undefined;
+    var idx: [4 * (seg + 1) * 3]c_int = undefined;
+    const center: sdl.SDL_FPoint = .{ .x = b.x + b.w / 2, .y = b.y + b.h / 2 };
+    verts[0] = .{ .position = center, .color = col, .tex_coord = .{ .x = 0, .y = 0 } };
+    const corners = [4][3]f32{
+        .{ b.x + b.w - r, b.y + r, -std.math.pi / 2.0 }, // 右上
+        .{ b.x + b.w - r, b.y + b.h - r, 0 }, // 右下
+        .{ b.x + r, b.y + b.h - r, std.math.pi / 2.0 }, // 左下
+        .{ b.x + r, b.y + r, std.math.pi }, // 左上
+    };
+    var n: usize = 1;
+    for (corners) |c| for (0..seg + 1) |k| {
+        const ang = c[2] + @as(f32, @floatFromInt(k)) / seg * (std.math.pi / 2.0);
+        verts[n] = .{ .position = .{ .x = c[0] + r * @cos(ang), .y = c[1] + r * @sin(ang) }, .color = col, .tex_coord = .{ .x = 0, .y = 0 } };
+        n += 1;
+    };
+    const m = n - 1;
+    for (0..m) |k| {
+        idx[k * 3] = 0;
+        idx[k * 3 + 1] = @intCast(1 + k);
+        idx[k * 3 + 2] = @intCast(1 + (k + 1) % m);
+    }
+    _ = sdl.SDL_RenderGeometry(ren, null, &verts, @intCast(n), &idx, @intCast(m * 3));
+}
+
+fn fillCircle(ren: *sdl.SDL_Renderer, cx: f32, cy: f32, r: f32, col: sdl.SDL_Color) void {
+    fillRounded(ren, .{ .x = cx - r, .y = cy - r, .w = 2 * r, .h = 2 * r }, r, col);
+}
+
+fn triangle(ren: *sdl.SDL_Renderer, p: [3][2]f32, col: sdl.SDL_Color) void {
+    var v: [3]sdl.SDL_Vertex = undefined;
+    for (p, &v) |q, *vv| vv.* = .{ .position = .{ .x = q[0], .y = q[1] }, .color = col, .tex_coord = .{ .x = 0, .y = 0 } };
+    _ = sdl.SDL_RenderGeometry(ren, null, &v, 3, null, 0);
+}
+
+/// 映像の上に重ねる操作パネル（QuickTime Player 風）:
+///   1 段目: フレーム番号 / 10 秒戻る・再生・10 秒進む、2 段目: 経過時刻 ― シークバー ― 全体の長さ、3 段目: 情報
 fn drawPanel(app: *App, ren: *sdl.SDL_Renderer, area: ps.Box) void {
+    const text = app.text.?;
+    const tw = textWidths(app);
+    var info_buf: [256]u8 = undefined;
+    const info_line = infoText(app, &info_buf);
+    app.panel.info = info_line.len > 0;
     const b = app.panel.box(area);
     _ = sdl.SDL_SetRenderDrawBlendMode(ren, sdl.SDL_BLENDMODE_BLEND);
     defer _ = sdl.SDL_SetRenderDrawBlendMode(ren, sdl.SDL_BLENDMODE_NONE);
-    _ = sdl.SDL_SetRenderDrawColor(ren, 20, 20, 20, 170);
-    _ = sdl.SDL_RenderFillRectF(ren, &.{ .x = b.x, .y = b.y, .w = b.w, .h = b.h });
+    fillRounded(ren, b, ps.Panel.radius, .{ .r = 40, .g = 40, .b = 40, .a = 175 });
 
-    // 再生中は ❚❚、止まっていれば ▶
+    const white: sdl.SDL_Color = .{ .r = 245, .g = 245, .b = 245, .a = 255 };
+    // 1 段目: フレーム番号（場面の共有に使う。C でコピー）
+    var fbuf: [32]u8 = undefined;
+    const fl = app.panel.frameLabel(area);
+    text.draw(ps.frameText(&fbuf, app.time_sec, app.fps), fl.x, fl.y, fl.h, .{ 245, 245, 245 }, 170);
+
+    // 10 秒戻る ◀◀ / 再生 ▶・一時停止 ❚❚ / 10 秒進む ▶▶
+    const bb = app.panel.backButton(area);
+    const cy = bb.y + bb.h / 2;
+    triangle(ren, .{ .{ bb.x + bb.w / 2, cy - 7 }, .{ bb.x + bb.w / 2, cy + 7 }, .{ bb.x + 1, cy } }, white);
+    triangle(ren, .{ .{ bb.x + bb.w - 1, cy - 7 }, .{ bb.x + bb.w - 1, cy + 7 }, .{ bb.x + bb.w / 2, cy } }, white);
+    const fb = app.panel.forwardButton(area);
+    triangle(ren, .{ .{ fb.x + 1, cy - 7 }, .{ fb.x + 1, cy + 7 }, .{ fb.x + fb.w / 2, cy } }, white);
+    triangle(ren, .{ .{ fb.x + fb.w / 2, cy - 7 }, .{ fb.x + fb.w / 2, cy + 7 }, .{ fb.x + fb.w - 1, cy } }, white);
     const pb = app.panel.playButton(area);
-    const white = sdl.SDL_Color{ .r = 240, .g = 240, .b = 240, .a = 255 };
+    const pcy = pb.y + pb.h / 2;
     if (app.clock.playing) {
-        fill(ren, .{ .x = pb.x + 9, .y = pb.y + 8, .w = 6, .h = pb.h - 16 }, .{ 240, 240, 240 });
-        fill(ren, .{ .x = pb.x + pb.w - 15, .y = pb.y + 8, .w = 6, .h = pb.h - 16 }, .{ 240, 240, 240 });
+        fillRounded(ren, .{ .x = pb.x + 8, .y = pcy - 11, .w = 6, .h = 22 }, 2, white);
+        fillRounded(ren, .{ .x = pb.x + pb.w - 14, .y = pcy - 11, .w = 6, .h = 22 }, 2, white);
     } else {
-        const tri = [3]sdl.SDL_Vertex{
-            .{ .position = .{ .x = pb.x + 10, .y = pb.y + 7 }, .color = white, .tex_coord = .{ .x = 0, .y = 0 } },
-            .{ .position = .{ .x = pb.x + 10, .y = pb.y + pb.h - 7 }, .color = white, .tex_coord = .{ .x = 0, .y = 0 } },
-            .{ .position = .{ .x = pb.x + pb.w - 7, .y = pb.y + pb.h / 2 }, .color = white, .tex_coord = .{ .x = 0, .y = 0 } },
-        };
-        _ = sdl.SDL_RenderGeometry(ren, null, &tri, 3, null, 0);
+        triangle(ren, .{ .{ pb.x + 9, pcy - 12 }, .{ pb.x + 9, pcy + 12 }, .{ pb.x + pb.w - 5, pcy } }, white);
     }
 
-    // シークバー: 地、再生済み、つまみ
-    const sb = app.panel.seekBar(area);
-    fill(ren, .{ .x = sb.x, .y = sb.y + sb.h / 2 - 2, .w = sb.w, .h = 4 }, .{ 110, 110, 110 });
+    // 2 段目: 経過時刻 ― シークバー ― 全体の長さ
+    var ebuf: [32]u8 = undefined;
+    var tbuf: [32]u8 = undefined;
+    const el = app.panel.elapsedLabel(area, tw);
+    const tl = app.panel.totalLabel(area, tw);
+    text.draw(ps.clockText(&ebuf, app.time_sec), el.x, el.y, el.h, .{ 245, 245, 245 }, 220);
+    text.draw(ps.clockText(&tbuf, app.duration), tl.x, tl.y, tl.h, .{ 245, 245, 245 }, 220);
+    const sb = app.panel.seekBar(area, tw);
+    const sy = sb.y + sb.h / 2;
+    fillRounded(ren, .{ .x = sb.x, .y = sy - 2, .w = sb.w, .h = 4 }, 2, .{ .r = 255, .g = 255, .b = 255, .a = 70 });
     const progress: f32 = if (app.duration > 0) @floatCast(std.math.clamp(app.time_sec / app.duration, 0, 1)) else 0;
-    fill(ren, .{ .x = sb.x, .y = sb.y + sb.h / 2 - 2, .w = sb.w * progress, .h = 4 }, .{ 240, 240, 240 });
-    fill(ren, .{ .x = sb.x + sb.w * progress - 4, .y = sb.y, .w = 8, .h = sb.h }, .{ 255, 255, 255 });
+    if (progress > 0) fillRounded(ren, .{ .x = sb.x, .y = sy - 2, .w = @max(4, sb.w * progress), .h = 4 }, 2, white);
+    fillCircle(ren, sb.x + sb.w * progress, sy, 7, white);
 
-    // 時刻 / 長さ  #フレーム番号
-    var text_buf: [64]u8 = undefined;
-    const text = ps.panelText(&text_buf, app.time_sec, app.duration, app.fps);
-    const lb = app.panel.label(area);
-    const Ctx = struct { ren: *sdl.SDL_Renderer, x: f32, y: f32 };
-    _ = sdl.SDL_SetRenderDrawColor(ren, 235, 235, 235, 255);
-    glyphs.render(text, 2, Ctx{ .ren = ren, .x = lb.x, .y = lb.y }, struct {
-        fn f(c: Ctx, x: u32, y: u32) void {
-            _ = sdl.SDL_RenderFillRectF(c.ren, &.{ .x = c.x + @as(f32, @floatFromInt(x)), .y = c.y + @as(f32, @floatFromInt(y)), .w = 2, .h = 2 });
-        }
-    }.f);
+    // 3 段目: 検出・復元の結果や案内（あるときだけ）
+    if (info_line.len > 0) {
+        const il = app.panel.infoLabel(area);
+        text.draw(info_line, il.x, il.y, il.h, .{ 245, 245, 245 }, 190);
+    }
 }
 
 fn title(w: *Io.Writer, app: *const App) !void {
-    try w.print("vrestore-gui | {d:.3}s / {d:.1}s frame {d} | motion {s} fill {s}", .{ app.time_sec, app.duration, ps.frameIndex(app.time_sec, app.fps), @tagName(app.motion_model), @tagName(app.fill) });
-    if (app.restored != null) {
-        try w.print(" | {s} | restored {d:.1}% of the ROI", .{ if (app.show_after) "AFTER" else "BEFORE", app.recovered.coverage() * 100 });
-        // 由来ごとの割合（ROI の中）。色は P で重ねたときのもの
-        for (std.enums.values(Provenance)) |p| if (p.inRoi()) {
-            try w.print(" {s} {d:.1}%", .{ @tagName(p), app.recovered.fraction(p) * 100 });
-        };
-        try w.writeAll(if (app.show_provenance) " (green: temporal_real, orange: spatial_inpainted, magenta: unrecovered) | B: before/after, P: provenance off" else " (magenta: unrecovered) | B: before/after, P: provenance");
-    }
-    if (app.selection.rect) |r| try w.print(" | selected {d},{d} {d}x{d}", .{ r.x, r.y, r.w, r.h });
-    if (app.detection) |d| {
-        try w.print(" | ROI {d},{d} {d}x{d} confidence {d:.3} margin ", .{ d.x, d.y, d.width, d.height, d.confidence });
-        if (d.margin) |m| try w.print("{d:.3}", .{m}) else try w.writeAll("-");
-        try w.writeAll(if (d.reliable) " RELIABLE" else " NOT RELIABLE");
-        var it = d.reasons.iterator();
-        while (it.next()) |r| try w.print(" ({s})", .{@tagName(r)});
-    } else if (app.problem_len > 0) {
-        try w.print(" | {s}", .{app.problem[0..app.problem_len]});
-    } else if (app.selection.rect != null) {
-        try w.writeAll(" | Enter: detect");
-    } else {
-        try w.writeAll(" | drag over the watermark");
-    }
+    try w.print("{s} — vrestore", .{app.video_name});
 }
 
-/// 矩形の外側、`from` px 目から 2 px 幅の枠（内側のウォーターマークを隠さない）
 fn drawRect(ren: *sdl.SDL_Renderer, v: state.View, r: state.Rect, col: [3]u8, from: usize) void {
     const s = v.toScreen(r);
     _ = sdl.SDL_SetRenderDrawColor(ren, col[0], col[1], col[2], 255);

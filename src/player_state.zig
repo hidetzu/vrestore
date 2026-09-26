@@ -21,9 +21,20 @@ pub const Box = struct {
 };
 
 /// パネルの上のどこか
-pub const Part = enum { none, play_button, seek_bar, body };
+pub const Part = enum { none, play_button, back_button, forward_button, seek_bar, body };
 
-/// 映像の上に重ねる操作パネル。位置は画面座標で持ち、映像の表示領域（`area`）の中に押し込む
+/// 文字の幅（フォントによって変わるので、描く側が測って渡す）
+pub const TextWidths = struct {
+    /// "00:00:00" の幅（経過時刻と全体の長さの欄）
+    time: f32,
+};
+
+/// 映像の上に重ねる操作パネル（QuickTime Player 風の 2〜3 段）。位置は画面座標で持ち、
+/// 映像の表示領域（`area`）の中に押し込む。
+///
+///   1 段目: 左にフレーム番号、中央に [10 秒戻る] [再生 / 一時停止] [10 秒進む]
+///   2 段目: 経過時刻 ― シークバー ― 全体の長さ
+///   3 段目: 検出・復元の情報（`info` が true のときだけ）
 pub const Panel = struct {
     x: f32,
     y: f32,
@@ -32,55 +43,91 @@ pub const Panel = struct {
     hidden: bool = false,
     /// 一度も動かしていなければ、映像の下寄り中央に置き続ける（窓の大きさが変わっても追従する）
     placed: bool = false,
+    /// 3 段目（情報の行）を出すか
+    info: bool = false,
 
-    pub const height: f32 = 56;
-    pub const max_width: f32 = 640;
-    pub const margin: f32 = 12;
-    pub const button: f32 = 36;
-    pub const pad: f32 = 10;
+    pub const row1: f32 = 40;
+    pub const row2: f32 = 26;
+    pub const row3: f32 = 20;
+    pub const max_width: f32 = 520;
+    pub const margin: f32 = 14;
+    pub const pad: f32 = 14;
+    pub const button: f32 = 32;
+    pub const small_button: f32 = 26;
+    pub const gap: f32 = 18;
+    pub const radius: f32 = 12;
 
     /// パネルの大きさ: 映像の幅に合わせて縮む（余白を残す）
-    pub fn size(area: Box) [2]f32 {
-        return .{ @max(160, @min(max_width, area.w - 2 * margin)), height };
+    pub fn size(p: Panel, area: Box) [2]f32 {
+        return .{ @max(200, @min(max_width, area.w - 2 * margin)), row1 + row2 + (if (p.info) row3 else 0) + 12 };
     }
 
     /// 既定の位置（映像の下寄り中央）
-    pub fn home(area: Box) [2]f32 {
-        const s = size(area);
+    pub fn home(p: Panel, area: Box) [2]f32 {
+        const s = p.size(area);
         return .{ area.x + (area.w - s[0]) / 2, area.y + area.h - s[1] - margin };
     }
 
     /// 現在の枠。映像の外に出ていれば押し戻したもの
     pub fn box(p: Panel, area: Box) Box {
-        const s = size(area);
-        const pos = if (p.placed) [2]f32{ p.x, p.y } else home(area);
+        const s = p.size(area);
+        const pos = if (p.placed) [2]f32{ p.x, p.y } else p.home(area);
         return .{ .x = clampAxis(pos[0], area.x, area.w, s[0]), .y = clampAxis(pos[1], area.y, area.h, s[1]), .w = s[0], .h = s[1] };
     }
 
     pub fn playButton(p: Panel, area: Box) Box {
         const b = p.box(area);
-        return .{ .x = b.x + pad, .y = b.y + (b.h - button) / 2, .w = button, .h = button };
+        return .{ .x = b.x + (b.w - button) / 2, .y = b.y + 6 + (row1 - button) / 2, .w = button, .h = button };
     }
 
-    /// シークバー（再生ボタンの右、上半分）
-    pub fn seekBar(p: Panel, area: Box) Box {
+    pub fn backButton(p: Panel, area: Box) Box {
+        const pb = p.playButton(area);
+        return .{ .x = pb.x - gap - small_button, .y = pb.y + (button - small_button) / 2, .w = small_button, .h = small_button };
+    }
+
+    pub fn forwardButton(p: Panel, area: Box) Box {
+        const pb = p.playButton(area);
+        return .{ .x = pb.x + button + gap, .y = pb.y + (button - small_button) / 2, .w = small_button, .h = small_button };
+    }
+
+    /// 1 段目の左: フレーム番号の文字
+    pub fn frameLabel(p: Panel, area: Box) Box {
         const b = p.box(area);
-        const x0 = b.x + pad + button + pad;
-        return .{ .x = x0, .y = b.y + 10, .w = @max(10, b.x + b.w - pad - x0), .h = 14 };
+        return .{ .x = b.x + pad, .y = b.y + 6, .w = @max(0, p.backButton(area).x - gap - b.x - pad), .h = row1 };
     }
 
-    /// 時刻とフレーム番号の文字（シークバーの下）
-    pub fn label(p: Panel, area: Box) Box {
-        const s = p.seekBar(area);
-        return .{ .x = s.x, .y = s.y + s.h + 6, .w = s.w, .h = 14 };
+    /// 2 段目の左: 経過時刻
+    pub fn elapsedLabel(p: Panel, area: Box, tw: TextWidths) Box {
+        const b = p.box(area);
+        return .{ .x = b.x + pad, .y = b.y + 6 + row1, .w = tw.time, .h = row2 };
     }
 
-    pub fn hit(p: Panel, area: Box, px: f32, py: f32) Part {
+    /// 2 段目の右: 全体の長さ
+    pub fn totalLabel(p: Panel, area: Box, tw: TextWidths) Box {
+        const b = p.box(area);
+        return .{ .x = b.x + b.w - pad - tw.time, .y = b.y + 6 + row1, .w = tw.time, .h = row2 };
+    }
+
+    /// 2 段目の中央: シークバー（経過時刻と全体の長さの間）
+    pub fn seekBar(p: Panel, area: Box, tw: TextWidths) Box {
+        const e = p.elapsedLabel(area, tw);
+        const t = p.totalLabel(area, tw);
+        const x0 = e.x + e.w + 10;
+        return .{ .x = x0, .y = e.y, .w = @max(10, t.x - 10 - x0), .h = row2 };
+    }
+
+    /// 3 段目: 情報の行（info が false なら高さ 0）
+    pub fn infoLabel(p: Panel, area: Box) Box {
+        const b = p.box(area);
+        return .{ .x = b.x + pad, .y = b.y + 6 + row1 + row2, .w = b.w - 2 * pad, .h = if (p.info) row3 else 0 };
+    }
+
+    pub fn hit(p: Panel, area: Box, tw: TextWidths, px: f32, py: f32) Part {
         if (p.hidden or !p.box(area).contains(px, py)) return .none;
         if (p.playButton(area).contains(px, py)) return .play_button;
-        // シークバーは上下に少し広く取って掴みやすくする
-        const s = p.seekBar(area);
-        if ((Box{ .x = s.x, .y = s.y - 6, .w = s.w, .h = s.h + 12 }).contains(px, py)) return .seek_bar;
+        if (p.backButton(area).contains(px, py)) return .back_button;
+        if (p.forwardButton(area).contains(px, py)) return .forward_button;
+        if (p.seekBar(area, tw).contains(px, py)) return .seek_bar;
         return .body;
     }
 
@@ -91,7 +138,7 @@ pub const Panel = struct {
 
     pub fn drag(p: *Panel, area: Box, px: f32, py: f32) void {
         const g = p.grab orelse return;
-        const s = size(area);
+        const s = p.size(area);
         p.x = clampAxis(px - g[0], area.x, area.w, s[0]);
         p.y = clampAxis(py - g[1], area.y, area.h, s[1]);
         p.placed = true;
@@ -101,6 +148,9 @@ pub const Panel = struct {
         p.grab = null;
     }
 };
+
+/// 10 秒戻る / 進むで動く時間
+pub const skip_sec = 10.0;
 
 /// 長さ `len` のものを、`lo` から幅 `span` の中に収める。入りきらなければ左（上）に寄せる
 fn clampAxis(v: f32, lo: f32, span: f32, len: f32) f32 {
@@ -122,6 +172,8 @@ pub const Press = enum {
     /// ROI の選択を始める（映像の上、パネルの外）
     select,
     toggle_play,
+    skip_back,
+    skip_forward,
     /// シークバーを押した・ドラッグし始めた
     seek,
     /// パネルを動かし始めた
@@ -131,9 +183,11 @@ pub const Press = enum {
 };
 
 /// 押した位置から、何をするかを決める。パネルの上なら ROI の選択は始めない
-pub fn routePress(p: Panel, area: Box, px: f32, py: f32) Press {
-    return switch (p.hit(area, px, py)) {
+pub fn routePress(p: Panel, area: Box, tw: TextWidths, px: f32, py: f32) Press {
+    return switch (p.hit(area, tw, px, py)) {
         .play_button => .toggle_play,
+        .back_button => .skip_back,
+        .forward_button => .skip_forward,
         .seek_bar => .seek,
         .body => .move_panel,
         .none => if (area.contains(px, py)) .select else .nothing,
@@ -217,11 +271,15 @@ pub fn formatTime(buf: []u8, sec: f64, millis: bool) []const u8 {
         (if (millis) std.fmt.bufPrint(buf, "{d}:{d:0>2}.{d:0>3}", .{ m, s, ms }) else std.fmt.bufPrint(buf, "{d}:{d:0>2}", .{ m, s }))) catch buf[0..0];
 }
 
-/// パネルに出す文字: "2:03.456 / 1:57:22  #3689"
-pub fn panelText(buf: []u8, sec: f64, duration: f64, fps: f64) []const u8 {
-    var a: [32]u8 = undefined;
-    var b: [32]u8 = undefined;
-    return std.fmt.bufPrint(buf, "{s} / {s}  #{d}", .{ formatTime(&a, sec, true), formatTime(&b, duration, false), frameIndex(sec, fps) }) catch buf[0..0];
+/// パネルの時刻の欄: "00:13:32"（QuickTime Player と同じ、時・分・秒を 2 桁ずつ）
+pub fn clockText(buf: []u8, sec: f64) []const u8 {
+    const total: u64 = @intFromFloat(@max(0, @floor(sec)));
+    return std.fmt.bufPrint(buf, "{d:0>2}:{d:0>2}:{d:0>2}", .{ total / 3600, (total / 60) % 60, total % 60 }) catch buf[0..0];
+}
+
+/// パネルのフレーム番号の欄: "frame 36998"
+pub fn frameText(buf: []u8, sec: f64, fps: f64) []const u8 {
+    return std.fmt.bufPrint(buf, "frame {d}", .{frameIndex(sec, fps)}) catch buf[0..0];
 }
 
 /// 場面を共有するための 1 行: "A.mp4 t=123.456 frame=3700"。
@@ -233,20 +291,21 @@ pub fn shareLine(buf: []u8, video_name: []const u8, sec: f64, fps: f64) []const 
 // ---- tests -------------------------------------------------------------------
 
 const area640: Box = .{ .x = 0, .y = 0, .w = 640, .h = 360 };
+const test_widths: TextWidths = .{ .time = 60 };
 
 test "player: the panel starts at the bottom centre and stays inside the video when dragged" {
     var p: Panel = .{ .x = 0, .y = 0 };
     const b0 = p.box(area640);
-    try std.testing.expectEqual(@as(f32, 616), b0.w); // 640 - 2 * 12
-    try std.testing.expectEqual(@as(f32, 12), b0.x);
-    try std.testing.expectEqual(@as(f32, 360 - 56 - 12), b0.y);
+    try std.testing.expectEqual(@as(f32, 520), b0.w);
+    try std.testing.expectEqual(@as(f32, 60), b0.x); // (640 - 520) / 2
+    try std.testing.expectEqual(@as(f32, 360 - b0.h - 14), b0.y);
 
     // 掴んで右上へ大きく動かすと、映像の端で止まる
     p.beginDrag(area640, b0.x + 300, b0.y + 30);
     p.drag(area640, 5000, -5000);
     p.endDrag();
     const b1 = p.box(area640);
-    try std.testing.expectEqual(@as(f32, 640 - 616), b1.x);
+    try std.testing.expectEqual(@as(f32, 640 - 520), b1.x);
     try std.testing.expectEqual(@as(f32, 0), b1.y);
 
     // 掴んだ点とパネルの位置の関係は保たれる
@@ -256,29 +315,52 @@ test "player: the panel starts at the bottom centre and stays inside the video w
     try std.testing.expectEqual(@as(f32, b1.y + 50), p.box(area640).y);
 }
 
-test "player: the panel is pushed back inside when the video area shrinks" {
+test "player: the panel is pushed back inside when the video area shrinks, and grows a row for info" {
     var p: Panel = .{ .x = 0, .y = 0 };
-    p.beginDrag(area640, 20, 300);
+    p.beginDrag(area640, 70, 300);
     p.drag(area640, 600, 340);
     const small: Box = .{ .x = 100, .y = 50, .w = 320, .h = 180 };
     const b = p.box(small);
     try std.testing.expect(b.x >= small.x and b.x + b.w <= small.x + small.w);
     try std.testing.expect(b.y >= small.y and b.y + b.h <= small.y + small.h);
+
+    const h2 = p.box(area640).h;
+    p.info = true;
+    try std.testing.expectEqual(h2 + Panel.row3, p.box(area640).h);
+    try std.testing.expect(p.infoLabel(area640).h > 0);
+}
+
+test "player: the controls do not overlap, and the seek bar sits between the two times" {
+    const p: Panel = .{ .x = 0, .y = 0 };
+    const back = p.backButton(area640);
+    const play = p.playButton(area640);
+    const fwd = p.forwardButton(area640);
+    try std.testing.expect(back.x + back.w < play.x and play.x + play.w < fwd.x);
+    const e = p.elapsedLabel(area640, test_widths);
+    const s = p.seekBar(area640, test_widths);
+    const t = p.totalLabel(area640, test_widths);
+    try std.testing.expect(e.x + e.w < s.x and s.x + s.w < t.x);
+    const b = p.box(area640);
+    try std.testing.expect(t.x + t.w <= b.x + b.w);
 }
 
 test "player: presses on the panel never start an ROI selection" {
     const p: Panel = .{ .x = 0, .y = 0 };
     const pb = p.playButton(area640);
-    const sb = p.seekBar(area640);
+    const bb = p.backButton(area640);
+    const fb = p.forwardButton(area640);
+    const sb = p.seekBar(area640, test_widths);
     const b = p.box(area640);
-    try std.testing.expectEqual(Press.toggle_play, routePress(p, area640, pb.x + 5, pb.y + 5));
-    try std.testing.expectEqual(Press.seek, routePress(p, area640, sb.x + sb.w / 2, sb.y + 2));
-    try std.testing.expectEqual(Press.move_panel, routePress(p, area640, b.x + b.w - 3, b.y + b.h - 3));
-    try std.testing.expectEqual(Press.select, routePress(p, area640, 100, 50));
-    try std.testing.expectEqual(Press.nothing, routePress(p, area640, 700, 50));
+    try std.testing.expectEqual(Press.toggle_play, routePress(p, area640, test_widths, pb.x + 5, pb.y + 5));
+    try std.testing.expectEqual(Press.skip_back, routePress(p, area640, test_widths, bb.x + 5, bb.y + 5));
+    try std.testing.expectEqual(Press.skip_forward, routePress(p, area640, test_widths, fb.x + 5, fb.y + 5));
+    try std.testing.expectEqual(Press.seek, routePress(p, area640, test_widths, sb.x + sb.w / 2, sb.y + 2));
+    try std.testing.expectEqual(Press.move_panel, routePress(p, area640, test_widths, b.x + 3, b.y + 3));
+    try std.testing.expectEqual(Press.select, routePress(p, area640, test_widths, 100, 50));
+    try std.testing.expectEqual(Press.nothing, routePress(p, area640, test_widths, 700, 50));
     // パネルを隠していれば、同じ位置でも ROI の選択になる
     const hidden: Panel = .{ .x = 0, .y = 0, .hidden = true };
-    try std.testing.expectEqual(Press.select, routePress(hidden, area640, pb.x + 5, pb.y + 5));
+    try std.testing.expectEqual(Press.select, routePress(hidden, area640, test_widths, pb.x + 5, pb.y + 5));
     // ROI を選んでいる間はパネルを描かない
     try std.testing.expect(!panelVisible(p, true));
     try std.testing.expect(panelVisible(p, false));
@@ -315,8 +397,10 @@ test "player: time, frame number and the share line" {
     try std.testing.expectEqualStrings("2:03.456", formatTime(&buf, 123.456, true));
     try std.testing.expectEqualStrings("1:57:22", formatTime(&buf, 7042.0, false));
     try std.testing.expectEqualStrings("0:00.000", formatTime(&buf, 0, true));
+    try std.testing.expectEqualStrings("00:13:32", clockText(&buf, 812.9));
+    try std.testing.expectEqualStrings("02:29:14", clockText(&buf, 8954.0));
+    try std.testing.expectEqualStrings("frame 3704", frameText(&buf, 123.456, 30));
     try std.testing.expectEqual(@as(u64, 3700), frameIndex(123.333, 30));
     try std.testing.expectApproxEqAbs(@as(f64, 123.3333), frameToSec(3700, 30), 1e-3);
-    try std.testing.expectEqualStrings("2:03.456 / 1:57:22  #3704", panelText(&buf, 123.456, 7042.0, 30));
     try std.testing.expectEqualStrings("A.mp4 t=123.456 frame=3704", shareLine(&buf, "A.mp4", 123.456, 30));
 }

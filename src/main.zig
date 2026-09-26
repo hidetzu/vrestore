@@ -281,6 +281,7 @@ test {
     _ = @import("gui_state.zig");
     _ = @import("player_state.zig");
     _ = @import("glyphs.zig");
+    _ = @import("fonts.zig");
     _ = @import("temporal.zig");
     _ = @import("provenance.zig");
     _ = @import("motion.zig");
