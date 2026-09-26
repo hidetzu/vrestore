@@ -55,6 +55,27 @@ pub fn score(reference: Image, test_img: Image, rect: Rect) Error!FrameScore {
     return s;
 }
 
+/// `mask`（1 画素 1 バイト、画像全体）が 0 でない画素だけの、R/G/B 平均の二乗誤差。
+/// 復元方式が「戻した」と言った画素がどれだけ正しいかを測る。数えた画素の数も返す
+pub fn mseMasked(reference: Image, test_img: Image, rect: Rect, mask: []const u8) Error!struct { mse: f64, pixels: usize } {
+    if (reference.width != test_img.width or reference.height != test_img.height) return error.SizeMismatch;
+    if (@as(u64, rect.x) + rect.w > reference.width or @as(u64, rect.y) + rect.h > reference.height) return error.RectOutside;
+    var sum: u64 = 0;
+    var n: usize = 0;
+    for (rect.y..rect.y + rect.h) |y| {
+        for (rect.x..rect.x + rect.w) |x| {
+            if (mask[y * reference.width + x] == 0) continue;
+            for (0..3) |c| {
+                const d = px(reference, x, y, c) - px(test_img, x, y, c);
+                sum += @intCast(d * d);
+            }
+            n += 1;
+        }
+    }
+    const mse_value = if (n == 0) 0 else @as(f64, @floatFromInt(sum)) / @as(f64, @floatFromInt(n * 3));
+    return .{ .mse = mse_value, .pixels = n };
+}
+
 /// MSE から PSNR (dB)。MSE が 0（完全一致）なら null
 pub fn psnr(mse_value: f64) ?f64 {
     if (mse_value <= 0) return null;
@@ -183,6 +204,23 @@ test "metrics: noise lowers SSIM, symmetric in its arguments" {
     try std.testing.expect(ab.ssimAll() < 0.999);
     try std.testing.expectEqual(ab.ssimAll(), ba.ssimAll());
     try std.testing.expectEqual(ab.mseAvg(), ba.mseAvg());
+}
+
+test "metrics: mseMasked counts only masked pixels inside the rect" {
+    var a = [_]u8{100} ** (16 * 16 * 3);
+    var b = [_]u8{100} ** (16 * 16 * 3);
+    var mask = [_]u8{0} ** (16 * 16);
+    // (2,2) は 10 ずれ、マスクあり。(3,2) は 50 ずれ、マスクなし。(15,15) はマスクありだが矩形の外
+    b[(2 * 16 + 2) * 3 ..][0..3].* = .{ 110, 110, 110 };
+    b[(2 * 16 + 3) * 3 ..][0..3].* = .{ 150, 150, 150 };
+    mask[2 * 16 + 2] = 255;
+    mask[2 * 16 + 1] = 255;
+    mask[15 * 16 + 15] = 255;
+    const img_a: Image = .{ .width = 16, .height = 16, .rgb = &a };
+    const img_b: Image = .{ .width = 16, .height = 16, .rgb = &b };
+    const r = try mseMasked(img_a, img_b, .{ .x = 0, .y = 0, .w = 8, .h = 8 }, &mask);
+    try std.testing.expectEqual(@as(usize, 2), r.pixels);
+    try std.testing.expectEqual(@as(f64, 50), r.mse); // (100 + 0) / 2
 }
 
 test "metrics: rejects mismatched sizes and bad rects" {
