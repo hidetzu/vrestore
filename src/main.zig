@@ -5,6 +5,7 @@ const video = @import("video.zig");
 const roi = @import("roi.zig");
 const detect_roi = @import("detect_roi.zig");
 const compare = @import("compare.zig");
+const restore_cmd = @import("restore_cmd.zig");
 
 const usage =
     \\usage: vrestore <command> [args]
@@ -24,9 +25,17 @@ const usage =
     \\      --min-margin <f>        reliable needs (peak - best elsewhere) >= f
     \\      --min-psr <f>           reliable needs PSR >= f (0 = not used)
     \\
-    \\  compare [--rect x,y,w,h] [--per-frame] <reference> <test>
+    \\  restore (--roi <detection.json> | --rect x,y,w,h) --raw <out.rgb|-> [options] <video>
+    \\      put back the pixels hidden by the watermark, taken from frames where the background
+    \\      moved out from under it (Temporal Recovery, translation only). Writes RGB24 raw frames;
+    \\      pixels it could not recover are left as they were. Prints the recovery coverage as JSON.
+    \\      --window <n>        frames to look at on each side (default 15)
+    \\      --mask <out.gray>   also write a mask: 0 = not recovered, 255 = recovered or outside the ROI
+    \\
+    \\  compare [--rect x,y,w,h | --roi <detection.json>] [--per-frame] [--mask <mask.gray>] <reference> <test>
     \\      compare <test> with the original <reference> frame by frame, inside the rect
     \\      (default: whole frame). Prints SSIM and PSNR as JSON; both videos need the same frames.
+    \\      With --mask (from restore), also the PSNR of the recovered pixels only.
     \\
     \\  --version       print the version
     \\  --help          print this message
@@ -39,6 +48,7 @@ const Command = union(enum) {
     probe: []const u8,
     detect_roi: detect_roi.Args,
     compare: compare.Args,
+    restore: restore_cmd.Args,
     /// 引数が足りない。どのコマンドかを持つ
     missing_arg: []const u8,
     /// 引数の形が違う。利用者に見せる文と、問題の引数
@@ -59,6 +69,7 @@ fn parseArgs(args: []const []const u8) Command {
     }
     if (std.mem.eql(u8, a, "detect-roi")) return parseDetectRoi(args[1..]);
     if (std.mem.eql(u8, a, "compare")) return parseCompare(args[1..]);
+    if (std.mem.eql(u8, a, "restore")) return parseRestore(args[1..]);
     return .{ .unknown = a };
 }
 
@@ -111,6 +122,14 @@ fn parseCompare(args: []const []const u8) Command {
         const a = args[i];
         if (std.mem.eql(u8, a, "--per-frame")) {
             out.per_frame = true;
+        } else if (std.mem.eql(u8, a, "--mask")) {
+            if (i + 1 >= args.len) return .{ .bad_arg = .{ .why = "option needs a value", .arg = a } };
+            i += 1;
+            out.mask = args[i];
+        } else if (std.mem.eql(u8, a, "--roi")) {
+            if (i + 1 >= args.len) return .{ .bad_arg = .{ .why = "option needs a value", .arg = a } };
+            i += 1;
+            out.roi_json = args[i];
         } else if (std.mem.eql(u8, a, "--rect")) {
             if (i + 1 >= args.len) return .{ .bad_arg = .{ .why = "option needs a value", .arg = a } };
             i += 1;
@@ -128,6 +147,48 @@ fn parseCompare(args: []const []const u8) Command {
     out.reference = paths[0];
     out.test_video = paths[1];
     return .{ .compare = out };
+}
+
+fn parseRestore(args: []const []const u8) Command {
+    var out: restore_cmd.Args = .{};
+    var video_path: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (!std.mem.startsWith(u8, a, "--")) {
+            if (video_path != null) return .{ .bad_arg = .{ .why = "only one video can be given", .arg = a } };
+            video_path = a;
+            continue;
+        }
+        if (i + 1 >= args.len) return .{ .bad_arg = .{ .why = "option needs a value", .arg = a } };
+        i += 1;
+        const v = args[i];
+        if (std.mem.eql(u8, a, "--roi")) {
+            out.roi_json = v;
+        } else if (std.mem.eql(u8, a, "--rect")) {
+            const r = compare.parseRect(v) orelse return .{ .bad_arg = .{ .why = "--rect needs x,y,w,h", .arg = v } };
+            out.rect = .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h };
+        } else if (std.mem.eql(u8, a, "--raw")) {
+            out.raw_out = v;
+        } else if (std.mem.eql(u8, a, "--mask")) {
+            out.mask_out = v;
+        } else if (std.mem.eql(u8, a, "--shifts")) {
+            out.shifts_out = v;
+        } else if (std.mem.eql(u8, a, "--window")) {
+            out.window = std.fmt.parseInt(usize, v, 10) catch 0;
+            if (out.window == 0) return .{ .bad_arg = .{ .why = "--window needs a positive integer", .arg = v } };
+        } else if (std.mem.eql(u8, a, "--max-ring-diff")) {
+            out.max_ring_diff = if (std.mem.eql(u8, v, "off")) null else std.fmt.parseFloat(f64, v) catch return .{ .bad_arg = .{ .why = "--max-ring-diff needs a number or off", .arg = v } };
+        } else if (std.mem.eql(u8, a, "--min-peak")) {
+            out.min_peak = parseFraction(v) orelse return .{ .bad_arg = .{ .why = "--min-peak needs a number between 0 and 1", .arg = v } };
+        } else {
+            return .{ .unknown = a };
+        }
+    }
+    if (out.rect == null and out.roi_json == null) return .{ .bad_arg = .{ .why = "restore needs --roi <detection.json> or --rect x,y,w,h", .arg = "--roi" } };
+    if (out.raw_out.len == 0) return .{ .bad_arg = .{ .why = "restore needs --raw <out.rgb> (or - for stdout)", .arg = "--raw" } };
+    out.video = video_path orelse return .{ .missing_arg = "restore" };
+    return .{ .restore = out };
 }
 
 fn parseFraction(s: []const u8) ?f64 {
@@ -160,7 +221,8 @@ pub fn main(init: std.process.Init) !u8 {
         },
         .probe => |path| return probe(arena, &out.interface, &err.interface, path),
         .detect_roi => |a| return detect_roi.run(init.gpa, io, &out.interface, &err.interface, a),
-        .compare => |a| return compare.run(init.gpa, &out.interface, &err.interface, a),
+        .compare => |a| return compare.run(init.gpa, io, &out.interface, &err.interface, a),
+        .restore => |a| return restore_cmd.run(init.gpa, io, &out.interface, &err.interface, a),
         .bad_arg => |b| {
             try err.interface.print("vrestore: {s}: '{s}'\n\n{s}", .{ b.why, b.arg, usage });
             return 2;
@@ -208,6 +270,8 @@ test {
     _ = compare;
     _ = @import("metrics.zig");
     _ = @import("gui_state.zig");
+    _ = @import("temporal.zig");
+    _ = restore_cmd;
 }
 
 test "parseArgs: no arguments shows help" {
@@ -245,6 +309,16 @@ test "parseArgs: compare" {
     try std.testing.expect(got.per_frame);
     try std.testing.expectEqualStrings("compare", parseArgs(&.{ "compare", "a.mp4" }).missing_arg);
     try std.testing.expectEqualStrings("1,2", parseArgs(&.{ "compare", "--rect", "1,2", "a", "b" }).bad_arg.arg);
+}
+
+test "parseArgs: restore" {
+    const got = parseArgs(&.{ "restore", "--roi", "d.json", "--raw", "o.rgb", "--window", "8", "v.mp4" }).restore;
+    try std.testing.expectEqualStrings("d.json", got.roi_json.?);
+    try std.testing.expectEqualStrings("o.rgb", got.raw_out);
+    try std.testing.expectEqual(@as(usize, 8), got.window);
+    try std.testing.expectEqualStrings("v.mp4", got.video);
+    try std.testing.expectEqualStrings("--roi", parseArgs(&.{ "restore", "--raw", "o", "v" }).bad_arg.arg);
+    try std.testing.expectEqualStrings("--raw", parseArgs(&.{ "restore", "--rect", "1,2,30,40", "v" }).bad_arg.arg);
 }
 
 test "parseArgs: unknown argument is kept verbatim" {

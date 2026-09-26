@@ -1,8 +1,13 @@
 //! ROI 検出の回帰テスト・較正に使う合成素材を作り、結果を正解と照合する。
 //!
 //!   roi_fixture synth  <case> <out.rgb> <truth.json>   RGB24 の生フレームと正解を書く
+//!   roi_fixture synth-clean <case> <out.rgb> <truth.json>
+//!                     同じケースをウォーターマーク無しで書く（復元の正解。背景は synth と画素まで同じ）
 //!   roi_fixture cutref <video> <truth.json> <out.png>  エンコード済み動画のフレームから参照画像を切る
 //!   roi_fixture check  <truth.json> <detection.json>   dx / dy / IoU / reliable を判定する
+//!   roi_fixture check-restore <name> <restore.json> <compare.json> <conditions>
+//!                     復元の結果を条件で判定する。conditions は "coverage>=0.99,ssim>=0.9" のような並び。
+//!                     キーは restore.json と compare.json のどちらかにある数値
 //!   roi_fixture crossmetrics <compare.jsonl> <ffmpeg-ssim.log> <ffmpeg-psnr.log>
 //!                     `vrestore compare --per-frame` の値が FFmpeg の ssim / psnr フィルタと一致するかを見る
 //!
@@ -23,7 +28,8 @@ pub const Case = struct {
     height: u32 = 360,
     frames: u32 = 30,
     /// pan: 模様がパンする / cut: 毎フレーム別の模様 / flat: 動かない滑らかなグラデーション
-    bg: enum { pan, cut, flat } = .pan,
+    /// zoom: 画面中央を中心に 1 フレームあたり 1% ずつ拡大する（画面全体の平行移動ではない動き）
+    bg: enum { pan, cut, flat, zoom } = .pan,
     /// 1 フレームあたりのパン量 (px)
     pan_x: i32 = 7,
     pan_y: i32 = 3,
@@ -84,6 +90,12 @@ pub fn main(init: std.process.Init) !u8 {
         try synth(arena, io, c, args[3], args[4]);
         return 0;
     }
+    if (args.len == 5 and std.mem.eql(u8, args[1], "synth-clean")) {
+        var c = try parseCase(args[2]);
+        c.opacity = 0;
+        try synth(arena, io, c, args[3], args[4]);
+        return 0;
+    }
     if (args.len == 5 and std.mem.eql(u8, args[1], "cutref")) {
         video.c.av_log_set_level(video.c.AV_LOG_QUIET);
         try cutref(arena, io, args[2], args[3], args[4]);
@@ -92,6 +104,11 @@ pub fn main(init: std.process.Init) !u8 {
     if (args.len == 4 and std.mem.eql(u8, args[1], "check")) {
         // PASS の行は stdout（zig build では表示されない）、FAIL の行は stderr にも出して失敗文に載せる
         const code = try check(arena, io, &out.interface, args[2], args[3]);
+        if (code != 0) try err.interface.writeAll(out.interface.buffered());
+        return code;
+    }
+    if (args.len == 6 and std.mem.eql(u8, args[1], "check-restore")) {
+        const code = try checkRestore(arena, io, &out.interface, args[2], args[3], args[4], args[5]);
         if (code != 0) try err.interface.writeAll(out.interface.buffered());
         return code;
     }
@@ -237,6 +254,15 @@ fn synth(gpa: std.mem.Allocator, io: Io, c: Case, out_path: []const u8, truth_pa
             var rgb: [3]f32 = undefined;
             for (0..3) |ch| rgb[ch] = switch (c.bg) {
                 .pan => tex[ch][(y + oy) * tw + x + ox],
+                .zoom => blk: {
+                    // 出力の (x, y) は、模様の中央から 1 / (1 + 0.01k) 倍の位置
+                    const s = 1 + 0.01 * @as(f32, @floatFromInt(k));
+                    const fx = @as(f32, @floatFromInt(tw)) / 2 + (@as(f32, @floatFromInt(x)) - @as(f32, @floatFromInt(w)) / 2) / s;
+                    const fy = @as(f32, @floatFromInt(th)) / 2 + (@as(f32, @floatFromInt(y)) - @as(f32, @floatFromInt(h)) / 2) / s;
+                    const ix: usize = @intFromFloat(std.math.clamp(fx, 0, @as(f32, @floatFromInt(tw - 1))));
+                    const iy: usize = @intFromFloat(std.math.clamp(fy, 0, @as(f32, @floatFromInt(th - 1))));
+                    break :blk tex[ch][iy * tw + ix];
+                },
                 .cut => cut_tex[ch][y * w + x],
                 .flat => (@as(f32, @floatFromInt(x)) / @as(f32, @floatFromInt(w)) * 0.6 +
                     @as(f32, @floatFromInt(y)) / @as(f32, @floatFromInt(h)) * 0.3 + 0.05 * @as(f32, @floatFromInt(ch))),
@@ -341,6 +367,49 @@ fn check(arena: std.mem.Allocator, io: Io, out: *Io.Writer, truth_path: []const 
     try out.print("{s} case={s} expect={s} dx={d} dy={d} iou={d:.3} reliable={} confidence={d:.3} margin={d:.3} psr={d:.1} crf={d} opacity={d:.2}\n", .{
         if (ok) "PASS" else "FAIL", t.case, t.expect, dx, dy, i, d.reliable, d.confidence, d.margin orelse -1, d.psr orelse -1, t.crf, t.opacity,
     });
+    return if (ok) 0 else 1;
+}
+
+fn jsonNumber(v: std.json.Value) ?f64 {
+    return switch (v) {
+        .float => |f| f,
+        .integer => |i| @floatFromInt(i),
+        else => null,
+    };
+}
+
+/// 1 行で結果を出す: <PASS|FAIL> restore=<name> <key>=<値>(<条件>) ...
+fn checkRestore(arena: std.mem.Allocator, io: Io, out: *Io.Writer, name: []const u8, restore_path: []const u8, compare_path: []const u8, conditions: []const u8) !u8 {
+    const cwd = Io.Dir.cwd();
+    // どちらのファイルも最後の行の JSON を読む（vrestore-gui は検出と復元の 2 行を出す）
+    var docs: [2]std.json.Value = undefined;
+    for ([_][]const u8{ restore_path, compare_path }, &docs) |p, *doc| {
+        const data = try cwd.readFileAlloc(io, p, arena, .limited(1 << 16));
+        const trimmed = std.mem.trimEnd(u8, data, "\n");
+        const last = trimmed[if (std.mem.lastIndexOfScalar(u8, trimmed, '\n')) |i| i + 1 else 0..];
+        doc.* = try std.json.parseFromSliceLeaky(std.json.Value, arena, last, .{});
+    }
+    var ok = true;
+    try out.print("restore={s}", .{name});
+    var it = std.mem.tokenizeScalar(u8, conditions, ',');
+    while (it.next()) |cond| {
+        const ge = std.mem.indexOf(u8, cond, ">=");
+        const le = std.mem.indexOf(u8, cond, "<=");
+        const at = ge orelse le orelse return error.BadCondition;
+        const key = cond[0..at];
+        const want = try std.fmt.parseFloat(f64, cond[at + 2 ..]);
+        const got: ?f64 = for (docs) |d| {
+            if (d.object.get(key)) |v| break jsonNumber(v);
+        } else null;
+        const pass = if (got) |g| (if (ge != null) g >= want else g <= want) else false;
+        ok = ok and pass;
+        if (got) |g| try out.print(" {s}={d:.4}({s})", .{ key, g, cond[at..] }) else try out.print(" {s}=missing({s})", .{ key, cond[at..] });
+    }
+    try out.writeAll("\n");
+    // PASS / FAIL は行頭に置きたいので、書いた行の前に足す
+    const line = try arena.dupe(u8, out.buffered());
+    out.end = 0;
+    try out.print("{s} {s}", .{ if (ok) "PASS" else "FAIL", line });
     return if (ok) 0 else 1;
 }
 

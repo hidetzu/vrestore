@@ -11,7 +11,11 @@ pub const Args = struct {
     test_video: []const u8 = "",
     /// null なら画面全体
     rect: ?metrics.Rect = null,
+    /// detect-roi の JSON。x / y / width / height を矩形にする（--rect の代わり）
+    roi_json: ?[]const u8 = null,
     per_frame: bool = false,
+    /// 1 画素 1 バイトのマスク（`vrestore restore --mask`）。0 でない画素だけで PSNR も出す
+    mask: ?[]const u8 = null,
 };
 
 /// "x,y,w,h" を読む
@@ -23,7 +27,7 @@ pub fn parseRect(s: []const u8) ?metrics.Rect {
     return .{ .x = v[0], .y = v[1], .w = v[2], .h = v[3] };
 }
 
-pub fn run(gpa: std.mem.Allocator, out: *Io.Writer, err: *Io.Writer, args: Args) !u8 {
+pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, args: Args) !u8 {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -43,7 +47,31 @@ pub fn run(gpa: std.mem.Allocator, out: *Io.Writer, err: *Io.Writer, args: Args)
         try err.print("vrestore: the videos have different sizes ({d}x{d} and {d}x{d}); compare needs the same frames\n", .{ ref.info.width, ref.info.height, tst.info.width, tst.info.height });
         return 1;
     }
-    const rect = args.rect orelse metrics.Rect{ .x = 0, .y = 0, .w = ref.info.width, .h = ref.info.height };
+    const rect = args.rect orelse if (args.roi_json) |p| blk: {
+        const data = Io.Dir.cwd().readFileAlloc(io, p, arena, .limited(1 << 16)) catch |e| {
+            try err.print("vrestore: could not read '{s}': {s}\n", .{ p, @errorName(e) });
+            return 1;
+        };
+        const Roi = struct { x: u32, y: u32, width: u32, height: u32 };
+        const r = std.json.parseFromSliceLeaky(Roi, arena, data, .{ .ignore_unknown_fields = true }) catch {
+            try err.print("vrestore: '{s}' is not a detect-roi JSON (needs x, y, width, height)\n", .{p});
+            return 1;
+        };
+        break :blk metrics.Rect{ .x = r.x, .y = r.y, .w = r.width, .h = r.height };
+    } else metrics.Rect{ .x = 0, .y = 0, .w = ref.info.width, .h = ref.info.height };
+
+    var mask_read_buf: [64 * 1024]u8 = undefined;
+    const mask_file: ?Io.File = if (args.mask) |p| Io.Dir.cwd().openFile(io, p, .{}) catch |e| {
+        try err.print("vrestore: could not open the mask '{s}': {s}\n", .{ p, @errorName(e) });
+        return 1;
+    } else null;
+    defer if (mask_file) |f| f.close(io);
+    var mask_r: ?Io.File.Reader = if (mask_file) |f| .initStreaming(f, io, &mask_read_buf) else null;
+    const mask = try arena.alloc(u8, @as(usize, ref.info.width) * ref.info.height);
+    var masked_sum: f64 = 0; // 画素数で重み付けした MSE の和
+    var masked_n: usize = 0;
+    var masked_bad: usize = 0;
+    var roi_n: usize = 0;
 
     const buf_a = try arena.alloc(u8, ref.frameBytes());
     const buf_b = try arena.alloc(u8, tst.frameBytes());
@@ -74,6 +102,17 @@ pub fn run(gpa: std.mem.Allocator, out: *Io.Writer, err: *Io.Writer, args: Args)
             } });
             return 2;
         };
+        if (mask_r) |*mr| {
+            mr.interface.readSliceAll(mask) catch {
+                try err.print("vrestore: the mask '{s}' ends before frame {d}; it needs one {d}x{d} byte plane per frame\n", .{ args.mask.?, n, ref.info.width, ref.info.height });
+                return 1;
+            };
+            const m = metrics.mseMasked(.{ .width = fa.?.width, .height = fa.?.height, .rgb = fa.?.rgb }, .{ .width = fb.?.width, .height = fb.?.height, .rgb = fb.?.rgb }, rect, mask) catch unreachable;
+            masked_sum += m.mse * @as(f64, @floatFromInt(m.pixels));
+            masked_n += m.pixels;
+            masked_bad += m.bad;
+            roi_n += @as(usize, rect.w) * rect.h;
+        }
         ssim_sum += s.ssimAll();
         ssim_min = @min(ssim_min, s.ssimAll());
         mse_sum += s.mseAvg();
@@ -93,6 +132,14 @@ pub fn run(gpa: std.mem.Allocator, out: *Io.Writer, err: *Io.Writer, args: Args)
         n, rect.x, rect.y, rect.w, rect.h, ssim_sum / nf, ssim_min, mse_sum / nf,
     });
     if (metrics.psnr(mse_sum / nf)) |p| try out.print("{d:.3}", .{p}) else try out.writeAll("null");
+    if (args.mask != null) {
+        // マスクのある画素（戻した画素）だけの PSNR と、それが矩形の何割か
+        try out.print(",\"masked_pixels\":{d},\"masked_fraction\":{d:.4},\"masked_psnr\":", .{ masked_n, @as(f64, @floatFromInt(masked_n)) / @as(f64, @floatFromInt(@max(1, roi_n))) });
+        const p = if (masked_n == 0) null else metrics.psnr(masked_sum / @as(f64, @floatFromInt(masked_n)));
+        if (p) |v| try out.print("{d:.3}", .{v}) else try out.writeAll("null");
+        // 戻した画素のうち、どれかの色で正解から bad_pixel_error より離れた画素の割合
+        try out.print(",\"masked_bad_fraction\":{d:.4}", .{@as(f64, @floatFromInt(masked_bad)) / @as(f64, @floatFromInt(@max(1, masked_n)))});
+    }
     try out.writeAll("}\n");
     return 0;
 }

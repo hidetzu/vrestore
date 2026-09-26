@@ -29,6 +29,8 @@ README・CI・ここにコマンドを写さない。
 
 ## 3. 境界
 
+- 背景復元は、映像内にある実画素だけを戻す。戻せない画素は埋めずに未復元として残し、マスクで返す
+  （[ADR 0005](docs/adr/0005-temporal-recovery-copies-real-pixels-and-leaves-the-rest-unrecovered.md)）
 - **ROI 検出と背景復元を分ける**（[ADR 0002](docs/adr/0002-roi-detection-is-separate-from-background-recovery.md)）。
   復元アルゴリズムを変えても ROI 検出を触らない
 - コンテナ・コーデックを自前で書かない。FFmpeg に任せる（[ADR 0001](docs/adr/0001-zig-for-control-and-image-processing-ffmpeg-for-codecs.md)）
@@ -76,4 +78,6 @@ ln -s ~/path/to/実素材.mp4 tmp/media/
 
 | 何が起きたか | 代わりにどうするか |
 |---|---|
+| 手持ちの実写で、推定した移動（ピークは 0.85〜0.99 と高い）で別フレームから画素を借り、「戻した」と言った画素の 29.8% が正解から外れた（横縞のような画素を貼った）。画面全体が平行移動していない動きを、平行移動の累積で近似したため | 借りる前に ROI の周りの帯が合うかを確かめる（`temporal.zig` の `ringDiff`、閾値 6）。`zig build restore-e2e` の `restore-zoom` が止める（確かめないと外れ 3.6% で FAIL） |
+| 位相相関（全帯域）で、実際は 3,1 px/フレームで動いている合成動画（crf 35）を 59 ペア中 56 ペア (0,0) と推定し、閾値を超えたので間違った画素を貼った（戻した画素の PSNR 20.4 dB）。x264 のブロックの格子（16 px）がどのフレームでも同じ位置にあり、位相相関が全周波数を同じ重みにするため | 位相相関は 0.06 cycles/px 以下だけで取る（`temporal.zig` の `max_freq`）。`zig build restore-e2e` の `restore-pan3-crf35` が止める（全帯域に戻すと coverage 0 で FAIL） |
 | Zig 0.16 の `std.Io.File.Writer.init` で stdout に書いたら、`{ echo; vrestore ...; } > file` のように前の出力があるファイルで先頭から上書きした（位置指定書き込み）。`zig build` の Run ステップは stdout をパイプで受けるので、テストでは見えなかった | stdout / stderr は `.initStreaming` で開く。`build.zig` の `cli_stdout_file` が止める |
