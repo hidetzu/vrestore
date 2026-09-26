@@ -1,0 +1,37 @@
+# Zig のビルド成果物とキャッシュ
+/.zig-cache/
+/zig-out/
+/zig-pkg/
+
+# macOS
+.DS_Store
+
+# ---- 動画・実素材はコミットしない -------------------------------------------
+# 手元の作業場。実素材は tmp/media/ に置く（CLAUDE.md「手元の素材」）
+/tmp/
+/media/
+/debug/
+
+# 動画コンテナ。場所を問わず無視する
+*.mp4
+*.m4v
+*.mov
+*.mkv
+*.webm
+*.avi
+*.ts
+*.flv
+*.wmv
+# 生の映像ストリーム
+*.h264
+*.264
+*.h265
+*.265
+*.hevc
+*.yuv
+*.y4m
+# ⚠ .gitignore は `git add -f` で抜けられる。
+# 最後の壁は scripts/check-no-media.sh（verify と CI が回す）
+
+# Claude Code の他セッションの worktree
+.claude/worktrees/
