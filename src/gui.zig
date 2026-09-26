@@ -7,6 +7,8 @@
 //! 操作:
 //!   ドラッグ（フレーム上）   ウォーターマークの範囲を選ぶ
 //!   Enter / D                選んだ範囲を参照画像にして検出する
+//!   R                        検出した ROI を、前後のフレームの実画素で戻す（Temporal Recovery）
+//!   Space                    処理前 / 処理後を切り替える（処理後で戻せなかった画素はマゼンタ）
 //!   ← / →                    1 フレーム戻る / 進む（Shift で 1 秒、↑ / ↓ で 10 秒）
 //!   Home / End               先頭 / 末尾
 //!   クリック・ドラッグ（下の帯）  その時刻へ移動
@@ -20,6 +22,8 @@ const roi = @import("roi.zig");
 const detect_roi = @import("detect_roi.zig");
 const state = @import("gui_state.zig");
 const compare = @import("compare.zig");
+const temporal = @import("temporal.zig");
+const restore_cmd = @import("restore_cmd.zig");
 
 const sdl = @cImport({
     @cInclude("SDL.h");
@@ -33,6 +37,8 @@ const usage =
     \\  --select x,y,w,h        start with this selection (frame pixels)
     \\  --detect-and-exit       run the detection on --select once, print the JSON and exit
     \\                          (the same path as pressing Enter; used by the tests)
+    \\  --restore               with --detect-and-exit, also restore the current frame (as pressing R)
+    \\                          and print its coverage as a second JSON line
     \\  --screenshot <png>      with --detect-and-exit, also save what the window shows
     \\
 ;
@@ -50,23 +56,103 @@ const App = struct {
     frame_dur: f64,
     selection: state.Selection = .{},
     detection: ?roi.Detection = null,
+    /// 表示中のフレームを戻したもの（R）。フレームを動かすと捨てる
+    restored: ?[]u8 = null,
+    /// 戻せた画素が 1、戻せなかった ROI の画素が 0（フレーム全体）
+    restored_mask: ?[]u8 = null,
+    recovered: temporal.Recovered = .{ .recovered = 0, .pixels = 0 },
+    show_after: bool = false,
+    /// 表示用の画素（処理後で、戻せなかった画素をマゼンタにしたもの）
+    display: []u8,
     /// 検出できなかったときの理由（窓のタイトルに出す）
     problem: [256]u8 = undefined,
     problem_len: usize = 0,
 
+    fn clearRestored(app: *App) void {
+        if (app.restored) |r| app.gpa.free(r);
+        if (app.restored_mask) |m| app.gpa.free(m);
+        app.restored = null;
+        app.restored_mask = null;
+        app.show_after = false;
+    }
+
+    /// 検出した ROI を、表示中のフレームの前後 `window` 枚の実画素で戻す。
+    /// 移動の推定と復元は temporal.recoverInWindow（CLI の restore と同じ部品、同じ閾値）
+    fn restore(app: *App) !void {
+        app.clearRestored();
+        app.problem_len = 0;
+        const det = app.detection orelse return app.setProblem("detect the ROI first (Enter)", .{});
+        const window = 15;
+        const roi_rect: temporal.Rect = .{ .x = @intCast(det.x), .y = @intCast(det.y), .w = @intCast(det.width), .h = @intCast(det.height) };
+
+        var d = try video.Decoder.open(app.path);
+        defer d.close();
+        try d.seek(@max(0, app.time_sec - @as(f64, @floatFromInt(window)) * app.frame_dur));
+        var bufs: std.ArrayList([]u8) = .empty;
+        defer {
+            for (bufs.items) |b| app.gpa.free(b);
+            bufs.deinit(app.gpa);
+        }
+        var target: ?usize = null;
+        var best_dt: f64 = std.math.inf(f64);
+        while (bufs.items.len < 2 * window + 1) {
+            const buf = try app.gpa.alloc(u8, d.frameBytes());
+            const f = (try d.next(buf)) orelse {
+                app.gpa.free(buf);
+                break;
+            };
+            try bufs.append(app.gpa, buf);
+            const dt = @abs(f.time_sec - app.time_sec);
+            if (dt < best_dt) {
+                best_dt = dt;
+                target = bufs.items.len - 1;
+            }
+            // 表示中のフレームより後ろを window 枚読んだら十分
+            if (target) |t| if (bufs.items.len > t + window) break;
+        }
+        const t = target orelse return app.setProblem("no frame to restore", .{});
+        const images = try app.gpa.alloc(temporal.Image, bufs.items.len);
+        defer app.gpa.free(images);
+        for (bufs.items, images) |b, *img| img.* = .{ .width = d.info.width, .height = d.info.height, .rgb = b };
+
+        const out = try app.gpa.alloc(u8, d.frameBytes());
+        errdefer app.gpa.free(out);
+        const mask = try app.gpa.alloc(u8, @as(usize, d.info.width) * d.info.height);
+        errdefer app.gpa.free(mask);
+        app.recovered = try temporal.recoverInWindow(app.gpa, images, t, roi_rect, restore_cmd.default_min_peak, out, mask);
+        app.restored = out;
+        app.restored_mask = mask;
+        app.show_after = true;
+    }
+
+    /// 画面に出す画素。処理後なら戻した画素、戻せなかった画素はマゼンタ（推測で埋めていないことを見せる）
+    fn pixels(app: *App) []const u8 {
+        if (!app.show_after) return app.rgb;
+        const r = app.restored orelse return app.rgb;
+        const m = app.restored_mask.?;
+        @memcpy(app.display, r);
+        for (m, 0..) |v, i| if (v == 0) {
+            app.display[i * 3 ..][0..3].* = .{ 255, 0, 255 };
+        };
+        return app.display;
+    }
+
     fn showAt(app: *App, sec: f64) !void {
+        app.clearRestored();
         const t = std.math.clamp(sec, 0, @max(0, app.duration - app.frame_dur));
         try app.dec.seek(t);
         if (try app.dec.next(app.rgb)) |f| app.time_sec = f.time_sec;
     }
 
     fn step(app: *App) !void {
+        app.clearRestored();
         // 1 フレーム進むのは seek せずに次を読むだけ
         if (try app.dec.next(app.rgb)) |f| app.time_sec = f.time_sec;
     }
 
     /// 選択範囲を参照画像にして検出する。Enter と --detect-and-exit はどちらもここを通る
     fn detect(app: *App) !void {
+        app.clearRestored();
         app.detection = null;
         app.problem_len = 0;
         const sel = app.selection.rect orelse return app.setProblem("select the watermark by dragging first", .{});
@@ -111,12 +197,15 @@ pub fn main(init: std.process.Init) !u8 {
     var at: f64 = 0;
     var select: ?state.Rect = null;
     var detect_and_exit = false;
+    var restore_too = false;
     var screenshot: ?[]const u8 = null;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const a = args[i];
         if (std.mem.eql(u8, a, "--detect-and-exit")) {
             detect_and_exit = true;
+        } else if (std.mem.eql(u8, a, "--restore")) {
+            restore_too = true;
         } else if (std.mem.eql(u8, a, "--at") and i + 1 < args.len) {
             i += 1;
             at = std.fmt.parseFloat(f64, args[i]) catch return badArg(&err.interface, "--at needs seconds", args[i]);
@@ -153,6 +242,7 @@ pub fn main(init: std.process.Init) !u8 {
         .path = path_z,
         .dec = dec,
         .rgb = try arena.alloc(u8, dec.frameBytes()),
+        .display = try arena.alloc(u8, dec.frameBytes()),
         .duration = dec.info.duration_sec orelse 0,
         .frame_dur = 1 / fps,
     };
@@ -194,8 +284,10 @@ pub fn main(init: std.process.Init) !u8 {
     };
     defer sdl.SDL_DestroyTexture(tex);
 
+    defer app.clearRestored();
     if (detect_and_exit) {
         try app.detect();
+        if (restore_too and app.detection != null) try app.restore();
         draw(&app, win, ren, tex);
         if (screenshot) |png_path| saveScreenshot(arena, io, ren, png_path) catch |e| {
             try err.interface.print("vrestore-gui: could not save the screenshot '{s}': {s}\n", .{ png_path, @errorName(e) });
@@ -204,6 +296,13 @@ pub fn main(init: std.process.Init) !u8 {
         sdl.SDL_RenderPresent(ren);
         if (app.detection) |d| {
             try detect_roi.writeJson(&out.interface, d);
+            if (restore_too) {
+                if (app.restored == null) {
+                    try err.interface.print("vrestore-gui: {s}\n", .{app.problem[0..app.problem_len]});
+                    return 1;
+                }
+                try out.interface.print("{{\"time_sec\":{d:.3},\"recovered\":{d},\"pixels\":{d},\"coverage\":{d:.4}}}\n", .{ app.time_sec, app.recovered.recovered, app.recovered.pixels, app.recovered.coverage() });
+            }
             return 0;
         }
         try err.interface.print("vrestore-gui: {s}\n", .{app.problem[0..app.problem_len]});
@@ -247,6 +346,7 @@ pub fn main(init: std.process.Init) !u8 {
                 switch (ev.key.keysym.scancode) {
                     sdl.SDL_SCANCODE_Q => running = false,
                     sdl.SDL_SCANCODE_ESCAPE => {
+                        app.clearRestored();
                         app.selection = .{};
                         app.detection = null;
                         app.problem_len = 0;
@@ -254,6 +354,13 @@ pub fn main(init: std.process.Init) !u8 {
                     sdl.SDL_SCANCODE_RETURN, sdl.SDL_SCANCODE_D => {
                         sdl.SDL_SetWindowTitle(win, "vrestore-gui | detecting...");
                         try app.detect();
+                    },
+                    sdl.SDL_SCANCODE_R => {
+                        sdl.SDL_SetWindowTitle(win, "vrestore-gui | restoring...");
+                        try app.restore();
+                    },
+                    sdl.SDL_SCANCODE_SPACE => {
+                        if (app.restored != null) app.show_after = !app.show_after;
                     },
                     sdl.SDL_SCANCODE_RIGHT => if (shift) try app.showAt(app.time_sec + 1) else try app.step(),
                     sdl.SDL_SCANCODE_LEFT => try app.showAt(app.time_sec - if (shift) 1 else app.frame_dur),
@@ -306,7 +413,7 @@ fn saveScreenshot(arena: std.mem.Allocator, io: Io, ren: *sdl.SDL_Renderer, path
 fn draw(app: *App, win: *sdl.SDL_Window, ren: *sdl.SDL_Renderer, tex: *sdl.SDL_Texture) void {
     const v = viewOf(ren, app);
     const ww = windowWidth(ren);
-    _ = sdl.SDL_UpdateTexture(tex, null, app.rgb.ptr, @intCast(app.dec.info.width * 3));
+    _ = sdl.SDL_UpdateTexture(tex, null, app.pixels().ptr, @intCast(app.dec.info.width * 3));
     _ = sdl.SDL_SetRenderDrawColor(ren, 24, 24, 24, 255);
     _ = sdl.SDL_RenderClear(ren);
     _ = sdl.SDL_RenderCopyF(ren, tex, null, &.{ .x = v.x, .y = v.y, .w = v.w, .h = v.h });
@@ -338,6 +445,9 @@ fn draw(app: *App, win: *sdl.SDL_Window, ren: *sdl.SDL_Renderer, tex: *sdl.SDL_T
 
 fn title(w: *Io.Writer, app: *const App) !void {
     try w.print("vrestore-gui | {d:.3}s / {d:.1}s", .{ app.time_sec, app.duration });
+    if (app.restored != null) {
+        try w.print(" | {s} | restored {d:.1}% of the ROI (magenta: not recovered) | Space: before/after", .{ if (app.show_after) "AFTER" else "BEFORE", app.recovered.coverage() * 100 });
+    }
     if (app.selection.rect) |r| try w.print(" | selected {d},{d} {d}x{d}", .{ r.x, r.y, r.w, r.h });
     if (app.detection) |d| {
         try w.print(" | ROI {d},{d} {d}x{d} confidence {d:.3} margin ", .{ d.x, d.y, d.width, d.height, d.confidence });
