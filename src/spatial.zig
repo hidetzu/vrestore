@@ -86,46 +86,50 @@ fn directional(rgb: []u8, w: u32, h: u32, prov: []const Provenance, i: u32) bool
 /// 埋めた画素を、上下左右の平均で置き換えることを繰り返す（ラプラス方程式の Gauss-Seidel 反復）。
 /// 見えている画素（known）は動かさない。画面の端は、画面の中の隣だけで平均する
 fn relax(gpa: std.mem.Allocator, rgb: []u8, w: u32, h: u32, prov: []const Provenance, roi: Rect) !void {
-    // 反復は小数で持つ（毎回 u8 に丸めると滑らかにならない）
-    const rw = roi.w;
-    const rh = roi.h;
-    const buf = try gpa.alloc(f32, @as(usize, rw) * rh * 3);
+    // 反復は小数で持つ（毎回 u8 に丸めると滑らかにならない）。ROI を 1 px 広げた範囲（画面の中）を持てば、
+    // 埋める画素の上下左右はすべてこの中にある
+    const px0 = roi.x -| 1;
+    const py0 = roi.y -| 1;
+    const pw = @min(w, roi.x + roi.w + 1) - px0;
+    const ph = @min(h, roi.y + roi.h + 1) - py0;
+    const buf = try gpa.alloc(f32, @as(usize, pw) * ph * 3);
     defer gpa.free(buf);
-    for (0..rh) |yy| for (0..rw) |xx| {
-        const i = (roi.y + yy) * w + roi.x + xx;
-        for (0..3) |c| buf[(yy * rw + xx) * 3 + c] = @floatFromInt(rgb[i * 3 + c]);
+    for (0..ph) |yy| for (0..pw) |xx| {
+        const i = (py0 + yy) * w + px0 + xx;
+        for (0..3) |c| buf[(yy * pw + xx) * 3 + c] = @floatFromInt(rgb[i * 3 + c]);
     };
-    const at = struct {
-        fn f(rgbv: []const u8, b: []const f32, ww: u32, r: Rect, x: i64, y: i64, c: usize) f32 {
-            if (x >= r.x and x < @as(i64, r.x) + r.w and y >= r.y and y < @as(i64, r.y) + r.h)
-                return b[((@as(usize, @intCast(y)) - r.y) * r.w + @as(usize, @intCast(x)) - r.x) * 3 + c];
-            return @floatFromInt(rgbv[(@as(usize, @intCast(y)) * ww + @as(usize, @intCast(x))) * 3 + c]);
+    // 埋める画素と、その上下左右（画面の中のものだけ、左・右・上・下の順）の buf 上の位置。
+    // 反復のたびに ROI 全体を見直さないよう、先に一度だけ並べる（順番は行優先のまま = 結果は変わらない）
+    const Hole = struct { at: u32, nb: [4]u32, n: u8 };
+    var holes: std.ArrayList(Hole) = .empty;
+    defer holes.deinit(gpa);
+    for (0..roi.h) |yy| for (0..roi.w) |xx| {
+        const x: i64 = @intCast(roi.x + xx);
+        const y: i64 = @intCast(roi.y + yy);
+        if (prov[@as(usize, @intCast(y)) * w + @as(usize, @intCast(x))] != .spatial_inpainted) continue;
+        var hole: Hole = .{ .at = @intCast((@as(usize, @intCast(y - py0)) * pw + @as(usize, @intCast(x - px0))) * 3), .nb = undefined, .n = 0 };
+        for ([_][2]i64{ .{ -1, 0 }, .{ 1, 0 }, .{ 0, -1 }, .{ 0, 1 } }) |d| {
+            const nx = x + d[0];
+            const ny = y + d[1];
+            if (nx < 0 or ny < 0 or nx >= w or ny >= h) continue;
+            hole.nb[hole.n] = @intCast((@as(usize, @intCast(ny - py0)) * pw + @as(usize, @intCast(nx - px0))) * 3);
+            hole.n += 1;
         }
-    }.f;
+        try holes.append(gpa, hole);
+    };
     for (0..harmonic_iterations) |_| {
-        for (0..rh) |yy| for (0..rw) |xx| {
-            const x: i64 = @intCast(roi.x + xx);
-            const y: i64 = @intCast(roi.y + yy);
-            if (prov[@as(usize, @intCast(y)) * w + @as(usize, @intCast(x))] != .spatial_inpainted) continue;
-            for (0..3) |c| {
-                var s: f32 = 0;
-                var n: f32 = 0;
-                for ([_][2]i64{ .{ -1, 0 }, .{ 1, 0 }, .{ 0, -1 }, .{ 0, 1 } }) |d| {
-                    const nx = x + d[0];
-                    const ny = y + d[1];
-                    if (nx < 0 or ny < 0 or nx >= w or ny >= h) continue;
-                    s += at(rgb, buf, w, roi, nx, ny, c);
-                    n += 1;
-                }
-                buf[(yy * rw + xx) * 3 + c] = s / n;
-            }
+        for (holes.items) |hl| for (0..3) |c| {
+            var s: f32 = 0;
+            for (hl.nb[0..hl.n]) |j| s += buf[j + c];
+            buf[hl.at + c] = s / @as(f32, @floatFromInt(hl.n));
         };
     }
-    for (0..rh) |yy| for (0..rw) |xx| {
-        const i = (roi.y + yy) * w + roi.x + xx;
-        if (prov[i] != .spatial_inpainted) continue;
-        for (0..3) |c| rgb[i * 3 + c] = @intFromFloat(std.math.clamp(@round(buf[(yy * rw + xx) * 3 + c]), 0, 255));
-    };
+    for (holes.items) |hl| {
+        const yy = hl.at / 3 / pw;
+        const xx = hl.at / 3 % pw;
+        const i = (py0 + yy) * w + px0 + xx;
+        for (0..3) |c| rgb[i * 3 + c] = @intFromFloat(std.math.clamp(@round(buf[hl.at + c]), 0, 255));
+    }
 }
 
 // ---- tests -------------------------------------------------------------------
