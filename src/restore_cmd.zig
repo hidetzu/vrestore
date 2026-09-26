@@ -10,6 +10,11 @@ const video = @import("video.zig");
 const temporal = @import("temporal.zig");
 const provenance = @import("provenance.zig");
 const motion = @import("motion.zig");
+const spatial = @import("spatial.zig");
+
+/// 戻せなかった画素を周囲から推測して埋めるか（spatial.zig）。埋めた画素の由来は spatial_inpainted。
+/// ⚠ 較正は docs/SPEC.md §4、決定は docs/adr/0008
+pub const default_fill: spatial.Method = .none;
 
 /// フレーム間の動きのモデル
 pub const MotionModel = enum {
@@ -41,6 +46,7 @@ pub const Args = struct {
     window: usize = 15,
     min_peak: f64 = default_min_peak,
     motion: MotionModel = default_motion,
+    fill: spatial.Method = default_fill,
     max_ring_diff: ?f64 = default_max_ring_diff,
     /// RGB24 の生フレームの出力先。"-" なら標準出力（そのとき集計は標準エラーへ）
     raw_out: []const u8 = "",
@@ -52,7 +58,7 @@ pub const Args = struct {
 
 /// 手元にある連続したフレーム列から、`target` を戻す（動きの推定・鎖・復元をまとめて行う）。
 /// GUI のように窓を丸ごと持っている呼び出し側用。`run` は流しながら同じ部品（estimatePair）を使う
-pub fn recoverInWindow(gpa: std.mem.Allocator, model: MotionModel, frames: []const temporal.Image, target: usize, roi: temporal.Rect, min_peak: f64, max_ring_diff: ?f64, out: []u8, prov: []provenance.Provenance) !temporal.Recovered {
+pub fn recoverInWindow(gpa: std.mem.Allocator, model: MotionModel, fill: spatial.Method, frames: []const temporal.Image, target: usize, roi: temporal.Rect, min_peak: f64, max_ring_diff: ?f64, out: []u8, prov: []provenance.Provenance) !temporal.Recovered {
     const lumas = try gpa.alloc(?motion.Luma, frames.len);
     defer gpa.free(lumas);
     @memset(lumas, null);
@@ -65,7 +71,17 @@ pub fn recoverInWindow(gpa: std.mem.Allocator, model: MotionModel, frames: []con
     for (motions, 0..) |*m, i| m.* = (try estimatePair(gpa, model, frames[i], frames[i + 1], lumas[i], lumas[i + 1], roi, min_peak)).motion;
     const track = try temporal.Track.buildAffine(gpa, motions);
     defer track.deinit(gpa);
-    return temporal.recoverFrame(frames, track, target, roi, max_ring_diff, out, prov);
+    const t = temporal.recoverFrame(frames, track, target, roi, max_ring_diff, out, prov);
+    return fillAndTally(gpa, fill, t, out, frames[target].width, frames[target].height, prov, roi);
+}
+
+/// Temporal の後に残った unrecovered を埋め、埋めた後の由来で数え直す
+fn fillAndTally(gpa: std.mem.Allocator, fill: spatial.Method, t: temporal.Recovered, out: []u8, w: u32, h: u32, prov: []provenance.Provenance, roi: temporal.Rect) !temporal.Recovered {
+    if (fill == .none) return t;
+    _ = try spatial.fill(gpa, fill, out, w, h, prov, .{ .x = roi.x, .y = roi.y, .w = roi.w, .h = roi.h });
+    var tally: temporal.Recovered = .{};
+    for (roi.y..roi.y + roi.h) |y| for (roi.x..roi.x + roi.w) |x| tally.add(prov[y * w + x]);
+    return tally;
 }
 
 const Slot = struct {
@@ -214,7 +230,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
         }
         const track = try temporal.Track.buildAffine(gpa, motions);
         defer track.deinit(gpa);
-        const r = temporal.recoverFrame(images, track, next_target - lo, rect, args.max_ring_diff, out_rgb, prov);
+        const r = try fillAndTally(gpa, args.fill, temporal.recoverFrame(images, track, next_target - lo, rect, args.max_ring_diff, out_rgb, prov), out_rgb, w, h, prov, rect);
         total.merge(r);
         coverage_min = @min(coverage_min, r.coverage());
 
@@ -238,8 +254,8 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
         try err.print("vrestore: '{s}' has no decodable frame\n", .{args.video});
         return 1;
     }
-    try summary.print("{{\"frames\":{d},\"x\":{d},\"y\":{d},\"width\":{d},\"height\":{d},\"motion\":\"{s}\",\"window\":{d},\"min_peak\":{d:.3},\"recovered\":{d},\"pixels\":{d},\"coverage\":{d:.4},\"coverage_min\":{d:.4},\"pairs_cut\":{d},\"peak_min\":{d:.3},\"peak_max\":{d:.3},\"provenance\":", .{
-        next_target, rect.x, rect.y, rect.w, rect.h, @tagName(args.motion), args.window, args.min_peak, total.recovered(), total.roiPixels(), total.coverage(), coverage_min, cuts, peak_min, peak_max,
+    try summary.print("{{\"frames\":{d},\"x\":{d},\"y\":{d},\"width\":{d},\"height\":{d},\"motion\":\"{s}\",\"fill\":\"{s}\",\"window\":{d},\"min_peak\":{d:.3},\"recovered\":{d},\"pixels\":{d},\"coverage\":{d:.4},\"coverage_min\":{d:.4},\"pairs_cut\":{d},\"peak_min\":{d:.3},\"peak_max\":{d:.3},\"provenance\":", .{
+        next_target, rect.x, rect.y, rect.w, rect.h, @tagName(args.motion), @tagName(args.fill), args.window, args.min_peak, total.recovered(), total.roiPixels(), total.coverage(), coverage_min, cuts, peak_min, peak_max,
     });
     try total.writeJson(summary);
     try summary.writeAll("}\n");
