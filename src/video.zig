@@ -33,6 +33,18 @@ pub const Error = error{
     OutOfMemory,
 };
 
+/// 利用者が次に何をすればよいか分かる言葉にする
+pub fn describe(e: Error) []const u8 {
+    return switch (e) {
+        error.OpenFailed => "not a readable video file (missing, no permission, or unknown format)",
+        error.NoVideoStream => "the file has no video stream",
+        error.UnsupportedCodec => "this FFmpeg build has no decoder for the video codec",
+        error.DecodeFailed => "the video stream could not be decoded",
+        error.SeekFailed => "seeking in the file failed",
+        error.OutOfMemory => "out of memory",
+    };
+}
+
 pub const Info = struct {
     width: u32,
     height: u32,
@@ -254,6 +266,52 @@ pub fn freeFrames(gpa: std.mem.Allocator, frames: []const Frame) void {
     gpa.free(frames);
 }
 
+pub const EncodeError = error{ UnsupportedCodec, EncodeFailed, OutOfMemory };
+
+/// RGB24 の画像を PNG にエンコードする（FFmpeg の png エンコーダ）。返すバイト列は `gpa` の所有。
+pub fn encodePng(gpa: std.mem.Allocator, width: u32, height: u32, rgb: []const u8) EncodeError![]u8 {
+    std.debug.assert(rgb.len == @as(usize, width) * height * 3);
+    const enc = c.avcodec_find_encoder(c.AV_CODEC_ID_PNG) orelse return error.UnsupportedCodec;
+    var ctx: ?*c.AVCodecContext = c.avcodec_alloc_context3(enc) orelse return error.OutOfMemory;
+    defer c.avcodec_free_context(&ctx);
+    ctx.?.width = @intCast(width);
+    ctx.?.height = @intCast(height);
+    ctx.?.pix_fmt = c.AV_PIX_FMT_RGB24;
+    ctx.?.time_base = .{ .num = 1, .den = 1 };
+    if (c.avcodec_open2(ctx, enc, null) < 0) return error.EncodeFailed;
+
+    var frame: ?*c.AVFrame = c.av_frame_alloc() orelse return error.OutOfMemory;
+    defer c.av_frame_free(&frame);
+    const f = frame.?;
+    f.format = c.AV_PIX_FMT_RGB24;
+    f.width = @intCast(width);
+    f.height = @intCast(height);
+    if (c.av_frame_get_buffer(f, 0) < 0) return error.OutOfMemory;
+    const row = @as(usize, width) * 3;
+    for (0..height) |y| {
+        const dst: [*]u8 = @ptrCast(f.data[0]);
+        @memcpy(dst[y * @as(usize, @intCast(f.linesize[0])) ..][0..row], rgb[y * row ..][0..row]);
+    }
+
+    var packet: ?*c.AVPacket = c.av_packet_alloc() orelse return error.OutOfMemory;
+    defer c.av_packet_free(&packet);
+    if (c.avcodec_send_frame(ctx, f) < 0) return error.EncodeFailed;
+    if (c.avcodec_send_frame(ctx, null) < 0) return error.EncodeFailed;
+    if (c.avcodec_receive_packet(ctx, packet) < 0) return error.EncodeFailed;
+    defer c.av_packet_unref(packet);
+    return gpa.dupe(u8, packet.?.data[0..@intCast(packet.?.size)]);
+}
+
+/// 画像ファイル（PNG / JPEG など FFmpeg が読めるもの）を 1 枚読んで RGB24 にする。
+/// 返す Frame の `rgb` は `gpa` の所有。
+pub fn loadImage(gpa: std.mem.Allocator, path: [:0]const u8) Error!Frame {
+    var d = try Decoder.open(path);
+    defer d.close();
+    const buf = try gpa.alloc(u8, d.frameBytes());
+    errdefer gpa.free(buf);
+    return (try d.next(buf)) orelse error.DecodeFailed;
+}
+
 // ---- tests -------------------------------------------------------------------
 //
 // fixture は build.zig が ffmpeg コマンドで合成する（リポジトリに動画を置かない）。
@@ -328,6 +386,27 @@ test "video: sampleFrames spreads over the whole duration" {
     try std.testing.expectEqual(@as(usize, 5), frames.len);
     // 0.98 * i / 5 秒 → 0, 0.196, 0.392, 0.588, 0.784 → 以降で最初のフレームは 0, 2, 4, 6, 8
     for (frames, [_]usize{ 0, 2, 4, 6, 8 }) |f, k| try expectGray(f, stepGray(k));
+}
+
+test "video: encodePng then loadImage round-trips the pixels exactly" {
+    const gpa = std.testing.allocator;
+    var rgb: [5 * 3 * 3]u8 = undefined;
+    for (&rgb, 0..) |*v, i| v.* = @intCast(i * 5);
+    const png = try encodePng(gpa, 5, 3, &rgb);
+    defer gpa.free(png);
+    try std.testing.expectEqualSlices(u8, "\x89PNG", png[0..4]);
+
+    // loadImage はファイルから読むので、一時ディレクトリへ書く
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.png", .data = png });
+    const path = try std.fmt.allocPrintSentinel(gpa, ".zig-cache/tmp/{s}/a.png", .{tmp.sub_path}, 0);
+    defer gpa.free(path);
+    const img = try loadImage(gpa, path);
+    defer gpa.free(img.rgb);
+    try std.testing.expectEqual(@as(u32, 5), img.width);
+    try std.testing.expectEqual(@as(u32, 3), img.height);
+    try std.testing.expectEqualSlices(u8, &rgb, img.rgb);
 }
 
 test "video: a file that is not a video fails to open" {

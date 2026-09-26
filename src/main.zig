@@ -2,6 +2,8 @@ const std = @import("std");
 const Io = std.Io;
 const build_options = @import("build_options");
 const video = @import("video.zig");
+const roi = @import("roi.zig");
+const detect_roi = @import("detect_roi.zig");
 
 const usage =
     \\usage: vrestore <command> [args]
@@ -9,13 +11,20 @@ const usage =
     \\Experimental video restoration tool.
     \\
     \\commands:
-    \\  probe <video>   print width, height, duration and codec as JSON,
-    \\                  after decoding the first frame
+    \\  probe <video>
+    \\      print width, height, duration and codec as JSON, after decoding the first frame
+    \\
+    \\  detect-roi --ref <image> [options] <video>
+    \\      find where the watermark cut out in <image> is fixed in <video>, print JSON.
+    \\      Cut the reference generously: include the whole watermark and some margin.
+    \\      --frames <n>            frames to vote with, spread over the video (default 15)
+    \\      --debug-dir <dir>       also write detection.json, frame-overlay.png, roi-crop.png
+    \\      --min-confidence <f>    reliable needs vote ratio >= f
+    \\      --min-margin <f>        reliable needs (peak - best elsewhere) >= f
+    \\      --min-psr <f>           reliable needs PSR >= f (0 = not used)
     \\
     \\  --version       print the version
     \\  --help          print this message
-    \\
-    \\ROI detection comes next (docs/SPEC.md).
     \\
 ;
 
@@ -23,8 +32,11 @@ const Command = union(enum) {
     help,
     version,
     probe: []const u8,
+    detect_roi: detect_roi.Args,
     /// 引数が足りない。どのコマンドかを持つ
     missing_arg: []const u8,
+    /// 引数の形が違う。利用者に見せる文と、問題の引数
+    bad_arg: struct { why: []const u8, arg: []const u8 },
     /// 知らない引数。利用者に見せるのでそのまま持つ
     unknown: []const u8,
 };
@@ -39,7 +51,53 @@ fn parseArgs(args: []const []const u8) Command {
         if (args.len < 2) return .{ .missing_arg = a };
         return .{ .probe = args[1] };
     }
+    if (std.mem.eql(u8, a, "detect-roi")) return parseDetectRoi(args[1..]);
     return .{ .unknown = a };
+}
+
+fn parseDetectRoi(args: []const []const u8) Command {
+    var out: detect_roi.Args = .{};
+    var video_path: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (!std.mem.startsWith(u8, a, "--")) {
+            if (video_path != null) return .{ .bad_arg = .{ .why = "only one video can be given", .arg = a } };
+            video_path = a;
+            continue;
+        }
+        if (i + 1 >= args.len) return .{ .bad_arg = .{ .why = "option needs a value", .arg = a } };
+        const v = args[i + 1];
+        i += 1;
+        if (std.mem.eql(u8, a, "--ref")) {
+            out.reference = v;
+        } else if (std.mem.eql(u8, a, "--debug-dir")) {
+            out.debug_dir = v;
+        } else if (std.mem.eql(u8, a, "--frames")) {
+            out.frames = std.fmt.parseInt(usize, v, 10) catch
+                return .{ .bad_arg = .{ .why = "--frames needs a positive integer", .arg = v } };
+            if (out.frames == 0) return .{ .bad_arg = .{ .why = "--frames needs a positive integer", .arg = v } };
+        } else if (std.mem.eql(u8, a, "--min-confidence")) {
+            out.thresholds.min_confidence = parseFraction(v) orelse
+                return .{ .bad_arg = .{ .why = "--min-confidence needs a number between 0 and 1", .arg = v } };
+        } else if (std.mem.eql(u8, a, "--min-margin")) {
+            out.thresholds.min_margin = parseFraction(v) orelse
+                return .{ .bad_arg = .{ .why = "--min-margin needs a number between 0 and 1", .arg = v } };
+        } else if (std.mem.eql(u8, a, "--min-psr")) {
+            out.thresholds.min_psr = std.fmt.parseFloat(f64, v) catch
+                return .{ .bad_arg = .{ .why = "--min-psr needs a number", .arg = v } };
+        } else {
+            return .{ .unknown = a };
+        }
+    }
+    if (out.reference.len == 0) return .{ .bad_arg = .{ .why = "detect-roi needs --ref <image>", .arg = "--ref" } };
+    out.video = video_path orelse return .{ .missing_arg = "detect-roi" };
+    return .{ .detect_roi = out };
+}
+
+fn parseFraction(s: []const u8) ?f64 {
+    const v = std.fmt.parseFloat(f64, s) catch return null;
+    return if (v >= 0 and v <= 1) v else null;
 }
 
 pub fn main(init: std.process.Init) !u8 {
@@ -66,6 +124,11 @@ pub fn main(init: std.process.Init) !u8 {
             return 0;
         },
         .probe => |path| return probe(arena, &out.interface, &err.interface, path),
+        .detect_roi => |a| return detect_roi.run(init.gpa, io, &out.interface, &err.interface, a),
+        .bad_arg => |b| {
+            try err.interface.print("vrestore: {s}: '{s}'\n\n{s}", .{ b.why, b.arg, usage });
+            return 2;
+        },
         .missing_arg => |cmd| {
             try err.interface.print("vrestore: '{s}' needs a video file\n\n{s}", .{ cmd, usage });
             return 2;
@@ -80,7 +143,7 @@ pub fn main(init: std.process.Init) !u8 {
 fn probe(arena: std.mem.Allocator, out: *Io.Writer, err: *Io.Writer, path: []const u8) !u8 {
     const path_z = try arena.dupeZ(u8, path);
     var d = video.Decoder.open(path_z) catch |e| {
-        try err.print("vrestore: could not open '{s}': {s}\n", .{ path, describe(e) });
+        try err.print("vrestore: could not open '{s}': {s}\n", .{ path, video.describe(e) });
         return 1;
     };
     defer d.close();
@@ -88,7 +151,7 @@ fn probe(arena: std.mem.Allocator, out: *Io.Writer, err: *Io.Writer, path: []con
     // コンテナのヘッダが読めてもデコードできるとは限らないので、1 フレーム目まで確かめる
     const buf = try arena.alloc(u8, d.frameBytes());
     const first = d.next(buf) catch |e| {
-        try err.print("vrestore: could not decode '{s}': {s}\n", .{ path, describe(e) });
+        try err.print("vrestore: could not decode '{s}': {s}\n", .{ path, video.describe(e) });
         return 1;
     };
     if (first == null) {
@@ -102,20 +165,10 @@ fn probe(arena: std.mem.Allocator, out: *Io.Writer, err: *Io.Writer, path: []con
     return 0;
 }
 
-/// 利用者が次に何をすればよいか分かる言葉にする
-fn describe(e: video.Error) []const u8 {
-    return switch (e) {
-        error.OpenFailed => "not a readable video file (missing, no permission, or unknown format)",
-        error.NoVideoStream => "the file has no video stream",
-        error.UnsupportedCodec => "this FFmpeg build has no decoder for the video codec",
-        error.DecodeFailed => "the video stream could not be decoded",
-        error.SeekFailed => "seeking in the file failed",
-        error.OutOfMemory => "out of memory",
-    };
-}
-
 test {
     _ = video;
+    _ = roi;
+    _ = detect_roi;
 }
 
 test "parseArgs: no arguments shows help" {
@@ -130,6 +183,19 @@ test "parseArgs: --version and -V" {
 test "parseArgs: probe takes a path" {
     try std.testing.expectEqualStrings("a.mp4", parseArgs(&.{ "probe", "a.mp4" }).probe);
     try std.testing.expectEqualStrings("probe", parseArgs(&.{"probe"}).missing_arg);
+}
+
+test "parseArgs: detect-roi" {
+    const got = parseArgs(&.{ "detect-roi", "--ref", "r.png", "--frames", "7", "--debug-dir", "d", "v.mp4" }).detect_roi;
+    try std.testing.expectEqualStrings("r.png", got.reference);
+    try std.testing.expectEqualStrings("v.mp4", got.video);
+    try std.testing.expectEqualStrings("d", got.debug_dir.?);
+    try std.testing.expectEqual(@as(usize, 7), got.frames);
+
+    try std.testing.expectEqualStrings("--ref", parseArgs(&.{ "detect-roi", "v.mp4" }).bad_arg.arg);
+    try std.testing.expectEqualStrings("0", parseArgs(&.{ "detect-roi", "--ref", "r", "--frames", "0", "v" }).bad_arg.arg);
+    try std.testing.expectEqualStrings("1.5", parseArgs(&.{ "detect-roi", "--ref", "r", "--min-margin", "1.5", "v" }).bad_arg.arg);
+    try std.testing.expectEqualStrings("detect-roi", parseArgs(&.{ "detect-roi", "--ref", "r" }).missing_arg);
 }
 
 test "parseArgs: unknown argument is kept verbatim" {

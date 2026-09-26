@@ -27,6 +27,7 @@ zig build check
 |---|---|
 | `zig fmt --check` | `build.zig` `build.zig.zon` `src/` の整形 |
 | `zig build test` | ユニットテスト（動画は ffmpeg で合成してから）と、実行ファイルを起動する `cli_*` |
+| `zig build e2e` | ROI の合成 E2E。ケースは `build.zig` の `roi_cases`。1 ケース = 合成 → エンコード → 参照画像を切る → `detect-roi` → 正解と照合 |
 | `scripts/check-no-media.sh` | 動画・1 MiB 超のファイルが git の管理下（ステージ含む）に無いこと。件数を出す |
 | `zig build`（install） | 実行ファイルが作れること |
 
@@ -35,14 +36,23 @@ zig build check
 ```sh
 zig build test                                       # テストだけ
 zig build test -Dtest-filter="parseArgs"             # 名前で 1 件
-zig fmt --check build.zig build.zig.zon src          # 整形だけ
+zig build e2e                                        # ROI の合成 E2E だけ
+zig fmt --check build.zig build.zig.zon src tools    # 整形だけ
 scripts/check-no-media.sh                            # 衛生だけ
 ```
 
 ## 合成 E2E
 
-まだ無い。ROI 検出が入ったら、合成動画の生成 → 検出 → 正解座標との比較（dx / dy / IoU / reliable）
-をここに足す。
+`zig build check` に含まれる（`zig build e2e`）。失敗したケースは `FAIL case=... dx= dy= iou= reliable= ...` の行が
+失敗文に出る。
+
+ROI の判定（閾値・照合・投票）を変えたときは、CI のケースだけでなく較正もやり直す:
+
+```sh
+scripts/roi-calibrate.sh -j 6      # 数分。結果は tmp/out/calibrate/results.txt
+```
+
+「位置が違うのに reliable=true」が 0 でなければ FAIL。数値が変わったら docs/SPEC.md §4 を更新する。
 
 ## 実素材
 
@@ -50,5 +60,15 @@ scripts/check-no-media.sh                            # 衛生だけ
 
 ```sh
 for f in tmp/media/*; do echo "$f"; zig-out/bin/vrestore probe "$f"; done
+zig-out/bin/vrestore detect-roi --ref tmp/media/<参照画像>.png --debug-dir tmp/out/<名前> tmp/media/<動画>
 ```
+
+正解のある実写で数値を出すには、手元の実写に既知の位置へ焼き込む（PIL と CJK フォントが要る）:
+
+```sh
+scripts/roi-real.sh -j 6 tmp/media/<動画>     # 10 分前後。結果は tmp/out/real/
+```
+
+`frame-overlay.png` と `roi-crop.png` を開いて、消したい場所を囲んでいるかを見る。実素材には正解が無いので、
+数値で言えるのは JSON の値まで。
 報告では「実素材では見ていない」を `Not verified` に書く。

@@ -22,50 +22,48 @@
 | 動画 | 動画でないファイルは開けないと報告する | test `"video: a file that is not a video fails to open"`、`build.zig` の `cli_probe_bad` |
 | CLI | `vrestore probe <video>` が 1 フレーム目までデコードしてから、幅・高さ・尺・コーデックを JSON 1 行で出す | `build.zig` の `cli_probe`（stdout 全体を照合） |
 | CLI | stdout が他の出力と共有された通常ファイルでも、前の出力を上書きしない | `build.zig` の `cli_stdout_file` |
+| 画像 | RGB24 を PNG に書き、PNG を RGB24 で読んで同じ画素に戻る | test `"video: encodePng then loadImage round-trips the pixels exactly"` |
+| ROI | 参照画像を切り出した元の画像から、切り出した位置を 0px で見つける（画面の端を含む） | `src/roi.zig` の test `"roi: locate finds an exact crop, including at the edges"` |
+| ROI | 同じ模様が 2 か所にあると margin が 0 近くに落ちる。PSR はほとんど落ちない | test `"roi: an exact duplicate drives margin to zero, while PSR stays high"` |
+| ROI | 輪郭の無い参照画像はエラー。比べる相手の位置が無いときは margin / PSR を null にし、reliable と言わない | test `"roi: a flat reference is rejected, and a search with no other position cannot be reliable"`、`build.zig` の `cli_detect_flat_ref` |
+| ROI | 複数フレームで投票し、最頻位置と得票率を返す。閾値を下回れば理由付きで reliable=false | test `"roi: detect votes for the fixed position even when some frames miss"` |
+| CLI | `vrestore detect-roi --ref <image> <video>` が JSON 1 行を出す。`--debug-dir` で `detection.json` / `frame-overlay.png` / `roi-crop.png` も書く | `src/detect_roi.zig` の test `"detect_roi: writeJson"`、`"detect_roi: drawRect leaves the inside untouched and clips at the edges"`。画像の中身は目視（下記） |
+| CLI | 読めない参照画像は、何が悪いかを stderr に出して終了コード 1 | `build.zig` の `cli_detect_bad_ref` |
+| ROI（合成 E2E） | 既知の位置に焼いたウォーターマークを、yuv420p にエンコードした動画から `dx=0, dy=0, IoU=1, reliable=true` で見つける（背景のパン・毎フレーム変わる背景・滑らかな背景、crf 16〜35、不透明度 0.35〜1、余白なしの参照、一部だけの参照） | `zig build e2e` の `roi check pan-full` `pan-faint-crf35` `cut-full` `flat-full` `pan-tight` `pan-part` |
+| ROI（合成 E2E） | 繰り返す文字列の途中を切った参照で、得票率も PSR も高いまま別の行に当たるとき、reliable=false を返す | `zig build e2e` の `roi check repeat-mid` |
+| ROI（合成 E2E） | ウォーターマークの無い（背景が動く）動画では reliable=false を返す | `zig build e2e` の `roi check absent` |
 | リポジトリ衛生 | 動画・巨大ファイルが git の管理下に無い | `scripts/check-no-media.sh` |
 
-## 2. 次に実装すること（契約）
+## 2. ROI 検出の契約
 
-### 2-1. ROI 検出
-
-**入力:** 動画 1 本 + ウォーターマーク参照画像 1 枚（ユーザーが「これを消したい」と切り出した領域）。
+**入力:** 動画 1 本 + ウォーターマーク参照画像 1 枚（利用者が「これを消したい」と切り出した領域）。
 
 解く問題は「どれがウォーターマークか」ではなく「**指定されたウォーターマークが、動画内のどこに
-固定されているか**」。
+固定されているか**」。返す矩形は参照画像の大きさそのもの（余白を含めて切ったなら、余白込み）。
 
-**出力（JSON）:**
+**出力（JSON 1 行）:**
 
 ```json
-{
-  "x": 493,
-  "y": 5,
-  "width": 142,
-  "height": 77,
-  "confidence": 1.0,
-  "psr": 19.5,
-  "frames_voted": 15,
-  "reliable": true
-}
+{"x":493,"y":5,"width":142,"height":77,"confidence":1.000,"psr":12.9,"margin":0.552,"peak":0.949,"frames_voted":15,"reliable":true,"reasons":[]}
 ```
 
-- `confidence` は複数フレームの投票での最頻位置の得票率
-- `reliable` は得票率と PSR を併せて決める。⚠ **PSR 単独で決めない**
-  （繰り返しパターンで「PSR は高いが位置が違う」例が PoC で出ている）
+| キー | 意味 |
+|---|---|
+| `confidence` | 投票での最頻位置の得票率 |
+| `margin` | その位置の相関と、それ以外で最も良い位置の相関の差（最頻位置に投票したフレームの平均）。測れないときは `null` |
+| `psr` | 相関のピークの突出度（同上）。**判定には使わない**、診断用 |
+| `peak` | 相関 (ZNCC) の値（同上） |
+| `reliable` | `confidence >= 0.4` かつ `margin >= 0.08`。閾値の根拠は §4、PSR を使わない理由は [ADR 0003](adr/0003-reliable-is-decided-by-vote-ratio-and-margin-not-psr.md)（⚠ 暫定。判定方式は見直し中） |
+| `reasons` | reliable=false の理由: `low_confidence` / `low_margin` / `low_psr`（`--min-psr` を与えたときだけ）/ `unmeasured_margin` |
 
-**デバッグ出力（正式機能の完成条件）:**
+**デバッグ出力（`--debug-dir <dir>`）:** `detection.json`（stdout と同じ）、`frame-overlay.png`（投票に使った
+1 枚目のフレームに検出矩形の外枠を描く。reliable なら赤、そうでなければ黄）、`roi-crop.png`（同じフレームから
+検出矩形を切り出したもの）。
 
-```
-debug/
-  detection.json
-  frame-overlay.png   # 元フレームに検出矩形を描いたもの
-  roi-crop.png        # 検出した ROI だけを切り出したもの
-```
-
-**参照画像の切り方（利用者向け）:** 小さく切らない。ウォーターマーク全体の特徴が入るよう、
-余白を含めて大きめに選ぶ。小さい参照ほど似た文字列・同じウォーターマーク内の別位置に誤マッチした（PoC）。
-
-**完成の判定:** CI 内で合成した動画（既知の位置に既知のウォーターマークを焼き付け、yuv420p で
-エンコード）で、`dx` / `dy` / `IoU` / `reliable` を機械判定する。
+**参照画像の切り方（利用者向け）:** 小さく切らない。ウォーターマーク全体の特徴が入るよう、余白を含めて
+大きめに選ぶ。繰り返す文字列の一部だけを切ると、別の行・別の周期に当たる（§4）。
+yuv420p の動画を `ffmpeg -vf crop` で切ると座標と大きさが偶数に丸められるので、RGB に変換してから切る
+（`-vf format=rgb24,crop=...`）。
 
 ## 3. 意図して実装しないこと（現段階）
 
@@ -76,6 +74,8 @@ debug/
 | MP4 の書き出し | 復元が無い段階で出すものが無い |
 | 動画プレイヤー UI | CLI / テストで境界を作るのが先。導入時に ADR を書く |
 | GPU / SIMD 最適化 | 測って遅いと分かってから |
+| 動かない背景とウォーターマークの区別 | 解く問題は「参照画像がどこに固定されているか」なので、背景が静止している動画では、切った背景そのものが毎フレーム同じ位置にあり、正しく見つかる（較正で観測）。それがウォーターマークかどうかは判定しない |
+| 大きさ・向きの違う参照画像 | 照合は平行移動だけ。別の解像度の動画から切った参照画像は当たらないか、相関が低くなる |
 
 ## 4. 測定値
 
@@ -85,4 +85,57 @@ debug/
 |---|---|---|---|
 | yuv420p を経由した灰色の往復誤差（RGB24 で見た値 − 合成時の値） | 最大 1（全 10 フレーム、全画素） | 2026-09-26 | 64x48 / 10 fps / libx264 `-qp 0` / 灰色 16+20k（k=0..9）。ffmpeg 8.1.1 コマンドの rawvideo rgb24 出力で観測。テストの許容差 2 はこれに基づく |
 
-ROI 検出が入ったら、合成素材での結果をここに置く。
+### ROI 検出の較正（`scripts/roi-calibrate.sh`）
+
+2026-09-26、macOS、zig 0.16.0、ffmpeg 8.1.1（libx264, `-preset veryfast`）、ReleaseFast、各ケース 1 回。
+640x360 / 10 fps / 30 フレーム、15 フレームで投票。条件は全組み合わせ:
+背景 {パン 7px,3px/フレーム・毎フレーム別の模様・静止した滑らかなグラデーション} × crf {16, 23, 35} ×
+不透明度 {1, 0.6, 0.35} × 参照 {余白 6px・余白 0・1 行目の先頭 3 文字・繰り返し文字列（周期 3）の途中 1 周期} ×
+seed {1, 2}、および ウォーターマーク無し（背景が動くもの）× crf × seed。
+参照画像はエンコード後の 1 フレーム目から切る。ウォーターマークは乱数のグリフ（縁取り付き）で、フォントは使わない。
+
+| 何を測ったか | 値 |
+|---|---|
+| 位置が正しかった（dx=0, dy=0）: 繰り返し以外 | 162 / 162 |
+| 位置が正しかった: 繰り返し文字列の途中を切った参照 | 34 / 54（外れた 20 件は別の行または周期に当たった） |
+| 閾値 0.4 / 0.08 で、位置が違う（またはウォーターマークが無い）のに reliable=true | 0 / 228 |
+| 閾値 0.4 / 0.08 で、位置が正しいのに reliable=false: 繰り返し以外 | 0 / 162 |
+| 閾値 0.4 / 0.08 で reliable=true になった繰り返し文字列のケース | 11 / 54（すべて位置が正しい） |
+| ウォーターマーク無しで reliable=true | 0 / 12 |
+| 位置が外れた繰り返し文字列のケースの PSR | 4.1〜23.3（得票率 0.067〜1.000） |
+| 位置が正しかった繰り返し以外のケースの PSR | 4.2〜20.2 |
+| 得票率 ≥ 0.4 で位置が違うケースの margin の最大 | 0.021 |
+| 位置が正しかった繰り返し以外のケースの margin の最小 | 0.112 |
+| 得票率 + PSR のどの閾値の組み合わせ（得票率 0〜1 を 0.05 刻み、PSR 0〜20 を 0.5 刻み）でも、位置が違うのに reliable=true を 0 にできたか | できなかった |
+
+解釈: margin の閾値 0.08 は、外れたケースの最大 0.021 と正しいケースの最小 0.112 の間にある。
+この閾値は姉妹プロジェクト mp4tool で別の合成素材から較正されたもので、ここでは測り直して変えていない。
+
+### ROI 検出: 実写に焼き込んだ素材（`scripts/roi-real.sh`）
+
+2026-09-26、同じ環境。手元の実写 1 本（1920x1080、29.97 fps、固定カメラ、照明が大きく変わる）の 10 秒間に、
+既知の位置へウォーターマークを焼き込んで yuv420p（libx264 veryfast）で再エンコード。焼き込んだ位置が正解。
+条件は全組み合わせ: ウォーターマーク 5 種（日本語 4 行 / URL 1 行 / 同じ語 3 回の繰り返し / 図形 + 語 / 小さい 1 語。
+PIL と実フォントで描画）× 位置 4（左上・上中央・中央・右下）× 不透明度 {1, 0.5, 0.25} × crf {20, 32} ×
+参照 {余白 12px・余白 0・左 1/3 + 余白 4px}。参照画像は焼き込み後の 16 フレーム目から切る。各 1 回。
+
+| 何を測ったか | 値 |
+|---|---|
+| 位置が正しかった（dx=0, dy=0） | 354 / 360 |
+| 外れた 6 件の条件 | すべて不透明度 0.25 かつ左 1/3 の参照。6 件とも reliable=false |
+| 閾値 0.4 / 0.08 で、位置が違うのに reliable=true | 0 / 360 |
+| 閾値 0.4 / 0.08 で、位置が正しいのに reliable=false | 22 / 354 |
+| 繰り返す語の一部を切った参照が隣の語に当たったケース | 1 件（dx=390、得票率 0.600、PSR 14.9、margin 0.043 → reliable=false） |
+| ウォーターマークを焼かない動画で、参照を切った位置に reliable=true で当たった | 13 / 24（固定カメラで背景が静止しているため。§3） |
+
+解釈: 合成素材と同じく、位置違いを止めているのは margin。ウォーターマークの無い動画での reliable=true は
+誤検出ではなく、静止した背景を正しく見つけている。参照画像がウォーターマークかどうかはこのツールでは判定できない。
+
+### ROI 検出: 合成でない素材で見たもの
+
+2026-09-26、同じ環境。正解座標が無いので、目視と全探索による検算だけ。
+
+| 素材 | 結果 |
+|---|---|
+| mp4tool の合成素材（PIL と実フォントで描いた透かし、640x360、crf 18）。背景の違う別の動画のフレームから、RGB で切った参照画像 | 2 か所とも生成時の座標と一致（dx=0, dy=0）、reliable=true |
+| 手元の実素材 1 本（640x360、正解なし） | reliable=true（得票率 0.733、margin 0.286、peak 0.322）。全解像度の全探索（4 フレーム）でも同じ位置が最良。roi-crop.png は目視で参照画像と同じ透かし。peak が低いのは、参照画像がこの動画から切ったものではないためと推測（未確認） |
