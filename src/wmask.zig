@@ -17,12 +17,12 @@
 const std = @import("std");
 
 pub const Params = struct {
-    /// 見分けた画素を広げる幅（px）
-    dilate: u32 = 1,
-    /// 勾配の時間方向の中央値の大きさが、ROI の中央値の何倍を超えたら縁とみなすか。0 なら縁を使わない
+    /// 見分けた画素を広げる幅（px）。ウォーターマークの縁取りの外側の圧縮のにじみまで隠す（ADR 0011）
+    dilate: u32 = 2,
+    /// 勾配の時間方向の中央値の大きさが、背景（変わりにくくない画素）の中央値の何倍を超えたら縁とみなすか。0 なら縁を使わない
     edge_ratio: f32 = 5,
-    /// 縁とみなす大きさの下限（8 bit の明るさ / px）。背景が平らで中央値が 0 に近いときに雑音を拾わない
-    min_edge: f32 = 2,
+    /// 縁とみなす大きさの下限（8 bit の明るさ / px）。背景が平らで中央値が 0 に近いときに、圧縮の雑音を拾わない
+    min_edge: f32 = 8,
     /// 背景の変わりやすさ（中央値）が、ウォーターマークの何倍以上なら見分けられたとみなすか
     min_separation: f32 = 1.5,
     /// 背景の変わりやすさの下限。これ未満なら背景もほぼ動いていない（固定カメラ）とみなす
@@ -80,9 +80,9 @@ pub fn estimate(gpa: std.mem.Allocator, crops: []const []const u8, w: u32, h: u3
     const still_fraction = fractionOf(hidden);
 
     if (p.edge_ratio > 0) {
-        const edge = try edges(gpa, crops, w, h, p.edge_ratio, p.min_edge);
+        const edge = try edges(gpa, crops, w, h, hidden, p.edge_ratio, p.min_edge);
         defer gpa.free(edge);
-        try dilate(gpa, edge, w, h, 1);
+        // 縁は広げない: 中心差分は両隣を見るので、縁はウォーターマークの外側 1 px まで既に付いている
         for (hidden, edge) |*hd, e| hd.* = hd.* or e;
     }
 
@@ -155,8 +155,10 @@ fn otsu(v: []const f32) f32 {
     return lo + @as(f32, @floatFromInt(best_i)) / scale;
 }
 
-/// 勾配（明るさ = R/G/B の平均の中心差分）の時間方向の中央値の大きさが、しきい値を超える画素
-fn edges(gpa: std.mem.Allocator, crops: []const []const u8, w: u32, h: u32, ratio: f32, min_edge: f32) ![]bool {
+/// 勾配（明るさ = R/G/B の平均の中心差分）の時間方向の中央値の大きさが、しきい値を超える画素。
+/// しきい値は `still`（変わりにくい画素）の外の中央値から決める。ROI 全体の中央値にすると、ROI のうちウォーターマークが
+/// 占める割合（= 指定した範囲の広さ）でしきい値が大きく動く
+fn edges(gpa: std.mem.Allocator, crops: []const []const u8, w: u32, h: u32, still: []const bool, ratio: f32, min_edge: f32) ![]bool {
     const n: usize = @as(usize, w) * h;
     const mag = try gpa.alloc(f32, n);
     defer gpa.free(mag);
@@ -176,9 +178,10 @@ fn edges(gpa: std.mem.Allocator, crops: []const []const u8, w: u32, h: u32, rati
         }
         mag[i] = std.math.hypot(median(gx), median(gy));
     };
-    const sorted = try gpa.dupe(f32, mag);
-    defer gpa.free(sorted);
-    const th = @max(min_edge, ratio * median(sorted));
+    var bg: std.ArrayList(f32) = .empty;
+    defer bg.deinit(gpa);
+    for (mag, still) |m, s| if (!s) try bg.append(gpa, m);
+    const th = @max(min_edge, if (bg.items.len > 0) ratio * median(bg.items) else min_edge);
     const out = try gpa.alloc(bool, n);
     for (mag, out) |m, *o| o.* = m > th;
     return out;
