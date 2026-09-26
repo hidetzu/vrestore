@@ -8,6 +8,8 @@
 #                   どの復元方式もこれを超えられない）
 #   delogo-roi      FFmpeg の delogo に vrestore detect-roi の検出矩形を渡したもの（余白込み）
 #   delogo-tight    delogo にウォーターマークぴったりの矩形を渡したもの（検出の誤差・余白の影響を除く）
+#   temporal        vrestore restore（Temporal Recovery）に detect-roi の矩形を渡したもの。戻せなかった画素は
+#                   焼かれたまま残る。戻した画素だけの PSNR と coverage も出す
 # 復元方式の出力は可逆で保存する（出力の再圧縮で落ちる分を混ぜない）。
 #
 # 使い方: scripts/restore-real.sh [-s 開始秒] [-d 秒数] [-j 並列数] <video>
@@ -92,15 +94,23 @@ run_spec() {
 	enc -i "$d/watermarked.mp4" -vf "delogo=x=$rx:y=$ry:w=$rw:h=$rh" -c:v ffv1 -pix_fmt yuv420p "$d/delogo-roi.mkv"
 	enc -i "$d/watermarked.mp4" -vf "delogo=x=$x:y=$y:w=$ww:h=$wh" -c:v ffv1 -pix_fmt yuv420p "$d/delogo-tight.mkv"
 
-	# 測るのはウォーターマークの外接矩形（焼き込んだ場所）
+	"$vr" restore --roi "$d/detection.json" --raw "$d/temporal.rgb" --mask "$d/temporal.mask" "$d/watermarked.mp4" >"$d/temporal.json"
+	enc -f rawvideo -pix_fmt rgb24 -s "${W}x${H}" -r "$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of csv=p=0 "$d/watermarked.mp4")" \
+		-i "$d/temporal.rgb" -c:v ffv1 -pix_fmt yuv444p "$d/temporal.mkv"
+	rm -f "$d/temporal.rgb"
+
+	# 測るのはウォーターマークの外接矩形（焼き込んだ場所）。temporal のマスクは ROI（余白込み）について出ているが、
+	# マスクのある画素だけを数えるので、外接矩形の中の戻した画素の PSNR になる
 	local rect=$x,$y,$ww,$wh row f
-	for row in watermarked reencode delogo-roi delogo-tight; do
+	for row in watermarked reencode delogo-roi delogo-tight temporal; do
 		case $row in
 		watermarked) f=$d/watermarked.mp4 ;;
 		reencode) f=$out/reencode-crf$crf.mp4 ;;
 		*) f=$d/$row.mkv ;;
 		esac
-		printf '%s %s %s\n' "$name" "$row" "$("$vr" compare --rect "$rect" "$out/orig.mkv" "$f")"
+		local mask=()
+		[ "$row" = temporal ] && mask=(--mask "$d/temporal.mask")
+		printf '%s %s %s\n' "$name" "$row" "$("$vr" compare --rect "$rect" "${mask[@]}" "$out/orig.mkv" "$f")"
 	done
 }
 export -f run_spec enc
@@ -116,7 +126,7 @@ rows = collections.defaultdict(dict)
 for line in open(sys.argv[1]):
     name, row, js = line.split(" ", 2)
     rows[name][row] = json.loads(js)
-order = ["watermarked", "reencode", "delogo-roi", "delogo-tight"]
+order = ["watermarked", "reencode", "delogo-roi", "delogo-tight", "temporal"]
 print(f"\n{'case':<26}" + "".join(f"{r:>22}" for r in order))
 print(f"{'':<26}" + "".join(f"{'SSIM mean/min  PSNR':>22}" for _ in order))
 for name in sorted(rows):
@@ -126,6 +136,11 @@ for name in sorted(rows):
         p = "inf" if v["psnr"] is None else f"{v['psnr']:.1f}"
         cells.append(f"{v['ssim']:.3f}/{v['ssim_min']:.3f} {p:>5}")
     print(f"{name:<26}" + "".join(f"{c:>22}" for c in cells))
+print("\ntemporal: fraction of the watermark rect recovered / PSNR over recovered pixels only")
+for name in sorted(rows):
+    t = rows[name]["temporal"]
+    mp = "-" if t.get("masked_psnr") is None else f"{t['masked_psnr']:.1f}"
+    print(f"  {name:<26} {t['masked_fraction']:.3f}  {mp}")
 print("\nmean over cases (SSIM mean):")
 for r in order:
     vals = [rows[n][r]["ssim"] for n in rows]

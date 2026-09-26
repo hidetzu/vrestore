@@ -40,6 +40,15 @@
 | GUI | タイムラインの横位置から時刻を出す（端に寄せる）。選択範囲を表示中のフレームから切り出して参照画像にする | test `"gui: timeline maps position to time and clamps"`、`"gui: crop cuts the selected pixels"` |
 | GUI（E2E） | `vrestore-gui` が動画を開いて指定時刻のフレームを出し、選択範囲から CLI と同じ検出（`detect_roi.detectInVideo`）を回して、既知の位置を `dx=0, dy=0, reliable=true` で返す。SDL のダミー描画で窓を開かずに回す | `zig build gui` の `roi check gui` |
 | GUI | マウスのドラッグ・キー操作・タイムラインのクリック | ⚠ 自動の検査は無い（[ADR 0004](adr/0004-the-gui-is-a-separate-sdl2-executable-that-only-calls-the-detector.md) の帰結） |
+| 復元 | 位相相関（低い周波数だけ）で隣り合うフレームの平行移動を推定する。上下左右どちら向きでも、固定のウォーターマークがあっても正しい | `src/temporal.zig` の test `"temporal: estimateShift finds a pan in every direction, ignoring a fixed watermark"` |
+| 復元 | 位相相関の窓をウォーターマークの ROI と重ならない所から取る | test `"temporal: chooseWindow keeps the window off the ROI and takes the largest"` |
+| 復元 | 相関のピークが閾値未満のペアで鎖を切り、動いていないとは見なさない | test `"temporal: Track cuts the chain at an unestimated pair instead of assuming no motion"` |
+| 復元 | 戻したと言った画素は正解と一致し、戻せなかった画素は焼かれたまま残ってマスクが 0 になる。動かない背景では何も戻らない | test `"temporal: recoverFrame restores the exact background under a pan, and reports what it could not"` |
+| CLI | `vrestore restore (--roi <detection.json> \| --rect) --raw <out.rgb> [--mask <out.gray>] <video>` が RGB24 の生フレームとマスクを書き、coverage などを JSON で出す | `zig build restore-e2e` |
+| CLI | `vrestore compare --mask` が、マスクのある画素（戻した画素）だけの PSNR と、それが矩形の何割かを出す。`--roi` で detect-roi の JSON を矩形にする | test `"metrics: mseMasked counts only masked pixels inside the rect"`、`zig build restore-e2e` |
+| 復元（合成 E2E） | パンする背景で、ウォーターマークの ROI をほぼすべて戻し、正解に近い（パン 15 px: coverage ≥ 0.99・SSIM ≥ 0.9・戻した画素の PSNR ≥ 35。パン 7,3: ≥ 0.95・≥ 0.88・≥ 34。遅いパン × crf 35: coverage ≥ 0.6・戻した画素の PSNR ≥ 30） | `zig build restore-e2e` の `restore-pan15` `restore-pan7` `restore-pan3-crf35` |
+| 復元（合成 E2E） | 動きで説明できない（毎フレーム別の模様）・動かない背景では、1 画素も戻さない | `zig build restore-e2e` の `restore-cut` `restore-flat` |
+| GUI | R で表示中のフレームを戻し（CLI と同じ部品・閾値）、Space で処理前 / 処理後を切り替える。戻せなかった画素はマゼンタ | `zig build gui` の `gui restore check`（coverage のみ）。表示は `--screenshot` で目視。キー操作は自動の検査なし |
 | リポジトリ衛生 | 動画・巨大ファイルが git の管理下に無い | `scripts/check-no-media.sh` |
 
 ## 2. ROI 検出の契約
@@ -77,7 +86,8 @@ yuv420p の動画を `ffmpeg -vf crop` で切ると座標と大きさが偶数�
 
 | 実装しない | 理由 |
 |---|---|
-| 背景復元（Temporal / Alpha / Spatial / 生成） | ROI 検出を独立した安定モジュールにしてから（[ADR 0002](adr/0002-roi-detection-is-separate-from-background-recovery.md)） |
+| 背景復元の Alpha / Spatial / 生成 | Temporal だけを先に入れた（[ADR 0005](adr/0005-temporal-recovery-copies-real-pixels-and-leaves-the-rest-unrecovered.md)）。戻せない画素は未復元のまま残す |
+| Temporal の小数画素・回転・ズーム・被写体ごとの動き | 画面全体の整数画素の平行移動だけ（ADR 0005） |
 | ウォーターマークの自動発見 | 解く問題を「指定されたものの位置」に絞る |
 | MP4 の書き出し | 復元が無い段階で出すものが無い |
 | 動画プレイヤー UI | CLI / テストで境界を作るのが先。導入時に ADR を書く |
@@ -159,6 +169,46 @@ PIL と実フォントで描画）× 位置 4（左上・上中央・中央・�
 中央では下がることがある（例: 図形 + 語 不透明度 0.5 / crf 20 で 0.663 → 0.344）。
 解釈（未検証）: 中央は人や照明の模様があり、delogo の内挿がそれを塗りつぶす。半透明のウォーターマークは
 背景が透けて残っているので、塗りつぶすより焼き込んだままの方が元に近い。
+
+### Temporal Recovery の較正（`scripts/restore-calibrate.sh`）
+
+2026-09-26、macOS、zig 0.16.0、ffmpeg 8.1.1（libx264 veryfast）、ReleaseFast、各 1 回。640x360 / 10 fps / 60 フレーム、
+窓は前後 15 フレーム、閾値 0.5。条件は全組み合わせ: 動き {パン 3,1 / 7,3 / 15,0 px/フレーム・毎フレーム別の模様・静止} ×
+位置 {右上の角・中央} × crf {16, 23, 35} × 不透明度 {1, 0.5} × seed {1, 2}（各 12 ケース）。ROI は detect-roi の検出矩形
+（ウォーターマーク + 余白 6 px）。正解はウォーターマークを焼く前の同じ背景（可逆）。SSIM・coverage は 12 ケースの平均。
+
+| 動き / 位置 | 焼き込んだまま SSIM | 再エンコードだけ（上限） | Temporal SSIM | coverage | 戻した画素の PSNR（最悪ケース） | 上限の PSNR（最悪ケース） |
+|---|---|---|---|---|---|---|
+| パン 15,0 / 中央 | 0.170 | 0.933 | 0.931 | 1.000 | 33.4 | 34.1 |
+| パン 15,0 / 角 | 0.159 | 0.939 | 0.838 | 0.909 | 32.1 | 34.3 |
+| パン 7,3 / 中央 | 0.170 | 0.942 | 0.902 | 0.988 | 31.7 | 34.7 |
+| パン 7,3 / 角 | 0.161 | 0.940 | 0.468 | 0.533 | 30.4 | 34.3 |
+| パン 3,1 / 中央 | 0.171 | 0.940 | 0.565 | 0.678 | 31.9 | 34.3 |
+| パン 3,1 / 角 | 0.157 | 0.938 | 0.337 | 0.410 | 30.1 | 34.0 |
+| 毎フレーム別の模様 | 0.164〜0.171 | 0.900 | 焼き込んだままと同じ | 0 | — | — |
+| 静止 | 0.111〜0.137 | 0.990 | 焼き込んだままと同じ | 0 | — | — |
+
+| 何を測ったか | 値 |
+|---|---|
+| 正しいパンのペアの位相相関のピーク | 0.848〜0.999 |
+| 毎フレーム別の模様（対応が無い）のペアのピーク | 0.094〜0.226（すべて閾値未満で鎖を切った） |
+| 全帯域の位相相関で正しく推定できたペア（crf 35・パン 3,1・角、numpy で同じ計算） | 0 / 59（(0,0) と推定。周波数の上限 0.1 で 13 / 59、0.06 で 56 / 59） |
+
+解釈: coverage が低いのは、窓（前後 15 フレーム）の間に背景がウォーターマークの幅だけ動かない所（遅いパン、
+角で背景が画面外へ出る所）。戻した画素の PSNR が上限より 1〜4 dB 低いのは、強い圧縮で移動量が ±1 px ずれるため（未検証）。
+
+### Temporal Recovery: 実写（固定カメラ）
+
+2026-09-26、同じ環境。「復元率の基準」と同じ 24 ケース（実写 1 本、固定カメラ、5 秒）に `vrestore restore` を加えた。
+
+| 何を測ったか | 値 |
+|---|---|
+| ウォーターマークの外接矩形のうち戻せた割合 | 0.000（24 ケースすべて） |
+| Temporal の SSIM（24 ケースの平均） | 0.377（焼き込んだまま 0.379） |
+| 隣り合うフレームの推定（1 ケース、149 ペア） | (0,0) が 84、±1 px の揺れが残り、ピーク 0.675〜0.961 |
+
+解釈: カメラが固定なので、隠れた背景はどのフレームにも写っていない。戻せないのが正しい。
+この素材では Temporal Recovery は効かない。
 
 ### ROI 検出: 合成でない素材で見たもの
 

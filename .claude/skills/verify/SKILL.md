@@ -29,6 +29,7 @@ zig build check
 | `zig fmt --check` | `build.zig` `build.zig.zon` `src/` の整形 |
 | `zig build test` | ユニットテスト（動画は ffmpeg で合成してから）と、実行ファイルを起動する `cli_*` |
 | `zig build gui` | `vrestore-gui` をビルドし、SDL のダミー描画で「フレーム表示 → 選択 → 検出」を回して正解と照合する（`roi check gui`） |
+| `zig build restore-e2e` | Temporal Recovery の合成 E2E。ケースは `build.zig` の `restore_cases`。合成 → エンコード → detect-roi → restore → 正解と compare → 条件で判定 |
 | `zig build metrics` | `vrestore compare` の SSIM / MSE を FFmpeg の ssim / psnr フィルタとフレームごとに突き合わせる |
 | `zig build e2e` | ROI の合成 E2E。ケースは `build.zig` の `roi_cases`。1 ケース = 合成 → エンコード → 参照画像を切る → `detect-roi` → 正解と照合 |
 | `scripts/check-no-media.sh` | 動画・1 MiB 超のファイルが git の管理下（ステージ含む）に無いこと。件数を出す |
@@ -48,6 +49,14 @@ scripts/check-no-media.sh                            # 衛生だけ
 
 `zig build check` に含まれる（`zig build e2e`）。失敗したケースは `FAIL case=... dx= dy= iou= reliable= ...` の行が
 失敗文に出る。
+
+復元（temporal.zig / restore）を変えたときは、合成の較正もやり直す:
+
+```sh
+scripts/restore-calibrate.sh -j 6    # 3 分前後。結果は tmp/out/restore-calibrate/results.txt
+```
+
+毎フレーム別の模様・静止の行で coverage が 0 でなければ FAIL（動きで説明できない画素を貼っている）。
 
 ROI の判定（閾値・照合・投票）を変えたときは、CI のケースだけでなく較正もやり直す:
 

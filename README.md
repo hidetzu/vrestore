@@ -15,6 +15,10 @@
   `--debug-dir <dir>` で、検出した矩形を重ねたフレームと切り出し画像も書き出す
 - `vrestore-gui <video>` — フレームを見ながらウォーターマークの範囲をドラッグで選び、Enter で検出する確認用の画面。
   検出した位置が枠で重なり、得票率・margin・reliable が窓のタイトルに出る（`zig build gui` で作る。SDL2 が要る）
+- `vrestore restore --roi detection.json --raw out.rgb --mask mask.gray input.mp4` — 検出した ROI の画素を、
+  背景が動いて見えている別のフレームの実画素で戻す（Temporal Recovery）。戻せなかった画素は焼かれたまま残し、
+  マスクと coverage（戻せた割合）で報告する。出力は RGB24 の生フレーム（ffmpeg でエンコードする）。
+  背景が動かない動画（固定カメラ）では何も戻らない
 - `vrestore compare --rect x,y,w,h <original> <processed>` — 処理後の動画が元の動画にどれだけ一致するかを、
   矩形の中で SSIM / PSNR で出す（復元の良さを測るためのもの）
 - `vrestore probe <video>` — 動画を FFmpeg で開いて 1 フレーム目までデコードし、幅・高さ・尺・コーデックを JSON で出す
@@ -28,8 +32,8 @@ vrestore detect-roi --ref watermark.png --debug-dir debug input.mp4
 
 ## 現在できないこと
 
-背景復元はまだ入っていません。ウォーターマーク除去ツールとしては使えません。
-今できるのは、消したい場所がどこかを決めるところまでです。
+背景復元は、背景が平行移動する動画で隠れた画素を別のフレームから戻す方式（Temporal Recovery）だけです。
+戻せない画素は埋めずに残すので、ウォーターマーク除去ツールとして完成したものではありません。
 
 ## Build / Test
 
@@ -42,7 +46,8 @@ zig build gui        # zig-out/bin/vrestore-gui
 zig-out/bin/vrestore-gui input.mp4
 ```
 
-操作: ドラッグで範囲を選ぶ / Enter で検出 / ← → で 1 フレーム（Shift で 1 秒、↑ ↓ で 10 秒）/ 下の帯のクリックで移動 / Esc で消す / Q で終了
+操作: ドラッグで範囲を選ぶ / Enter で検出 / R で表示中のフレームを復元 / Space で処理前・処理後（戻せなかった画素はマゼンタ）/
+← → で 1 フレーム（Shift で 1 秒、↑ ↓ で 10 秒）/ 下の帯のクリックで移動 / Esc で消す / Q で終了
 
 ```sh
 zig build            # zig-out/bin/vrestore
