@@ -70,6 +70,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
     const mask = try arena.alloc(u8, @as(usize, ref.info.width) * ref.info.height);
     var masked_sum: f64 = 0; // 画素数で重み付けした MSE の和
     var masked_n: usize = 0;
+    var masked_bad: usize = 0;
     var roi_n: usize = 0;
 
     const buf_a = try arena.alloc(u8, ref.frameBytes());
@@ -109,6 +110,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
             const m = metrics.mseMasked(.{ .width = fa.?.width, .height = fa.?.height, .rgb = fa.?.rgb }, .{ .width = fb.?.width, .height = fb.?.height, .rgb = fb.?.rgb }, rect, mask) catch unreachable;
             masked_sum += m.mse * @as(f64, @floatFromInt(m.pixels));
             masked_n += m.pixels;
+            masked_bad += m.bad;
             roi_n += @as(usize, rect.w) * rect.h;
         }
         ssim_sum += s.ssimAll();
@@ -135,6 +137,8 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
         try out.print(",\"masked_pixels\":{d},\"masked_fraction\":{d:.4},\"masked_psnr\":", .{ masked_n, @as(f64, @floatFromInt(masked_n)) / @as(f64, @floatFromInt(@max(1, roi_n))) });
         const p = if (masked_n == 0) null else metrics.psnr(masked_sum / @as(f64, @floatFromInt(masked_n)));
         if (p) |v| try out.print("{d:.3}", .{v}) else try out.writeAll("null");
+        // 戻した画素のうち、どれかの色で正解から bad_pixel_error より離れた画素の割合
+        try out.print(",\"masked_bad_fraction\":{d:.4}", .{@as(f64, @floatFromInt(masked_bad)) / @as(f64, @floatFromInt(@max(1, masked_n)))});
     }
     try out.writeAll("}\n");
     return 0;

@@ -55,25 +55,34 @@ pub fn score(reference: Image, test_img: Image, rect: Rect) Error!FrameScore {
     return s;
 }
 
-/// `mask`（1 画素 1 バイト、画像全体）が 0 でない画素だけの、R/G/B 平均の二乗誤差。
+/// マスクのある画素のうち、どれかの色で正解からこれより離れた画素を「外れ」と数える。
+/// 圧縮だけの誤差（再エンコードの上限）で届かない大きさにしてある: crf 35 の再エンコードでも
+/// 画素ごとの誤差はほぼこの内側に収まる（docs/SPEC.md §4 の restore の測定で確認する）
+pub const bad_pixel_error = 32;
+
+/// `mask`（1 画素 1 バイト、画像全体）が 0 でない画素だけの、R/G/B 平均の二乗誤差と、外れた画素の数。
 /// 復元方式が「戻した」と言った画素がどれだけ正しいかを測る。数えた画素の数も返す
-pub fn mseMasked(reference: Image, test_img: Image, rect: Rect, mask: []const u8) Error!struct { mse: f64, pixels: usize } {
+pub fn mseMasked(reference: Image, test_img: Image, rect: Rect, mask: []const u8) Error!struct { mse: f64, pixels: usize, bad: usize } {
     if (reference.width != test_img.width or reference.height != test_img.height) return error.SizeMismatch;
     if (@as(u64, rect.x) + rect.w > reference.width or @as(u64, rect.y) + rect.h > reference.height) return error.RectOutside;
     var sum: u64 = 0;
     var n: usize = 0;
+    var bad: usize = 0;
     for (rect.y..rect.y + rect.h) |y| {
         for (rect.x..rect.x + rect.w) |x| {
             if (mask[y * reference.width + x] == 0) continue;
+            var worst: u64 = 0;
             for (0..3) |c| {
                 const d = px(reference, x, y, c) - px(test_img, x, y, c);
                 sum += @intCast(d * d);
+                worst = @max(worst, @abs(d));
             }
+            if (worst > bad_pixel_error) bad += 1;
             n += 1;
         }
     }
     const mse_value = if (n == 0) 0 else @as(f64, @floatFromInt(sum)) / @as(f64, @floatFromInt(n * 3));
-    return .{ .mse = mse_value, .pixels = n };
+    return .{ .mse = mse_value, .pixels = n, .bad = bad };
 }
 
 /// MSE から PSNR (dB)。MSE が 0（完全一致）なら null
@@ -221,6 +230,9 @@ test "metrics: mseMasked counts only masked pixels inside the rect" {
     const r = try mseMasked(img_a, img_b, .{ .x = 0, .y = 0, .w = 8, .h = 8 }, &mask);
     try std.testing.expectEqual(@as(usize, 2), r.pixels);
     try std.testing.expectEqual(@as(f64, 50), r.mse); // (100 + 0) / 2
+    try std.testing.expectEqual(@as(usize, 0), r.bad); // 10 は外れではない
+    b[(2 * 16 + 1) * 3 ..][0..3].* = .{ 100, 100 + bad_pixel_error + 1, 100 };
+    try std.testing.expectEqual(@as(usize, 1), (try mseMasked(img_a, img_b, .{ .x = 0, .y = 0, .w = 8, .h = 8 }, &mask)).bad);
 }
 
 test "metrics: rejects mismatched sizes and bad rects" {
