@@ -12,10 +12,13 @@ const provenance = @import("provenance.zig");
 const motion = @import("motion.zig");
 const spatial = @import("spatial.zig");
 const wmask = @import("wmask.zig");
+const mp4 = @import("mp4.zig");
 
 /// ROI の中でウォーターマークの画素だけを隠れている扱いにするか（wmask.zig）。none なら ROI 全体を隠す。
 /// ⚠ 較正は docs/SPEC.md §4、決定は docs/adr/0010
 pub const MaskMode = enum { none, auto };
+/// --out の MP4 に元の音声を入れるか
+pub const AudioMode = enum { copy, none };
 pub const default_mask: MaskMode = .none;
 /// マスクを推定するときに動画全体から取るフレーム数
 pub const mask_frames = 60;
@@ -79,8 +82,12 @@ pub const Args = struct {
     fill: spatial.Method = default_fill,
     mask: MaskMode = default_mask,
     max_ring_diff: ?f64 = default_max_ring_diff,
-    /// RGB24 の生フレームの出力先。"-" なら標準出力（そのとき集計は標準エラーへ）
+    /// RGB24 の生フレームの出力先。"-" なら標準出力（そのとき集計は標準エラーへ）。空なら書かない
     raw_out: []const u8 = "",
+    /// 全フレームを H.264 の MP4 に書き出す先（mp4.zig）
+    mp4_out: ?[]const u8 = null,
+    crf: u8 = 18,
+    audio: AudioMode = .copy,
     /// 画素ごとの由来（provenance.zig の形式、1 画素 1 バイト）の出力先
     provenance_out: ?[]const u8 = null,
     /// 隣り合うフレームの移動量の推定を 1 行ずつ書く（診断用）: "<frame> <dx> <dy> <peak>"
@@ -185,6 +192,8 @@ test "fillAndTally: fills the watermark pixels outside the ROI too, and keeps th
 }
 
 const Slot = struct {
+    /// 入力のストリームの time_base での時刻（書き出しに使う）
+    pts: i64,
     rgb: []u8,
     /// affine のときだけ使う輝度（次のフレームとの推定に使い回す）
     luma: ?motion.Luma,
@@ -245,13 +254,19 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
 
     // 出力先
     var raw_buf: [64 * 1024]u8 = undefined;
+    const want_raw = args.raw_out.len > 0;
     const to_stdout = std.mem.eql(u8, args.raw_out, "-");
-    const raw_file: ?Io.File = if (to_stdout) null else cwd.createFile(io, args.raw_out, .{}) catch |e| {
+    const raw_file: ?Io.File = if (to_stdout or !want_raw) null else cwd.createFile(io, args.raw_out, .{}) catch |e| {
         try err.print("vrestore: could not create '{s}': {s}\n", .{ args.raw_out, @errorName(e) });
         return 1;
     };
     defer if (raw_file) |f| f.close(io);
     var raw_w: Io.File.Writer = .initStreaming(raw_file orelse .stdout(), io, &raw_buf);
+    var mp4_w: ?mp4.Writer = if (args.mp4_out) |p| mp4.Writer.open(try arena.dupeZ(u8, p), try arena.dupeZ(u8, args.video), &d, .{ .crf = args.crf, .audio = args.audio == .copy }) catch |e| {
+        try err.print("vrestore: could not write '{s}': {s}\n", .{ p, mp4.describe(e) });
+        return 1;
+    } else null;
+    defer if (mp4_w) |*m| m.close();
     const summary = if (to_stdout) err else out;
     var prov_buf: [64 * 1024]u8 = undefined;
     const prov_file: ?Io.File = if (args.provenance_out) |p| cwd.createFile(io, p, .{}) catch |e| {
@@ -326,7 +341,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
                 peak_min = @min(peak_min, est.shift.peak);
                 peak_max = @max(peak_max, est.shift.peak);
             }
-            try slots.append(arena, .{ .rgb = buf, .luma = luma, .motion = m });
+            try slots.append(arena, .{ .rgb = buf, .pts = f.pts, .luma = luma, .motion = m });
         }
         if (next_target >= lo + slots.items.len) break;
 
@@ -346,7 +361,11 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
         total.merge(r);
         coverage_min = @min(coverage_min, r.coverage());
 
-        try raw_w.interface.writeAll(out_rgb);
+        if (want_raw) try raw_w.interface.writeAll(out_rgb);
+        if (mp4_w) |*m| m.write(out_rgb, slots.items[next_target - lo].pts) catch |e| {
+            try err.print("vrestore: could not write '{s}': {s}\n", .{ args.mp4_out.?, mp4.describe(e) });
+            return 1;
+        };
         if (prov_w) |*pw| try pw.interface.writeAll(std.mem.sliceAsBytes(prov));
         next_target += 1;
 
@@ -358,7 +377,11 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
             lo += 1;
         }
     }
-    try raw_w.interface.flush();
+    if (want_raw) try raw_w.interface.flush();
+    if (mp4_w) |*m| m.finish() catch |e| {
+        try err.print("vrestore: could not write '{s}': {s}\n", .{ args.mp4_out.?, mp4.describe(e) });
+        return 1;
+    };
     if (prov_w) |*pw| try pw.interface.flush();
     if (shifts_w) |*sw| try sw.interface.flush();
 
@@ -372,6 +395,11 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
     try total.writeJson(summary);
     try summary.print(",\"mask\":\"{s}\"", .{@tagName(args.mask)});
     if (mask_est) |m| try summary.print(",\"mask_accepted\":{},\"mask_fraction\":{d:.4},\"mask_inside_mad\":{d:.2},\"mask_outside_mad\":{d:.2}", .{ m.accepted, m.fraction, m.inside_mad, m.outside_mad });
+    if (mp4_w) |*m| {
+        try summary.print(",\"out\":{{\"frames\":{d},\"crf\":{d},\"audio\":", .{ m.frames, args.crf });
+        if (m.audioPackets()) |n| try summary.print("{{\"copied_packets\":{d}}}", .{n}) else try summary.print("\"{s}\"", .{if (args.audio == .none) "none" else "absent"});
+        try summary.writeAll("}");
+    }
     try summary.writeAll("}\n");
     return 0;
 }

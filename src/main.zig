@@ -25,10 +25,13 @@ const usage =
     \\      --min-margin <f>        reliable needs (peak - best elsewhere) >= f
     \\      --min-psr <f>           reliable needs PSR >= f (0 = not used)
     \\
-    \\  restore (--roi <detection.json> | --rect x,y,w,h) --raw <out.rgb|-> [options] <video>
+    \\  restore (--roi <detection.json> | --rect x,y,w,h) (--out <out.mp4> | --raw <out.rgb|->) [options] <video>
     \\      put back the pixels hidden by the watermark, taken from frames where the background
-    \\      moved out from under it (Temporal Recovery, translation only). Writes RGB24 raw frames;
-    \\      pixels it could not recover are left as they were. Prints the recovery coverage as JSON.
+    \\      moved out from under it (Temporal Recovery). Writes every frame as an H.264 MP4 with the
+    \\      original audio (--out) and/or as RGB24 raw frames (--raw); pixels it could not recover are
+    \\      left as they were. Prints the recovery coverage as JSON.
+    \\      --crf <n>           H.264 quality for --out, 0-51, lower is better and larger (default 18)
+    \\      --audio <a>         copy (put the original audio in --out as is, default) or none
     \\      --window <n>        frames to look at on each side (default 15)
     \\      --motion <m>        translation (whole-frame shift) or affine (shift + rotation + zoom)
     \\      --mask <m>          none (hide the whole ROI) or auto (hide only the watermark's own pixels,
@@ -177,6 +180,13 @@ fn parseRestore(args: []const []const u8) Command {
             out.rect = .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h };
         } else if (std.mem.eql(u8, a, "--raw")) {
             out.raw_out = v;
+        } else if (std.mem.eql(u8, a, "--out")) {
+            out.mp4_out = v;
+        } else if (std.mem.eql(u8, a, "--crf")) {
+            out.crf = std.fmt.parseInt(u8, v, 10) catch 255;
+            if (out.crf > 51) return .{ .bad_arg = .{ .why = "--crf needs an integer from 0 to 51", .arg = v } };
+        } else if (std.mem.eql(u8, a, "--audio")) {
+            out.audio = std.meta.stringToEnum(restore_cmd.AudioMode, v) orelse return .{ .bad_arg = .{ .why = "--audio needs copy or none", .arg = v } };
         } else if (std.mem.eql(u8, a, "--provenance")) {
             out.provenance_out = v;
         } else if (std.mem.eql(u8, a, "--shifts")) {
@@ -199,7 +209,7 @@ fn parseRestore(args: []const []const u8) Command {
         }
     }
     if (out.rect == null and out.roi_json == null) return .{ .bad_arg = .{ .why = "restore needs --roi <detection.json> or --rect x,y,w,h", .arg = "--roi" } };
-    if (out.raw_out.len == 0) return .{ .bad_arg = .{ .why = "restore needs --raw <out.rgb> (or - for stdout)", .arg = "--raw" } };
+    if (out.raw_out.len == 0 and out.mp4_out == null) return .{ .bad_arg = .{ .why = "restore needs --out <out.mp4> or --raw <out.rgb> (or - for stdout)", .arg = "--out" } };
     out.video = video_path orelse return .{ .missing_arg = "restore" };
     return .{ .restore = out };
 }
@@ -338,7 +348,15 @@ test "parseArgs: restore" {
     try std.testing.expectEqual(@as(usize, 8), got.window);
     try std.testing.expectEqualStrings("v.mp4", got.video);
     try std.testing.expectEqualStrings("--roi", parseArgs(&.{ "restore", "--raw", "o", "v" }).bad_arg.arg);
-    try std.testing.expectEqualStrings("--raw", parseArgs(&.{ "restore", "--rect", "1,2,30,40", "v" }).bad_arg.arg);
+    // 出力先が無ければ止める。--out だけでもよい
+    try std.testing.expectEqualStrings("--out", parseArgs(&.{ "restore", "--rect", "1,2,30,40", "v" }).bad_arg.arg);
+    const mp = parseArgs(&.{ "restore", "--rect", "1,2,30,40", "--out", "o.mp4", "--crf", "23", "--audio", "none", "v" }).restore;
+    try std.testing.expectEqualStrings("o.mp4", mp.mp4_out.?);
+    try std.testing.expectEqual(@as(u8, 23), mp.crf);
+    try std.testing.expectEqual(restore_cmd.AudioMode.none, mp.audio);
+    try std.testing.expectEqualStrings("", mp.raw_out);
+    try std.testing.expectEqualStrings("52", parseArgs(&.{ "restore", "--rect", "1,2,3,4", "--out", "o", "--crf", "52", "v" }).bad_arg.arg);
+    try std.testing.expectEqualStrings("mp3", parseArgs(&.{ "restore", "--rect", "1,2,3,4", "--out", "o", "--audio", "mp3", "v" }).bad_arg.arg);
 }
 
 test "parseArgs: unknown argument is kept verbatim" {
