@@ -10,9 +10,17 @@ permissions:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    # FFmpeg のメジャー版はランナーの apt で決まる。ubuntu-latest だと黙って上がるので固定する（docs/adr/0001）
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
+
+      # ffmpeg コマンドはテスト用動画の合成に、lib*-dev はリンクに使う
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg pkg-config \
+            libavformat-dev libavcodec-dev libswscale-dev libavutil-dev
+          ffmpeg -version | head -1
 
       # Zig の版は build.zig.zon の minimum_zig_version から読む（mlugg/setup-zig の既定動作）
       - uses: mlugg/setup-zig@v2
