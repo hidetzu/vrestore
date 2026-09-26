@@ -30,6 +30,7 @@ const usage =
     \\      moved out from under it (Temporal Recovery, translation only). Writes RGB24 raw frames;
     \\      pixels it could not recover are left as they were. Prints the recovery coverage as JSON.
     \\      --window <n>        frames to look at on each side (default 15)
+    \\      --motion <m>        translation (whole-frame shift) or affine (shift + rotation + zoom)
     \\      --provenance <out>  also write where each pixel came from, 1 byte per pixel per frame:
     \\                          0 = outside the ROI, 1 = unrecovered, 2 = temporal_real
     \\
@@ -179,6 +180,8 @@ fn parseRestore(args: []const []const u8) Command {
         } else if (std.mem.eql(u8, a, "--window")) {
             out.window = std.fmt.parseInt(usize, v, 10) catch 0;
             if (out.window == 0) return .{ .bad_arg = .{ .why = "--window needs a positive integer", .arg = v } };
+        } else if (std.mem.eql(u8, a, "--motion")) {
+            out.motion = std.meta.stringToEnum(restore_cmd.MotionModel, v) orelse return .{ .bad_arg = .{ .why = "--motion needs translation or affine", .arg = v } };
         } else if (std.mem.eql(u8, a, "--max-ring-diff")) {
             out.max_ring_diff = if (std.mem.eql(u8, v, "off")) null else std.fmt.parseFloat(f64, v) catch return .{ .bad_arg = .{ .why = "--max-ring-diff needs a number or off", .arg = v } };
         } else if (std.mem.eql(u8, a, "--min-peak")) {
@@ -274,6 +277,7 @@ test {
     _ = @import("gui_state.zig");
     _ = @import("temporal.zig");
     _ = @import("provenance.zig");
+    _ = @import("motion.zig");
     _ = restore_cmd;
 }
 

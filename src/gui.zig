@@ -10,6 +10,7 @@
 //!   R                        検出した ROI を、前後のフレームの実画素で戻す（Temporal Recovery）
 //!   Space                    処理前 / 処理後を切り替える（処理後で戻せなかった画素はマゼンタ）
 //!   P                        処理後の画面に、各画素の由来（provenance）を色で重ねる / 外す
+//!   M                        動きのモデルを切り替える（translation / affine）。次の R から使う
 //!   ← / →                    1 フレーム戻る / 進む（Shift で 1 秒、↑ / ↓ で 10 秒）
 //!   Home / End               先頭 / 末尾
 //!   クリック・ドラッグ（下の帯）  その時刻へ移動
@@ -43,6 +44,7 @@ const usage =
     \\  --restore               with --detect-and-exit, also restore the current frame (as pressing R)
     \\                          and print its coverage as a second JSON line
     \\  --show-provenance       with --restore, show the provenance colors (as pressing P)
+    \\  --motion <m>            translation or affine (as pressing M)
     \\  --screenshot <png>      with --detect-and-exit, also save what the window shows
     \\
 ;
@@ -68,6 +70,8 @@ const App = struct {
     show_after: bool = false,
     /// 処理後の画面に由来の色を重ねる（P）
     show_provenance: bool = false,
+    /// 動きのモデル（M で切り替え）
+    motion_model: restore_cmd.MotionModel = restore_cmd.default_motion,
     /// 表示用の画素（処理後で、戻せなかった画素をマゼンタにしたもの）
     display: []u8,
     /// 検出できなかったときの理由（窓のタイトルに出す）
@@ -83,7 +87,7 @@ const App = struct {
     }
 
     /// 検出した ROI を、表示中のフレームの前後 `window` 枚の実画素で戻す。
-    /// 移動の推定と復元は temporal.recoverInWindow（CLI の restore と同じ部品、同じ閾値）
+    /// 動きの推定と復元は restore_cmd.recoverInWindow（CLI の restore と同じ部品、同じ閾値）
     fn restore(app: *App) !void {
         app.clearRestored();
         app.problem_len = 0;
@@ -125,7 +129,7 @@ const App = struct {
         errdefer app.gpa.free(out);
         const prov = try app.gpa.alloc(Provenance, @as(usize, d.info.width) * d.info.height);
         errdefer app.gpa.free(prov);
-        app.recovered = try temporal.recoverInWindow(app.gpa, images, t, roi_rect, restore_cmd.default_min_peak, restore_cmd.default_max_ring_diff, out, prov);
+        app.recovered = try restore_cmd.recoverInWindow(app.gpa, app.motion_model, images, t, roi_rect, restore_cmd.default_min_peak, restore_cmd.default_max_ring_diff, out, prov);
         app.restored = out;
         app.restored_prov = prov;
         app.show_after = true;
@@ -212,6 +216,7 @@ pub fn main(init: std.process.Init) !u8 {
     var detect_and_exit = false;
     var restore_too = false;
     var show_prov = false;
+    var motion_model = restore_cmd.default_motion;
     var screenshot: ?[]const u8 = null;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -222,6 +227,9 @@ pub fn main(init: std.process.Init) !u8 {
             restore_too = true;
         } else if (std.mem.eql(u8, a, "--show-provenance")) {
             show_prov = true;
+        } else if (std.mem.eql(u8, a, "--motion") and i + 1 < args.len) {
+            i += 1;
+            motion_model = std.meta.stringToEnum(restore_cmd.MotionModel, args[i]) orelse return badArg(&err.interface, "--motion needs translation or affine", args[i]);
         } else if (std.mem.eql(u8, a, "--at") and i + 1 < args.len) {
             i += 1;
             at = std.fmt.parseFloat(f64, args[i]) catch return badArg(&err.interface, "--at needs seconds", args[i]);
@@ -260,6 +268,7 @@ pub fn main(init: std.process.Init) !u8 {
         .rgb = try arena.alloc(u8, dec.frameBytes()),
         .display = try arena.alloc(u8, dec.frameBytes()),
         .duration = dec.info.duration_sec orelse 0,
+        .motion_model = motion_model,
         .frame_dur = 1 / fps,
     };
     try app.showAt(at);
@@ -383,6 +392,10 @@ pub fn main(init: std.process.Init) !u8 {
                     sdl.SDL_SCANCODE_SPACE => {
                         if (app.restored != null) app.show_after = !app.show_after;
                     },
+                    sdl.SDL_SCANCODE_M => {
+                        app.clearRestored();
+                        app.motion_model = if (app.motion_model == .translation) .affine else .translation;
+                    },
                     sdl.SDL_SCANCODE_P => {
                         if (app.restored != null) {
                             app.show_provenance = !app.show_provenance;
@@ -471,7 +484,7 @@ fn draw(app: *App, win: *sdl.SDL_Window, ren: *sdl.SDL_Renderer, tex: *sdl.SDL_T
 }
 
 fn title(w: *Io.Writer, app: *const App) !void {
-    try w.print("vrestore-gui | {d:.3}s / {d:.1}s", .{ app.time_sec, app.duration });
+    try w.print("vrestore-gui | {d:.3}s / {d:.1}s | motion {s}", .{ app.time_sec, app.duration, @tagName(app.motion_model) });
     if (app.restored != null) {
         try w.print(" | {s} | restored {d:.1}% of the ROI", .{ if (app.show_after) "AFTER" else "BEFORE", app.recovered.coverage() * 100 });
         // 由来ごとの割合（ROI の中）。色は P で重ねたときのもの

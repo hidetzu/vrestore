@@ -28,8 +28,13 @@ pub const Case = struct {
     height: u32 = 360,
     frames: u32 = 30,
     /// pan: 模様がパンする / cut: 毎フレーム別の模様 / flat: 動かない滑らかなグラデーション
-    /// zoom: 画面中央を中心に 1 フレームあたり 1% ずつ拡大する（画面全体の平行移動ではない動き）
-    bg: enum { pan, cut, flat, zoom } = .pan,
+    /// zoom: 画面中央を中心に 1 フレームあたり 1% ずつ拡大する（画面全体の平行移動ではない動き）。
+    /// warp: 画面中央を中心に、1 フレームあたり `zoom` の拡大・`rot` 度の回転・(pan_x, pan_y) の平行移動を重ねる
+    bg: enum { pan, cut, flat, zoom, warp } = .pan,
+    /// warp の 1 フレームあたりの拡大率（0.005 = 0.5%）
+    zoom: f32 = 0,
+    /// warp の 1 フレームあたりの回転（度）
+    rot: f32 = 0,
     /// 1 フレームあたりのパン量 (px)
     pan_x: i32 = 7,
     pan_y: i32 = 3,
@@ -227,8 +232,11 @@ fn synth(gpa: std.mem.Allocator, io: Io, c: Case, out_path: []const u8, truth_pa
     // 背景: pan は大きな模様から窓をずらして切る。cut は毎フレーム別の seed
     const span_x: u32 = @abs(c.pan_x) * c.frames;
     const span_y: u32 = @abs(c.pan_y) * c.frames;
-    const tw = w + span_x;
-    const th = h + span_y;
+    // warp は回転するので、画面の角が模様の外に出ないよう縦横とも倍の余白を取る
+    const extra_x: u32 = if (c.bg == .warp) w else 0;
+    const extra_y: u32 = if (c.bg == .warp) w else 0;
+    const tw = w + span_x + extra_x;
+    const th = h + span_y + extra_y;
     const tex = [3][]f32{
         try noiseTexture(gpa, tw, th, c.seed * 3 + 0),
         try noiseTexture(gpa, tw, th, c.seed * 3 + 1),
@@ -254,6 +262,19 @@ fn synth(gpa: std.mem.Allocator, io: Io, c: Case, out_path: []const u8, truth_pa
             var rgb: [3]f32 = undefined;
             for (0..3) |ch| rgb[ch] = switch (c.bg) {
                 .pan => tex[ch][(y + oy) * tw + x + ox],
+                .warp => blk: {
+                    // フレーム k の画素 (x, y) は、模様の中央を原点に、パンを戻し、回転と拡大を戻した位置
+                    const kf: f32 = @floatFromInt(k);
+                    const s = std.math.pow(f32, 1 + c.zoom, kf);
+                    const ang = -c.rot * kf * std.math.pi / 180.0;
+                    const rx = @as(f32, @floatFromInt(x)) - @as(f32, @floatFromInt(w)) / 2 - @as(f32, @floatFromInt(c.pan_x)) * kf;
+                    const ry = @as(f32, @floatFromInt(y)) - @as(f32, @floatFromInt(h)) / 2 - @as(f32, @floatFromInt(c.pan_y)) * kf;
+                    const fx = @as(f32, @floatFromInt(tw)) / 2 + (rx * @cos(ang) - ry * @sin(ang)) / s;
+                    const fy = @as(f32, @floatFromInt(th)) / 2 + (rx * @sin(ang) + ry * @cos(ang)) / s;
+                    const ix: usize = @intFromFloat(std.math.clamp(fx, 0, @as(f32, @floatFromInt(tw - 1))));
+                    const iy: usize = @intFromFloat(std.math.clamp(fy, 0, @as(f32, @floatFromInt(th - 1))));
+                    break :blk tex[ch][iy * tw + ix];
+                },
                 .zoom => blk: {
                     // 出力の (x, y) は、模様の中央から 1 / (1 + 0.01k) 倍の位置
                     const s = 1 + 0.01 * @as(f32, @floatFromInt(k));

@@ -9,6 +9,20 @@ const Io = std.Io;
 const video = @import("video.zig");
 const temporal = @import("temporal.zig");
 const provenance = @import("provenance.zig");
+const motion = @import("motion.zig");
+
+/// フレーム間の動きのモデル
+pub const MotionModel = enum {
+    /// 画面全体の整数画素の平行移動（位相相関）
+    translation,
+    /// 平行移動 + 回転 + 拡大縮小（ブロックの動きに RANSAC で当てはめる、motion.zig）
+    affine,
+};
+
+/// affine を既定にする: 手持ちの実写で外れた画素が 1.76% → 0.24%、合成の回転 + パンで SSIM 0.46 → 0.81、
+/// 平行移動だけの合成では同等。代わりに角の ROI の coverage が下がる（パン 7,3: 0.426 → 0.367）。
+/// ⚠ 較正は docs/SPEC.md §4、決定は docs/adr/0007
+pub const default_motion: MotionModel = .affine;
 
 /// 位相相関のピークがこれ未満のペアは「推定できなかった」として鎖を切る。
 /// ⚠ 較正は docs/SPEC.md §4。値を変えるときは scripts/restore-calibrate.sh をやり直す
@@ -26,6 +40,7 @@ pub const Args = struct {
     roi_json: ?[]const u8 = null,
     window: usize = 15,
     min_peak: f64 = default_min_peak,
+    motion: MotionModel = default_motion,
     max_ring_diff: ?f64 = default_max_ring_diff,
     /// RGB24 の生フレームの出力先。"-" なら標準出力（そのとき集計は標準エラーへ）
     raw_out: []const u8 = "",
@@ -35,11 +50,49 @@ pub const Args = struct {
     shifts_out: ?[]const u8 = null,
 };
 
+/// 手元にある連続したフレーム列から、`target` を戻す（動きの推定・鎖・復元をまとめて行う）。
+/// GUI のように窓を丸ごと持っている呼び出し側用。`run` は流しながら同じ部品（estimatePair）を使う
+pub fn recoverInWindow(gpa: std.mem.Allocator, model: MotionModel, frames: []const temporal.Image, target: usize, roi: temporal.Rect, min_peak: f64, max_ring_diff: ?f64, out: []u8, prov: []provenance.Provenance) !temporal.Recovered {
+    const lumas = try gpa.alloc(?motion.Luma, frames.len);
+    defer gpa.free(lumas);
+    @memset(lumas, null);
+    defer for (lumas) |l| if (l) |ll| ll.deinit(gpa);
+    if (model == .affine) for (frames, lumas) |f, *l| {
+        l.* = try motion.Luma.init(gpa, .{ .width = f.width, .height = f.height, .rgb = f.rgb });
+    };
+    const motions = try gpa.alloc(?motion.Affine, frames.len - 1);
+    defer gpa.free(motions);
+    for (motions, 0..) |*m, i| m.* = (try estimatePair(gpa, model, frames[i], frames[i + 1], lumas[i], lumas[i + 1], roi, min_peak)).motion;
+    const track = try temporal.Track.buildAffine(gpa, motions);
+    defer track.deinit(gpa);
+    return temporal.recoverFrame(frames, track, target, roi, max_ring_diff, out, prov);
+}
+
 const Slot = struct {
     rgb: []u8,
-    /// 1 つ前のフレームからの移動。先頭フレームは null
-    shift: ?temporal.Shift,
+    /// affine のときだけ使う輝度（次のフレームとの推定に使い回す）
+    luma: ?motion.Luma,
+    /// 1 つ前のフレームからの動き。先頭フレームと、推定できなかったときは null
+    motion: ?motion.Affine,
 };
+
+/// 隣り合うフレームの動きを 1 つ推定する。平行移動と affine の両方の入口
+pub fn estimatePair(gpa: std.mem.Allocator, model: MotionModel, prev: temporal.Image, cur: temporal.Image, prev_luma: ?motion.Luma, cur_luma: ?motion.Luma, roi: temporal.Rect, min_peak: f64) !struct { motion: ?motion.Affine, shift: temporal.Shift, inliers: u32 } {
+    const shift = try temporal.estimateShift(gpa, prev, cur, roi);
+    switch (model) {
+        .translation => return .{
+            .motion = if (shift.peak >= min_peak) motion.Affine.translation(@floatFromInt(shift.dx), @floatFromInt(shift.dy)) else null,
+            .shift = shift,
+            .inliers = 0,
+        },
+        .affine => {
+            // 位相相関の平行移動は、ブロックを探す中心にだけ使う。信用できなければ 0 を中心に探す
+            const center: [2]i32 = if (shift.peak >= min_peak) .{ shift.dx, shift.dy } else .{ 0, 0 };
+            const est = try motion.estimateAffine(gpa, prev_luma.?, cur_luma.?, .{ .x = roi.x, .y = roi.y, .w = roi.w, .h = roi.h }, center, .{});
+            return .{ .motion = if (est) |e| e.motion else null, .shift = shift, .inliers = if (est) |e| e.inliers else 0 };
+        },
+    }
+}
 
 pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, args: Args) !u8 {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
@@ -105,6 +158,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
 
     // 前後 window 枚ずつを持つリングの代わりに、先頭を捨てる配列（最大 2 * window + 1 枚）
     var slots: std.ArrayList(Slot) = .empty;
+    defer for (slots.items) |sl| if (sl.luma) |l| l.deinit(gpa);
     var free: std.ArrayList([]u8) = .empty; // 使い終わったバッファを再利用する
     var lo: usize = 0; // slots[0] のフレーム番号
     var next_target: usize = 0;
@@ -127,16 +181,24 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
                 eof = true;
                 break;
             };
-            var shift: ?temporal.Shift = null;
+            const luma: ?motion.Luma = if (args.motion == .affine) try motion.Luma.init(gpa, .{ .width = w, .height = h, .rgb = f.rgb }) else null;
+            var m: ?motion.Affine = null;
             if (slots.items.len > 0) {
-                const prev = slots.items[slots.items.len - 1].rgb;
-                shift = try temporal.estimateShift(gpa, .{ .width = w, .height = h, .rgb = prev }, .{ .width = w, .height = h, .rgb = f.rgb }, rect);
-                if (shift.?.peak < args.min_peak) cuts += 1;
-                if (shifts_w) |*sw| try sw.interface.print("{d} {d} {d} {d:.4}\n", .{ lo + slots.items.len, shift.?.dx, shift.?.dy, shift.?.peak });
-                peak_min = @min(peak_min, shift.?.peak);
-                peak_max = @max(peak_max, shift.?.peak);
+                const prev = slots.items[slots.items.len - 1];
+                const est = try estimatePair(gpa, args.motion, .{ .width = w, .height = h, .rgb = prev.rgb }, .{ .width = w, .height = h, .rgb = f.rgb }, prev.luma, luma, rect, args.min_peak);
+                m = est.motion;
+                if (m == null) cuts += 1;
+                if (shifts_w) |*sw| {
+                    try sw.interface.print("{d} {d} {d} {d:.4}", .{ lo + slots.items.len, est.shift.dx, est.shift.dy, est.shift.peak });
+                    if (args.motion == .affine) {
+                        if (m) |a| try sw.interface.print(" affine {d:.5} {d:.5} {d:.3} {d:.5} {d:.5} {d:.3} inliers {d}", .{ a.a, a.b, a.c, a.d, a.e, a.f, est.inliers }) else try sw.interface.writeAll(" affine none");
+                    }
+                    try sw.interface.writeAll("\n");
+                }
+                peak_min = @min(peak_min, est.shift.peak);
+                peak_max = @max(peak_max, est.shift.peak);
             }
-            try slots.append(arena, .{ .rgb = buf, .shift = shift });
+            try slots.append(arena, .{ .rgb = buf, .luma = luma, .motion = m });
         }
         if (next_target >= lo + slots.items.len) break;
 
@@ -144,13 +206,13 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
         const n = slots.items.len;
         const images = try gpa.alloc(temporal.Image, n);
         defer gpa.free(images);
-        const shifts = try gpa.alloc(temporal.Shift, n - 1);
-        defer gpa.free(shifts);
+        const motions = try gpa.alloc(?motion.Affine, n - 1);
+        defer gpa.free(motions);
         for (slots.items, 0..) |s, i| {
             images[i] = .{ .width = w, .height = h, .rgb = s.rgb };
-            if (i > 0) shifts[i - 1] = s.shift.?;
+            if (i > 0) motions[i - 1] = s.motion;
         }
-        const track = try temporal.Track.build(gpa, shifts, args.min_peak);
+        const track = try temporal.Track.buildAffine(gpa, motions);
         defer track.deinit(gpa);
         const r = temporal.recoverFrame(images, track, next_target - lo, rect, args.max_ring_diff, out_rgb, prov);
         total.merge(r);
@@ -162,7 +224,9 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
 
         // 次の target の窓から外れたフレームを捨てる
         while (lo + args.window < next_target and slots.items.len > 0) {
-            try free.append(arena, slots.orderedRemove(0).rgb);
+            const old = slots.orderedRemove(0);
+            if (old.luma) |l| l.deinit(gpa);
+            try free.append(arena, old.rgb);
             lo += 1;
         }
     }
@@ -174,8 +238,8 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
         try err.print("vrestore: '{s}' has no decodable frame\n", .{args.video});
         return 1;
     }
-    try summary.print("{{\"frames\":{d},\"x\":{d},\"y\":{d},\"width\":{d},\"height\":{d},\"window\":{d},\"min_peak\":{d:.3},\"recovered\":{d},\"pixels\":{d},\"coverage\":{d:.4},\"coverage_min\":{d:.4},\"pairs_cut\":{d},\"peak_min\":{d:.3},\"peak_max\":{d:.3},\"provenance\":", .{
-        next_target, rect.x, rect.y, rect.w, rect.h, args.window, args.min_peak, total.recovered(), total.roiPixels(), total.coverage(), coverage_min, cuts, peak_min, peak_max,
+    try summary.print("{{\"frames\":{d},\"x\":{d},\"y\":{d},\"width\":{d},\"height\":{d},\"motion\":\"{s}\",\"window\":{d},\"min_peak\":{d:.3},\"recovered\":{d},\"pixels\":{d},\"coverage\":{d:.4},\"coverage_min\":{d:.4},\"pairs_cut\":{d},\"peak_min\":{d:.3},\"peak_max\":{d:.3},\"provenance\":", .{
+        next_target, rect.x, rect.y, rect.w, rect.h, @tagName(args.motion), args.window, args.min_peak, total.recovered(), total.roiPixels(), total.coverage(), coverage_min, cuts, peak_min, peak_max,
     });
     try total.writeJson(summary);
     try summary.writeAll("}\n");

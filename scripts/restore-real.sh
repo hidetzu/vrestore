@@ -12,8 +12,8 @@
 #                   焼かれたまま残る。戻した画素だけの PSNR と coverage も出す
 # 復元方式の出力は可逆で保存する（出力の再圧縮で落ちる分を混ぜない）。
 #
-# 使い方: scripts/restore-real.sh [-s 開始秒] [-d 秒数] [-j 並列数] <video>
-# 出力:   tmp/out/restore/<動画名>/results.txt と集計（標準出力）
+# 使い方: scripts/restore-real.sh [-s 開始秒] [-d 秒数] [-j 並列数] [-M translation|affine] <video>
+# 出力:   tmp/out/restore/<動画名>/results-<motion>.txt と集計（標準出力）
 # ⚠ 動画・出力は tmp/ の下にだけ置く（CLAUDE.md §4）。実素材のファイル名を公開物に書かない。
 # PIL と CJK フォントが要る（scripts/mkwatermark.py）。CI では回さない。
 set -euo pipefail
@@ -21,8 +21,10 @@ set -euo pipefail
 start=200
 dur=5
 jobs=4
-while getopts s:d:j: o; do
+motion=translation
+while getopts s:d:j:M: o; do
 	case $o in
+	M) motion=$OPTARG ;;
 	s) start=$OPTARG ;;
 	d) dur=$OPTARG ;;
 	j) jobs=$OPTARG ;;
@@ -38,6 +40,8 @@ video=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 
 cd "$(git rev-parse --show-toplevel)"
 out=tmp/out/restore/$(basename "${video%.*}")-s$start-d$dur
+# 焼き込み・delogo は動きのモデルによらないので共有し、temporal の出力と集計だけモデルごとに分ける
+res=$out/results-$motion.txt
 mkdir -p "$out/wm" "$out/cases"
 
 zig build tools -Doptimize=ReleaseFast --prefix tmp/out/restore/bin >/dev/null
@@ -96,7 +100,7 @@ run_spec() {
 	enc -i "$d/watermarked.mp4" -vf "delogo=x=$rx:y=$ry:w=$rw:h=$rh" -c:v ffv1 -pix_fmt yuv420p "$d/delogo-roi.mkv"
 	enc -i "$d/watermarked.mp4" -vf "delogo=x=$x:y=$y:w=$ww:h=$wh" -c:v ffv1 -pix_fmt yuv420p "$d/delogo-tight.mkv"
 
-	"$vr" restore --roi "$d/detection.json" --raw "$d/temporal.rgb" --provenance "$d/temporal.prov" "$d/watermarked.mp4" >"$d/temporal.json"
+	"$vr" restore --motion "$motion" --roi "$d/detection.json" --raw "$d/temporal.rgb" --provenance "$d/temporal.prov" "$d/watermarked.mp4" >"$d/temporal.json"
 	enc -f rawvideo -pix_fmt rgb24 -s "${W}x${H}" -r "$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of csv=p=0 "$d/watermarked.mp4")" \
 		-i "$d/temporal.rgb" -c:v ffv1 -pix_fmt yuv444p "$d/temporal.mkv"
 	rm -f "$d/temporal.rgb"
@@ -116,13 +120,13 @@ run_spec() {
 	done
 }
 export -f run_spec enc
-export out W H vr tool
+export out W H vr tool motion
 
-echo "restore-real: ${#specs[@]} videos, ${W}x${H}, ${dur}s from ${start}s, $jobs jobs, $(ffmpeg -version | head -1 | cut -d' ' -f1-3), $(zig version)"
-printf '%s\n' "${specs[@]}" | xargs -P "$jobs" -L 1 bash -c 'run_spec "$@"' _ | sort >"$out/results.txt"
-echo "restore-real: $(wc -l <"$out/results.txt" | tr -d ' ') rows in $out/results.txt"
+echo "restore-real: ${#specs[@]} videos, motion $motion, ${W}x${H}, ${dur}s from ${start}s, $jobs jobs, $(ffmpeg -version | head -1 | cut -d' ' -f1-3), $(zig version)"
+printf '%s\n' "${specs[@]}" | xargs -P "$jobs" -L 1 bash -c 'run_spec "$@"' _ | sort >"$res"
+echo "restore-real: $(wc -l <"$res" | tr -d ' ') rows in $res"
 
-python3 - "$out/results.txt" <<'EOF'
+python3 - "$res" <<'EOF'
 import sys, json, collections
 rows = collections.defaultdict(dict)
 for line in open(sys.argv[1]):

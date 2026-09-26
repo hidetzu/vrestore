@@ -41,17 +41,21 @@
 | GUI（E2E） | `vrestore-gui` が動画を開いて指定時刻のフレームを出し、選択範囲から CLI と同じ検出（`detect_roi.detectInVideo`）を回して、既知の位置を `dx=0, dy=0, reliable=true` で返す。SDL のダミー描画で窓を開かずに回す | `zig build gui` の `roi check gui` |
 | GUI | マウスのドラッグ・キー操作・タイムラインのクリック | ⚠ 自動の検査は無い（[ADR 0004](adr/0004-the-gui-is-a-separate-sdl2-executable-that-only-calls-the-detector.md) の帰結） |
 | 復元 | 位相相関（低い周波数だけ）で隣り合うフレームの平行移動を推定する。上下左右どちら向きでも、固定のウォーターマークがあっても正しい | `src/temporal.zig` の test `"temporal: estimateShift finds a pan in every direction, ignoring a fixed watermark"` |
+| 復元 | affine の合成・逆変換。最小二乗で正確な affine を当て、独自に動くブロックを外れ値として除く（乱数を使わない RANSAC）。ばらばらに動くブロックなら推定できなかったと返す | `src/motion.zig` の test `"motion: compose and inverse"`、`"motion: least squares recovers an exact affine, and RANSAC ignores a block that moves on its own"`、`"motion: too few consistent blocks means not estimated"` |
+| 復元 | ブロックの動きから、1% の拡大 + 0.5 度の回転を画面の四隅で 1 px 未満の誤差で推定する | test `"motion: estimateAffine finds a small zoom and rotation between two frames"` |
 | 復元 | 位相相関の窓をウォーターマークの ROI と重ならない所から取る | test `"temporal: chooseWindow keeps the window off the ROI and takes the largest"` |
 | 復元 | 相関のピークが閾値未満のペアで鎖を切り、動いていないとは見なさない | test `"temporal: Track cuts the chain at an unestimated pair instead of assuming no motion"` |
 | 復元 | 戻したと言った画素（由来 `temporal_real`）は正解と一致し、戻せなかった画素は焼かれたまま残って由来が `unrecovered` になる。ROI の外は `original`。推定した移動量が間違っていれば、ROI の周りの帯が合わないのでそのフレームからは借りない。動かない背景では何も戻らない | test `"temporal: recoverFrame restores the exact background under a pan, refuses frames whose surroundings do not match, and reports what it could not"` |
 | 由来 | 各画素の由来（provenance）を 1 バイトで表す: 0 `original`（ROI の外）、1 `unrecovered`、2 `temporal_real`。3 / 4 は予約（`alpha_recovered` / `spatial_inpainted`）。知らない値は読まない | `src/provenance.zig` の test `"provenance: byte values are part of the file format"` |
 | 由来 | coverage は ROI の中の画素のうち、証拠から戻した由来（今は `temporal_real` だけ）の割合。ROI の外は数えない | test `"provenance: coverage counts recovered pixels over the ROI, not pixels outside it"` |
-| CLI | `vrestore restore (--roi <detection.json> \| --rect) --raw <out.rgb> [--provenance <out>] <video>` が RGB24 の生フレームと由来を書き、coverage と由来ごとの画素数を JSON で出す | `zig build restore-e2e`（`restore-pan15` で `temporal_real` の割合 ≥ 0.99、`restore-cut` で `unrecovered` の割合 = 1） |
+| CLI | `vrestore restore (--roi <detection.json> \| --rect) --raw <out.rgb> [--provenance <out>] [--motion affine\|translation] <video>` が RGB24 の生フレームと由来を書き、coverage と由来ごとの画素数を JSON で出す | `zig build restore-e2e`（`restore-pan15` で `temporal_real` の割合 ≥ 0.99、`restore-cut` で `unrecovered` の割合 = 1） |
 | CLI | `vrestore compare --provenance` が、由来ごとに画素数・割合・PSNR・外れた画素（どれかの色で 32 より大きい差）の割合を出す。`masked_*` は coverage に数える由来の画素をまとめたもの。由来によらない矩形全体の外れた画素の割合（`bad_fraction`）はいつも出す。`--roi` で detect-roi の JSON を矩形にする | test `"metrics: mseWhere counts only pixels with the label inside the rect"`、`"metrics: badPixels counts pixels off by more than bad_pixel_error in any color"`、`zig build restore-e2e` |
 | 復元（合成 E2E） | パンする背景で、ウォーターマークの ROI をほぼすべて戻し、正解に近い（パン 15 px: coverage ≥ 0.99・SSIM ≥ 0.9・戻した画素の PSNR ≥ 35。パン 7,3: ≥ 0.95・≥ 0.88・≥ 34。遅いパン × crf 35: coverage ≥ 0.6・戻した画素の PSNR ≥ 30） | `zig build restore-e2e` の `restore-pan15` `restore-pan7` `restore-pan3-crf35` |
 | 復元（合成 E2E） | 動きで説明できない（毎フレーム別の模様）・動かない背景では、1 画素も戻さない | `zig build restore-e2e` の `restore-cut` `restore-flat` |
 | 復元（合成 E2E） | 画面全体の平行移動ではない動き（ズーム）で、戻した画素のうち外れた画素が 2% 以下 | `zig build restore-e2e` の `restore-zoom` |
-| GUI | R で表示中のフレームを戻し（CLI と同じ部品・閾値）、Space で処理前 / 処理後を切り替える。戻せなかった画素はマゼンタ。P で各画素の由来の色（`temporal_real` 緑、`unrecovered` マゼンタ）を重ね、窓のタイトルに由来ごとの割合を出す | `zig build gui` の `gui restore check`（coverage のみ）。表示は `--screenshot` で目視。キー操作は自動の検査なし |
+| 復元（合成 E2E） | 回転 + パンで、affine（既定）が ROI の 8 割以上を戻し、SSIM ≥ 0.75、外れた画素 ≤ 1% | `zig build restore-e2e` の `restore-rotpan`（平行移動では coverage 0.57・SSIM 0.44 で FAIL） |
+| 復元（合成 E2E） | `--motion translation` でもパン 7,3 を戻す | `zig build restore-e2e` の `restore-pan7-translation` |
+| GUI | M で動きのモデル（affine / translation）を切り替え、窓のタイトルに出す。R で表示中のフレームを戻し（CLI と同じ部品・閾値）、Space で処理前 / 処理後を切り替える。戻せなかった画素はマゼンタ。P で各画素の由来の色（`temporal_real` 緑、`unrecovered` マゼンタ）を重ね、窓のタイトルに由来ごとの割合を出す | `zig build gui` の `gui restore check`（coverage のみ）。表示は `--screenshot` で目視。キー操作は自動の検査なし |
 | リポジトリ衛生 | 動画・巨大ファイルが git の管理下に無い | `scripts/check-no-media.sh` |
 
 ## 2. ROI 検出の契約
@@ -90,7 +94,7 @@ yuv420p の動画を `ffmpeg -vf crop` で切ると座標と大きさが偶数�
 | 実装しない | 理由 |
 |---|---|
 | 背景復元の Alpha / Spatial / 生成 | Temporal だけを先に入れた（[ADR 0005](adr/0005-temporal-recovery-copies-real-pixels-and-leaves-the-rest-unrecovered.md)）。戻せない画素は未復元のまま残す |
-| Temporal の小数画素・回転・ズーム・被写体ごとの動き | 画面全体の整数画素の平行移動だけ（ADR 0005） |
+| Temporal の被写体ごとの動き（ROI 周辺の block motion / optical flow） | 動きは画面全体の affine（ADR 0007）。手持ちの実写で戻らないのは、背景が窓の中で露出していないためで、局所的な動きを追っても戻らない（SPEC §4） |
 | ウォーターマークの自動発見 | 解く問題を「指定されたものの位置」に絞る |
 | MP4 の書き出し | 復元が無い段階で出すものが無い |
 | 動画プレイヤー UI | CLI / テストで境界を作るのが先。導入時に ADR を書く |
@@ -236,6 +240,65 @@ SSIM・coverage は 12 ケースの平均。
 解釈: この素材は画面全体が平行移動していないので、ほとんど戻らないのが正しい。確かめないと、ピークの高い
 （0.85〜0.99）推定で間違った画素を「戻した」と言っていた。閾値 4 はさらに外れが少ないが、合成のパン 7,3（中央）の
 coverage が 0.988 → 0.942 に下がったので 6 にした。
+
+### Temporal Recovery: affine と平行移動の比較（`scripts/restore-calibrate.sh -M`）
+
+2026-09-26、同じ環境・条件。上の 120 ケースに、画面中央を軸にした動き（`bg=warp`）を 4 通り足した 216 ケース:
+回転 0.3 度/フレーム、拡大 0.5%/フレーム、回転 0.2 度 + パン 5,2、拡大 0.3% + パン 5,2（それぞれ位置 2 × crf 3 × 不透明度 2 ×
+seed 2）。同じ入力に `--motion translation` と `--motion affine` をかけた。SSIM・coverage は 12 ケースの平均、
+外れた画素は行の全ケースの戻した画素に対する割合。
+
+| 動き / 位置 | 上限（再エンコードだけ） | SSIM 平行移動 → affine | coverage 平行移動 → affine | 外れた画素 平行移動 → affine |
+|---|---|---|---|---|
+| パン 15,0 / 中央 | 0.933 | 0.931 → 0.932 | 1.000 → 1.000 | 0.00% → 0.00% |
+| パン 15,0 / 角 | 0.939 | 0.842 → 0.849 | 0.906 → 0.898 | 0.06% → 0.02% |
+| パン 7,3 / 中央 | 0.942 | 0.901 → 0.908 | 0.988 → 0.987 | 0.01% → 0.01% |
+| パン 7,3 / 角 | 0.940 | 0.373 → 0.364 | 0.426 → 0.367 | 0.10% → 0.01% |
+| パン 3,1 / 中央 | 0.940 | 0.562 → 0.561 | 0.675 → 0.668 | 0.01% → 0.00% |
+| パン 3,1 / 角 | 0.938 | 0.231 → 0.210 | 0.294 → 0.205 | 0.28% → 0.00% |
+| 回転 0.2 度 + パン 5,2 / 中央 | 0.927 | 0.464 → 0.813 | 0.573 → 0.908 | 0.04% → 0.00% |
+| 回転 0.2 度 + パン 5,2 / 角 | 0.921 | 0.180 → 0.386 | 0.136 → 0.389 | 0.32% → 0.03% |
+| 拡大 0.3% + パン 5,2 / 中央 | 0.931 | 0.447 → 0.796 | 0.555 → 0.891 | 0.05% → 0.01% |
+| 拡大 0.3% + パン 5,2 / 角 | 0.926 | 0.181 → 0.359 | 0.167 → 0.355 | 0.36% → 0.03% |
+| 回転 0.3 度 / 中央 | 0.926 | 0.185 → 0.185 | 0.029 → 0.065 | 0.01% → 0.00% |
+| 回転 0.3 度 / 角 | 0.923 | 0.158 → 0.231 | 0.000 → 0.212 | 0.00% → 0.01% |
+| 拡大 0.5% / 中央 | 0.932 | 0.177 → 0.177 | 0.065 → 0.091 | 0.05% → 0.01% |
+| 拡大 0.5% / 角 | 0.934 | 0.157 → 0.176 | 0.000 → 0.140 | 0.00% → 0.00% |
+| 毎フレーム別の模様・静止 | 0.900 / 0.990 | 変わらず | 0 → 0 | — |
+
+| 何を測ったか | 値 |
+|---|---|
+| 216 ケース全体の戻した画素のうち外れた画素 | 平行移動 0.062%（44,972,487 画素中）→ affine 0.010%（55,514,963 画素中） |
+| 平行移動の出力が affine への一般化の前後で同じか（上の 120 ケースの評価値） | 2,880 個すべて一致 |
+| 処理時間（640x360・60 フレーム、合成 3 ケース） | 平行移動 0.71〜0.72 秒、affine 1.91〜1.95 秒 |
+
+解釈: 中心を軸にした回転・拡大だけの動きは、ROI が中心付近にあると背景がほとんど動かないので、どちらでも戻らない。
+
+### Temporal Recovery: affine と平行移動の比較（実写）
+
+2026-09-26、同じ環境。「手持ちの実写に焼き込んだ素材」の 72 ケースと、「実写（固定カメラ）」の 24 ケースに、
+`--motion translation` と `--motion affine` をかけた（帯の差の閾値 6）。ウォーターマークの外接矩形で測る。
+
+| 素材 | 戻した割合（平均）平行移動 → affine | 戻した画素のうち外れた画素 平行移動 → affine | SSIM（平均）平行移動 → affine（焼き込んだまま） |
+|---|---|---|---|
+| 手持ちの実写 72 ケース | 0.0039 → 0.0001 | 1.76% → 0.24% | 0.2022 → 0.2014（0.2016） |
+| 固定カメラの実写 24 ケース | 0 → 0 | — | 0.3773 → 0.3773（0.3787） |
+
+手持ちの実写のうち 2 区間（48 ケース）で、帯の差の閾値を変えた:
+
+| 閾値 | 平行移動: 戻した割合 / 外れた画素 | affine: 戻した割合 / 外れた画素 |
+|---|---|---|
+| 確かめない | 0.1538 / 29.8% | 0.0050 / 18.3% |
+| 12 | 0.0282 / 7.9% | 0.0021 / 4.4% |
+| 6（既定） | 0.0058 / 1.8% | 0.0002 / 0.24% |
+
+| 何を測ったか | 値 |
+|---|---|
+| affine で追った ROI の中心の、前後 15 フレームでの最大の動き（1 ケースずつ、ROI 183 x 43） | 600 秒の区間: 中央値 3.3 px・90 パーセンタイル 5.4 px、2500 秒の区間: 8.7 px・13.7 px |
+| 窓を広げたときのウォーターマークの外接矩形のうち戻した割合（2500 秒の区間、不透明度 1・crf 20 の 6 ケース、affine） | 前後 15 フレーム: 0〜0.17%、30: 0〜1.1%、60: 0〜1.5%（外れた画素は 0.3% 以下） |
+
+解釈: この実写では、ウォーターマークの下の背景が窓の中でほとんど露出していない（動きが ROI の高さの半分にも届かない）。
+affine で戻る割合が小さいのは正しい。平行移動が「戻した」画素の多くは、±1 px の揺れの累積による見かけの露出。
 
 ### Temporal Recovery: 実写（固定カメラ）
 

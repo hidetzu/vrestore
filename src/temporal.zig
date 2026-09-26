@@ -14,6 +14,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const provenance = @import("provenance.zig");
+const motion = @import("motion.zig");
+pub const Affine = motion.Affine;
 const Provenance = provenance.Provenance;
 
 pub const Rect = struct { x: u32, y: u32, w: u32, h: u32 };
@@ -191,39 +193,83 @@ pub fn estimateShift(gpa: Allocator, prev: Image, cur: Image, exclude: ?Rect) !S
 
 // ---- 復元 --------------------------------------------------------------------
 
-/// 窓の中の各フレームの位置。隣り合うフレームの移動量を累積したもの。
+/// 窓の中の各フレームの位置。隣り合うフレームの動きを累積したもの。
 /// 推定できなかったペアで鎖が切れるので、`segment` が同じフレームどうしだけ比べられる
 pub const Track = struct {
-    /// フレーム 0 を原点とした背景の累積移動量
-    offset: [][2]i32,
+    /// 区間の先頭フレームの点 p が、フレーム k では pose[k](p) に写る
+    pose: []Affine,
     segment: []u32,
 
-    /// `shifts[i]` はフレーム i から i+1 への移動。`min_peak` 未満のペアは鎖を切る
+    /// 平行移動: `shifts[i]` はフレーム i から i+1 への移動。`min_peak` 未満のペアは鎖を切る
     pub fn build(gpa: Allocator, shifts: []const Shift, min_peak: f64) !Track {
-        const n = shifts.len + 1;
-        const offset = try gpa.alloc([2]i32, n);
-        errdefer gpa.free(offset);
+        const motions = try gpa.alloc(?Affine, shifts.len);
+        defer gpa.free(motions);
+        for (shifts, motions) |s, *m| m.* = if (s.peak >= min_peak)
+            Affine.translation(@floatFromInt(s.dx), @floatFromInt(s.dy))
+        else
+            null;
+        return buildAffine(gpa, motions);
+    }
+
+    /// `motions[i]` はフレーム i から i+1 への動き（null は推定できなかった）
+    pub fn buildAffine(gpa: Allocator, motions: []const ?Affine) !Track {
+        const n = motions.len + 1;
+        const pose = try gpa.alloc(Affine, n);
+        errdefer gpa.free(pose);
         const segment = try gpa.alloc(u32, n);
-        offset[0] = .{ 0, 0 };
+        pose[0] = .identity;
         segment[0] = 0;
-        for (shifts, 0..) |s, i| {
-            if (s.peak >= min_peak) {
-                offset[i + 1] = .{ offset[i][0] + s.dx, offset[i][1] + s.dy };
+        for (motions, 0..) |m, i| {
+            if (m) |mm| {
+                pose[i + 1] = mm.compose(pose[i]);
                 segment[i + 1] = segment[i];
             } else {
-                // 推定できなかった。累積は続けられないので新しい区間を始める（0 を入れて続けない）
-                offset[i + 1] = .{ 0, 0 };
+                // 推定できなかった。累積は続けられないので新しい区間を始める（動いていないとは見なさない）
+                pose[i + 1] = .identity;
                 segment[i + 1] = segment[i] + 1;
             }
         }
-        return .{ .offset = offset, .segment = segment };
+        return .{ .pose = pose, .segment = segment };
+    }
+
+    /// フレーム t の点が、フレーム s でどこに写るか（同じ区間のときだけ意味がある）
+    pub fn transform(tr: Track, t: usize, s: usize) Affine {
+        return tr.pose[s].compose(tr.pose[t].inverse() orelse .identity);
     }
 
     pub fn deinit(t: Track, gpa: Allocator) void {
-        gpa.free(t.offset);
+        gpa.free(t.pose);
         gpa.free(t.segment);
     }
 };
+
+fn inRoi(roi: Rect, x: i64, y: i64) bool {
+    return x >= roi.x and x < @as(i64, roi.x) + roi.w and y >= roi.y and y < @as(i64, roi.y) + roi.h;
+}
+
+/// フレーム `img` の (fx, fy) の画素を取る。整数の位置ならその画素をそのまま、そうでなければ周りの 4 画素の
+/// 双線形補間。使う画素（重みが 0 でないもの）が画面の外か ROI の中にあれば null（ウォーターマークを混ぜない）
+fn sample(img: Image, roi: Rect, fx: f64, fy: f64) ?[3]u8 {
+    const x0f = @floor(fx);
+    const y0f = @floor(fy);
+    const tx = fx - x0f;
+    const ty = fy - y0f;
+    if (x0f < -1 or y0f < -1 or x0f >= @as(f64, @floatFromInt(img.width)) or y0f >= @as(f64, @floatFromInt(img.height))) return null;
+    const x0: i64 = @intFromFloat(x0f);
+    const y0: i64 = @intFromFloat(y0f);
+    const wts = [4]f64{ (1 - tx) * (1 - ty), tx * (1 - ty), (1 - tx) * ty, tx * ty };
+    const offs = [4][2]i64{ .{ 0, 0 }, .{ 1, 0 }, .{ 0, 1 }, .{ 1, 1 } };
+    var acc = [3]f64{ 0, 0, 0 };
+    for (wts, offs) |wt, o| {
+        if (wt == 0) continue;
+        const x = x0 + o[0];
+        const y = y0 + o[1];
+        if (x < 0 or y < 0 or x >= img.width or y >= img.height or inRoi(roi, x, y)) return null;
+        const i = (@as(usize, @intCast(y)) * img.width + @as(usize, @intCast(x))) * 3;
+        for (0..3) |c| acc[c] += wt * @as(f64, @floatFromInt(img.rgb[i + c]));
+    }
+    return .{ @intFromFloat(@round(acc[0])), @intFromFloat(@round(acc[1])), @intFromFloat(@round(acc[2])) };
+}
 
 /// 由来ごとの画素数（provenance.zig）。coverage は Tally.coverage()
 pub const Recovered = provenance.Tally;
@@ -236,7 +282,6 @@ pub const Recovered = provenance.Tally;
 pub fn recoverFrame(frames: []const Image, track: Track, target: usize, roi: Rect, max_ring_diff: ?f64, out: []u8, prov: []Provenance) Recovered {
     const t = frames[target];
     const w = t.width;
-    const h = t.height;
     @memcpy(out, t.rgb);
     @memset(prov, .original);
     var tally: Recovered = .{};
@@ -244,11 +289,13 @@ pub fn recoverFrame(frames: []const Image, track: Track, target: usize, roi: Rec
     // 使ってよいフレーム: 鎖がつながっていて、ROI の周りの帯が表示中のフレームと合うもの
     std.debug.assert(frames.len <= max_window_frames);
     var usable: [max_window_frames]bool = undefined;
+    var to_s: [max_window_frames]Affine = undefined;
     for (0..frames.len) |s| {
         usable[s] = s != target and track.segment[s] == track.segment[target];
         if (!usable[s]) continue;
+        to_s[s] = track.transform(target, s);
         if (max_ring_diff) |limit| {
-            const d = ringDiff(t, frames[s], roi, track.offset[s][0] - track.offset[target][0], track.offset[s][1] - track.offset[target][1]);
+            const d = ringDiff(t, frames[s], roi, to_s[s]);
             usable[s] = if (d) |v| v <= limit else false;
         }
     }
@@ -262,15 +309,10 @@ pub fn recoverFrame(frames: []const Image, track: Track, target: usize, roi: Rec
                     if (si < 0 or si >= frames.len) continue;
                     const s: usize = @intCast(si);
                     if (!usable[s]) continue;
-                    // 背景の同じ点は、フレーム s では x + (D[s] - D[target]) にある
-                    const sx = @as(i64, @intCast(x)) + track.offset[s][0] - track.offset[target][0];
-                    const sy = @as(i64, @intCast(y)) + track.offset[s][1] - track.offset[target][1];
-                    if (sx < 0 or sy < 0 or sx >= w or sy >= h) continue;
-                    const ux: usize = @intCast(sx);
-                    const uy: usize = @intCast(sy);
-                    if (ux >= roi.x and ux < roi.x + roi.w and uy >= roi.y and uy < roi.y + roi.h) continue;
-                    const src = (uy * w + ux) * 3;
-                    @memcpy(out[(y * w + x) * 3 ..][0..3], frames[s].rgb[src..][0..3]);
+                    // 背景の同じ点は、フレーム s では to_s[s](x, y) にある
+                    const q = to_s[s].apply(@floatFromInt(x), @floatFromInt(y));
+                    const px = sample(frames[s], roi, q[0], q[1]) orelse continue;
+                    out[(y * w + x) * 3 ..][0..3].* = px;
                     prov[y * w + x] = .temporal_real;
                     break :search;
                 }
@@ -295,47 +337,32 @@ const ring_band = 6;
 /// 動きが画面全体の平行移動でない（手持ちの揺れ・被写体の動き・ズーム）と、累積した移動量は ROI の近くで
 /// 合わない。そのフレームから画素を借りると、正しくない画素を「戻した」と言ってしまう（手持ちの実写で観測）。
 /// 比べられる画素が帯の 1/4 未満なら確かめられないとして null
-fn ringDiff(t: Image, s: Image, roi: Rect, dx: i32, dy: i32) ?f64 {
+fn ringDiff(t: Image, s: Image, roi: Rect, to_s: Affine) ?f64 {
     const w: i64 = t.width;
     const h: i64 = t.height;
     const x0: i64 = @as(i64, roi.x) - ring_band;
     const y0: i64 = @as(i64, roi.y) - ring_band;
     const x1: i64 = @as(i64, roi.x) + roi.w + ring_band;
     const y1: i64 = @as(i64, roi.y) + roi.h + ring_band;
-    var sum: u64 = 0;
+    var sum: f64 = 0;
     var n: u64 = 0;
     var total: u64 = 0;
     var y = y0;
     while (y < y1) : (y += 1) {
         var x = x0;
         while (x < x1) : (x += 1) {
-            const in_roi = x >= roi.x and x < @as(i64, roi.x) + roi.w and y >= roi.y and y < @as(i64, roi.y) + roi.h;
-            if (in_roi) continue;
+            if (inRoi(roi, x, y)) continue;
             total += 1;
             if (x < 0 or y < 0 or x >= w or y >= h) continue;
-            const sx = x + dx;
-            const sy = y + dy;
-            if (sx < 0 or sy < 0 or sx >= w or sy >= h) continue;
-            if (sx >= roi.x and sx < @as(i64, roi.x) + roi.w and sy >= roi.y and sy < @as(i64, roi.y) + roi.h) continue;
+            const q = to_s.apply(@floatFromInt(x), @floatFromInt(y));
+            const sp = sample(s, roi, q[0], q[1]) orelse continue;
             const it = (@as(usize, @intCast(y)) * t.width + @as(usize, @intCast(x))) * 3;
-            const is = (@as(usize, @intCast(sy)) * s.width + @as(usize, @intCast(sx))) * 3;
-            for (0..3) |c| sum += @abs(@as(i32, t.rgb[it + c]) - @as(i32, s.rgb[is + c]));
+            for (0..3) |c| sum += @abs(@as(f64, @floatFromInt(t.rgb[it + c])) - @as(f64, @floatFromInt(sp[c])));
             n += 3;
         }
     }
     if (n / 3 * 4 < total) return null;
-    return @as(f64, @floatFromInt(sum)) / @as(f64, @floatFromInt(n));
-}
-
-/// 手元にある連続したフレーム列から、`target` を戻す（移動の推定・鎖・復元をまとめて行う）。
-/// GUI のように窓を丸ごと持っている呼び出し側用。CLI（restore_cmd.zig）は流しながら同じ部品を使う
-pub fn recoverInWindow(gpa: Allocator, frames: []const Image, target: usize, roi: Rect, min_peak: f64, max_ring_diff: ?f64, out: []u8, prov: []Provenance) !Recovered {
-    const shifts = try gpa.alloc(Shift, frames.len - 1);
-    defer gpa.free(shifts);
-    for (shifts, 0..) |*s, i| s.* = try estimateShift(gpa, frames[i], frames[i + 1], roi);
-    const track = try Track.build(gpa, shifts, min_peak);
-    defer track.deinit(gpa);
-    return recoverFrame(frames, track, target, roi, max_ring_diff, out, prov);
+    return sum / @as(f64, @floatFromInt(n));
 }
 
 // ---- tests -------------------------------------------------------------------
@@ -435,8 +462,10 @@ test "temporal: Track cuts the chain at an unestimated pair instead of assuming 
     }, 0.1);
     defer t.deinit(gpa);
     try std.testing.expectEqualSlices(u32, &.{ 0, 0, 1, 1 }, t.segment);
-    try std.testing.expectEqual([2]i32{ 3, 1 }, t.offset[1]);
-    try std.testing.expectEqual([2]i32{ 3, 1 }, t.offset[3]);
+    try std.testing.expectEqual(Affine.translation(3, 1), t.pose[1]);
+    // 切れた後の区間は、その先頭（フレーム 2）を原点にやり直す
+    try std.testing.expectEqual(Affine.identity, t.pose[2]);
+    try std.testing.expectEqual(Affine.translation(3, 1), t.pose[3]);
 }
 
 test "temporal: recoverFrame restores the exact background under a pan, refuses frames whose surroundings do not match, and reports what it could not" {

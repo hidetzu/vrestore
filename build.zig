@@ -318,6 +318,8 @@ const roi_cases = [_]RoiCase{
 
 const RestoreCase = struct {
     roi: RoiCase,
+    /// restore --motion。null なら既定（restore_cmd.default_motion）
+    motion: ?[]const u8 = null,
     /// tools/roi_fixture check-restore の条件
     expect: []const u8,
 };
@@ -327,12 +329,17 @@ const restore_cases = [_]RestoreCase{
     .{ .roi = .{ .spec = "name=restore-pan15,bg=pan,pan_x=15,pan_y=0,x=240,y=150,frames=60", .crf = 23 }, .expect = "coverage>=0.99,ssim>=0.9,masked_psnr>=35,provenance.temporal_real.fraction>=0.99" },
     // 実測: coverage 0.988、SSIM 0.926、戻した画素の PSNR 37.5
     .{ .roi = .{ .spec = "name=restore-pan7,bg=pan,pan_x=7,pan_y=3,x=240,y=150,frames=60", .crf = 23 }, .expect = "coverage>=0.95,ssim>=0.88,masked_psnr>=34" },
+    // 同じ素材を平行移動のモデルで（--motion translation の経路を回し続ける）
+    .{ .roi = .{ .spec = "name=restore-pan7-translation,bg=pan,pan_x=7,pan_y=3,x=240,y=150,frames=60", .crf = 23 }, .motion = "translation", .expect = "coverage>=0.95,ssim>=0.88,masked_psnr>=34" },
     // 遅いパン × 強い圧縮。全帯域の位相相関だと x264 のブロックの格子が (0,0) のピークを作り、動いていないと
     // 推定した（CLAUDE.md §7）。実測（低い周波数だけ）: coverage 0.680、戻した画素の PSNR 32.2
     .{ .roi = .{ .spec = "name=restore-pan3-crf35,bg=pan,pan_x=3,pan_y=1,x=240,y=150,frames=60", .crf = 35 }, .expect = "coverage>=0.6,masked_psnr>=30" },
     // ズームする背景（画面全体の平行移動ではない動き）。平行移動で近似して借りると外れた画素を貼る。
     // ROI の周りの帯が合わないフレームからは借りないので、戻した画素のほとんどは正しいこと
     .{ .roi = .{ .spec = "name=restore-zoom,bg=zoom,x=240,y=150,frames=60", .crf = 23 }, .expect = "masked_bad_fraction<=0.02" },
+    // 回転 + パン（画面全体の平行移動ではない動き）。affine で動きを追えば戻せる。
+    // 較正（crf 23 を含む 12 ケースの平均）: 平行移動 SSIM 0.464・coverage 0.573、affine 0.813・0.908
+    .{ .roi = .{ .spec = "name=restore-rotpan,bg=warp,rot=0.2,pan_x=5,pan_y=2,x=240,y=150,frames=60", .crf = 23 }, .expect = "coverage>=0.8,ssim>=0.75,masked_bad_fraction<=0.01" },
     // 毎フレーム別の模様: 動きで説明できないので、1 画素も貼らない
     // 由来はすべて unrecovered（戻さなかった画素を戻したと数えない）
     .{ .roi = .{ .spec = "name=restore-cut,bg=cut,x=240,y=150,frames=60", .crf = 23 }, .expect = "coverage<=0,provenance.unrecovered.fraction>=1" },
@@ -369,7 +376,9 @@ fn restoreCase(b: *std.Build, tool: *std.Build.Step.Compile, exe: *std.Build.Ste
 
     const restore = b.addRunArtifact(exe);
     restore.setName(b.fmt("{s} restore", .{name}));
-    restore.addArgs(&.{ "restore", "--roi" });
+    restore.addArg("restore");
+    if (c.motion) |m| restore.addArgs(&.{ "--motion", m });
+    restore.addArg("--roi");
     restore.addFileArg(roi_json);
     restore.addArg("--raw");
     const out_rgb = restore.addOutputFileArg("restored.rgb");
