@@ -5,6 +5,10 @@
 //!                     同じケースをウォーターマーク無しで書く（復元の正解。背景は synth と画素まで同じ）
 //!   roi_fixture cutref <video> <truth.json> <out.png>  エンコード済み動画のフレームから参照画像を切る
 //!   roi_fixture check  <truth.json> <detection.json>   dx / dy / IoU / reliable を判定する
+//!   roi_fixture synth-mask <case> <out.bin>          焼いたウォーターマークの画素（1 画素 1 バイト、0/1）
+//!   roi_fixture check-mask <truth-mask.bin> <provenance.bin> <w> <h> <min_recall>
+//!                     restore --provenance の 1 フレーム目で、本物のウォーターマークの画素を隠れている扱い
+//!                     （original 以外）にできた割合（再現率）と、隠した画素のうち本物だった割合（適合率）
 //!   roi_fixture check-restore <name> <restore.json> <compare.json> <conditions>
 //!                     復元の結果を条件で判定する。conditions は "coverage>=0.99,ssim>=0.9" のような並び。
 //!                     キーは restore.json と compare.json のどちらかにある数値。入れ子は "provenance.unrecovered.fraction"
@@ -109,6 +113,15 @@ pub fn main(init: std.process.Init) !u8 {
     if (args.len == 4 and std.mem.eql(u8, args[1], "check")) {
         // PASS の行は stdout（zig build では表示されない）、FAIL の行は stderr にも出して失敗文に載せる
         const code = try check(arena, io, &out.interface, args[2], args[3]);
+        if (code != 0) try err.interface.writeAll(out.interface.buffered());
+        return code;
+    }
+    if (args.len == 4 and std.mem.eql(u8, args[1], "synth-mask")) {
+        try synthMask(arena, io, try parseCase(args[2]), args[3]);
+        return 0;
+    }
+    if (args.len == 7 and std.mem.eql(u8, args[1], "check-mask")) {
+        const code = try checkMask(arena, io, &out.interface, args[2], args[3], try std.fmt.parseInt(u32, args[4], 10), try std.fmt.parseInt(u32, args[5], 10), try std.fmt.parseFloat(f64, args[6]));
         if (code != 0) try err.interface.writeAll(out.interface.buffered());
         return code;
     }
@@ -325,6 +338,44 @@ fn synth(gpa: std.mem.Allocator, io: Io, c: Case, out_path: []const u8, truth_pa
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = truth_path, .data = jw.written() });
 }
 
+/// synth と同じ位置に置いたウォーターマークの画素を 1、それ以外を 0 で書く
+fn synthMask(gpa: std.mem.Allocator, io: Io, c: Case, out_path: []const u8) !void {
+    const mask = try watermarkMask(gpa, c);
+    const wx: u32 = @intCast(if (c.x < 0) @as(i32, @intCast(c.width - mask.w)) + c.x + 1 else c.x);
+    const wy: u32 = @intCast(if (c.y < 0) @as(i32, @intCast(c.height - mask.h)) + c.y + 1 else c.y);
+    const buf = try gpa.alloc(u8, @as(usize, c.width) * c.height);
+    @memset(buf, 0);
+    for (0..mask.h) |y| for (0..mask.w) |x| {
+        if (mask.px[y * mask.w + x] != 0) buf[(wy + y) * c.width + wx + x] = 1;
+    };
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = buf });
+}
+
+/// 1 行で結果を出す: <PASS|FAIL> mask recall=<> precision=<> hidden=<> truth=<>
+fn checkMask(arena: std.mem.Allocator, io: Io, out: *Io.Writer, truth_path: []const u8, prov_path: []const u8, w: u32, h: u32, min_recall: f64) !u8 {
+    const cwd = Io.Dir.cwd();
+    const truth = try cwd.readFileAlloc(io, truth_path, arena, .limited(1 << 26));
+    const prov = try cwd.readFileAlloc(io, prov_path, arena, .limited(1 << 30));
+    const n = @as(usize, w) * h;
+    if (truth.len != n or prov.len < n) return error.SizeMismatch;
+    var tp: usize = 0;
+    var t_total: usize = 0;
+    var hidden: usize = 0;
+    for (0..n) |i| {
+        // provenance の 0 は original（隠れていない）。それ以外は隠れている扱い
+        const hd = prov[i] != 0;
+        const tw = truth[i] != 0;
+        t_total += @intFromBool(tw);
+        hidden += @intFromBool(hd);
+        tp += @intFromBool(hd and tw);
+    }
+    const recall = @as(f64, @floatFromInt(tp)) / @as(f64, @floatFromInt(@max(1, t_total)));
+    const precision = @as(f64, @floatFromInt(tp)) / @as(f64, @floatFromInt(@max(1, hidden)));
+    const ok = recall >= min_recall;
+    try out.print("{s} mask recall={d:.4} precision={d:.4} hidden={d} truth={d} (min recall {d})\n", .{ if (ok) "PASS" else "FAIL", recall, precision, hidden, t_total, min_recall });
+    return if (ok) 0 else 1;
+}
+
 /// `r` を `m` px 広げ、画面内に収める
 fn expand(r: Rect, m: u32, w: u32, h: u32) Rect {
     const x0 = r.x -| m;
@@ -406,6 +457,8 @@ fn jsonNumber(v: std.json.Value) ?f64 {
     return switch (v) {
         .float => |f| f,
         .integer => |i| @floatFromInt(i),
+        // 真偽値は 1 / 0（mask_accepted>=1 のように判定する）
+        .bool => |b| if (b) 1 else 0,
         else => null,
     };
 }
