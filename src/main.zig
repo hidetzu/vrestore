@@ -30,12 +30,14 @@ const usage =
     \\      moved out from under it (Temporal Recovery, translation only). Writes RGB24 raw frames;
     \\      pixels it could not recover are left as they were. Prints the recovery coverage as JSON.
     \\      --window <n>        frames to look at on each side (default 15)
-    \\      --mask <out.gray>   also write a mask: 0 = not recovered, 255 = recovered or outside the ROI
+    \\      --provenance <out>  also write where each pixel came from, 1 byte per pixel per frame:
+    \\                          0 = outside the ROI, 1 = unrecovered, 2 = temporal_real
     \\
-    \\  compare [--rect x,y,w,h | --roi <detection.json>] [--per-frame] [--mask <mask.gray>] <reference> <test>
+    \\  compare [--rect x,y,w,h | --roi <detection.json>] [--per-frame] [--provenance <file>] <reference> <test>
     \\      compare <test> with the original <reference> frame by frame, inside the rect
     \\      (default: whole frame). Prints SSIM and PSNR as JSON; both videos need the same frames.
-    \\      With --mask (from restore), also the PSNR of the recovered pixels only.
+    \\      With --provenance (from restore), also PSNR and bad pixels per provenance
+    \\      (unrecovered / temporal_real), and over the recovered pixels together (masked_*).
     \\
     \\  --version       print the version
     \\  --help          print this message
@@ -122,10 +124,10 @@ fn parseCompare(args: []const []const u8) Command {
         const a = args[i];
         if (std.mem.eql(u8, a, "--per-frame")) {
             out.per_frame = true;
-        } else if (std.mem.eql(u8, a, "--mask")) {
+        } else if (std.mem.eql(u8, a, "--provenance")) {
             if (i + 1 >= args.len) return .{ .bad_arg = .{ .why = "option needs a value", .arg = a } };
             i += 1;
-            out.mask = args[i];
+            out.provenance = args[i];
         } else if (std.mem.eql(u8, a, "--roi")) {
             if (i + 1 >= args.len) return .{ .bad_arg = .{ .why = "option needs a value", .arg = a } };
             i += 1;
@@ -170,8 +172,8 @@ fn parseRestore(args: []const []const u8) Command {
             out.rect = .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h };
         } else if (std.mem.eql(u8, a, "--raw")) {
             out.raw_out = v;
-        } else if (std.mem.eql(u8, a, "--mask")) {
-            out.mask_out = v;
+        } else if (std.mem.eql(u8, a, "--provenance")) {
+            out.provenance_out = v;
         } else if (std.mem.eql(u8, a, "--shifts")) {
             out.shifts_out = v;
         } else if (std.mem.eql(u8, a, "--window")) {
@@ -271,6 +273,7 @@ test {
     _ = @import("metrics.zig");
     _ = @import("gui_state.zig");
     _ = @import("temporal.zig");
+    _ = @import("provenance.zig");
     _ = restore_cmd;
 }
 

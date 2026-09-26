@@ -8,6 +8,7 @@ const std = @import("std");
 const Io = std.Io;
 const video = @import("video.zig");
 const temporal = @import("temporal.zig");
+const provenance = @import("provenance.zig");
 
 /// 位相相関のピークがこれ未満のペアは「推定できなかった」として鎖を切る。
 /// ⚠ 較正は docs/SPEC.md §4。値を変えるときは scripts/restore-calibrate.sh をやり直す
@@ -28,8 +29,8 @@ pub const Args = struct {
     max_ring_diff: ?f64 = default_max_ring_diff,
     /// RGB24 の生フレームの出力先。"-" なら標準出力（そのとき集計は標準エラーへ）
     raw_out: []const u8 = "",
-    /// 1 画素 1 バイトのマスクの出力先。戻せなかった ROI の画素が 0、それ以外が 255
-    mask_out: ?[]const u8 = null,
+    /// 画素ごとの由来（provenance.zig の形式、1 画素 1 バイト）の出力先
+    provenance_out: ?[]const u8 = null,
     /// 隣り合うフレームの移動量の推定を 1 行ずつ書く（診断用）: "<frame> <dx> <dy> <peak>"
     shifts_out: ?[]const u8 = null,
 };
@@ -82,13 +83,13 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
     defer if (raw_file) |f| f.close(io);
     var raw_w: Io.File.Writer = .initStreaming(raw_file orelse .stdout(), io, &raw_buf);
     const summary = if (to_stdout) err else out;
-    var mask_buf: [64 * 1024]u8 = undefined;
-    const mask_file: ?Io.File = if (args.mask_out) |p| cwd.createFile(io, p, .{}) catch |e| {
+    var prov_buf: [64 * 1024]u8 = undefined;
+    const prov_file: ?Io.File = if (args.provenance_out) |p| cwd.createFile(io, p, .{}) catch |e| {
         try err.print("vrestore: could not create '{s}': {s}\n", .{ p, @errorName(e) });
         return 1;
     } else null;
-    defer if (mask_file) |f| f.close(io);
-    var mask_w: ?Io.File.Writer = if (mask_file) |f| .initStreaming(f, io, &mask_buf) else null;
+    defer if (prov_file) |f| f.close(io);
+    var prov_w: ?Io.File.Writer = if (prov_file) |f| .initStreaming(f, io, &prov_buf) else null;
 
     var shifts_buf: [4096]u8 = undefined;
     const shifts_file: ?Io.File = if (args.shifts_out) |p| cwd.createFile(io, p, .{}) catch |e| {
@@ -100,7 +101,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
 
     const frame_bytes = d.frameBytes();
     const out_rgb = try arena.alloc(u8, frame_bytes);
-    const mask = try arena.alloc(u8, @as(usize, w) * h);
+    const prov = try arena.alloc(provenance.Provenance, @as(usize, w) * h);
 
     // 前後 window 枚ずつを持つリングの代わりに、先頭を捨てる配列（最大 2 * window + 1 枚）
     var slots: std.ArrayList(Slot) = .empty;
@@ -108,7 +109,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
     var lo: usize = 0; // slots[0] のフレーム番号
     var next_target: usize = 0;
     var eof = false;
-    var total: temporal.Recovered = .{ .recovered = 0, .pixels = 0 };
+    var total: provenance.Tally = .{};
     var coverage_min: f64 = 1;
     var cuts: usize = 0;
     var peak_min: f64 = 1;
@@ -151,16 +152,12 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
         }
         const track = try temporal.Track.build(gpa, shifts, args.min_peak);
         defer track.deinit(gpa);
-        const r = temporal.recoverFrame(images, track, next_target - lo, rect, args.max_ring_diff, out_rgb, mask);
-        total.recovered += r.recovered;
-        total.pixels += r.pixels;
+        const r = temporal.recoverFrame(images, track, next_target - lo, rect, args.max_ring_diff, out_rgb, prov);
+        total.merge(r);
         coverage_min = @min(coverage_min, r.coverage());
 
         try raw_w.interface.writeAll(out_rgb);
-        if (mask_w) |*mw| {
-            for (mask) |*m| m.* = if (m.* == 1) 255 else 0;
-            try mw.interface.writeAll(mask);
-        }
+        if (prov_w) |*pw| try pw.interface.writeAll(std.mem.sliceAsBytes(prov));
         next_target += 1;
 
         // 次の target の窓から外れたフレームを捨てる
@@ -170,15 +167,17 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
         }
     }
     try raw_w.interface.flush();
-    if (mask_w) |*mw| try mw.interface.flush();
+    if (prov_w) |*pw| try pw.interface.flush();
     if (shifts_w) |*sw| try sw.interface.flush();
 
     if (next_target == 0) {
         try err.print("vrestore: '{s}' has no decodable frame\n", .{args.video});
         return 1;
     }
-    try summary.print("{{\"frames\":{d},\"x\":{d},\"y\":{d},\"width\":{d},\"height\":{d},\"window\":{d},\"min_peak\":{d:.3},\"recovered\":{d},\"pixels\":{d},\"coverage\":{d:.4},\"coverage_min\":{d:.4},\"pairs_cut\":{d},\"peak_min\":{d:.3},\"peak_max\":{d:.3}}}\n", .{
-        next_target, rect.x, rect.y, rect.w, rect.h, args.window, args.min_peak, total.recovered, total.pixels, total.coverage(), coverage_min, cuts, peak_min, peak_max,
+    try summary.print("{{\"frames\":{d},\"x\":{d},\"y\":{d},\"width\":{d},\"height\":{d},\"window\":{d},\"min_peak\":{d:.3},\"recovered\":{d},\"pixels\":{d},\"coverage\":{d:.4},\"coverage_min\":{d:.4},\"pairs_cut\":{d},\"peak_min\":{d:.3},\"peak_max\":{d:.3},\"provenance\":", .{
+        next_target, rect.x, rect.y, rect.w, rect.h, args.window, args.min_peak, total.recovered(), total.roiPixels(), total.coverage(), coverage_min, cuts, peak_min, peak_max,
     });
+    try total.writeJson(summary);
+    try summary.writeAll("}\n");
     return 0;
 }

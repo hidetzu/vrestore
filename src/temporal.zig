@@ -13,6 +13,8 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const provenance = @import("provenance.zig");
+const Provenance = provenance.Provenance;
 
 pub const Rect = struct { x: u32, y: u32, w: u32, h: u32 };
 
@@ -223,29 +225,21 @@ pub const Track = struct {
     }
 };
 
-pub const Recovered = struct {
-    /// 戻せた画素の数
-    recovered: usize,
-    /// ROI の画素の数
-    pixels: usize,
-
-    pub fn coverage(r: Recovered) f64 {
-        return if (r.pixels == 0) 0 else @as(f64, @floatFromInt(r.recovered)) / @as(f64, @floatFromInt(r.pixels));
-    }
-};
+/// 由来ごとの画素数（provenance.zig）。coverage は Tally.coverage()
+pub const Recovered = provenance.Tally;
 
 /// フレーム `target` の ROI の画素を、別のフレームの実画素で戻して `out`（RGB24、target と同じ大きさ）に書く。
-/// `mask`（1 画素 1 バイト、フレーム全体）には戻せた画素を 1、戻せなかった ROI の画素を 0、ROI の外を 1 で書く。
-/// 戻せなかった画素は target の画素のまま残す（推測で埋めない）。
+/// `prov`（1 画素 1 つ、フレーム全体）には各画素の由来を書く: ROI の外は original、戻せた画素は temporal_real、
+/// 戻せなかった ROI の画素は unrecovered。戻せなかった画素は target の画素のまま残す（推測で埋めない）。
 ///
 /// 候補は時間の近いフレームから順に見る。背景の同じ点がそのフレームで ROI の外かつ画面内にあれば採る。
-pub fn recoverFrame(frames: []const Image, track: Track, target: usize, roi: Rect, max_ring_diff: ?f64, out: []u8, mask: []u8) Recovered {
+pub fn recoverFrame(frames: []const Image, track: Track, target: usize, roi: Rect, max_ring_diff: ?f64, out: []u8, prov: []Provenance) Recovered {
     const t = frames[target];
     const w = t.width;
     const h = t.height;
     @memcpy(out, t.rgb);
-    @memset(mask, 1);
-    var got: usize = 0;
+    @memset(prov, .original);
+    var tally: Recovered = .{};
 
     // 使ってよいフレーム: 鎖がつながっていて、ROI の周りの帯が表示中のフレームと合うもの
     std.debug.assert(frames.len <= max_window_frames);
@@ -260,7 +254,7 @@ pub fn recoverFrame(frames: []const Image, track: Track, target: usize, roi: Rec
     }
     for (roi.y..roi.y + roi.h) |y| {
         for (roi.x..roi.x + roi.w) |x| {
-            mask[y * w + x] = 0;
+            prov[y * w + x] = .unrecovered;
             var dist: usize = 1;
             search: while (dist < frames.len) : (dist += 1) {
                 for ([_]i64{ -1, 1 }) |sign| {
@@ -277,14 +271,15 @@ pub fn recoverFrame(frames: []const Image, track: Track, target: usize, roi: Rec
                     if (ux >= roi.x and ux < roi.x + roi.w and uy >= roi.y and uy < roi.y + roi.h) continue;
                     const src = (uy * w + ux) * 3;
                     @memcpy(out[(y * w + x) * 3 ..][0..3], frames[s].rgb[src..][0..3]);
-                    mask[y * w + x] = 1;
-                    got += 1;
+                    prov[y * w + x] = .temporal_real;
                     break :search;
                 }
             }
+            tally.add(prov[y * w + x]);
         }
     }
-    return .{ .recovered = got, .pixels = @as(usize, roi.w) * roi.h };
+    // ROI の外は数えない（Tally.roiPixels は ROI の中だけ）
+    return tally;
 }
 
 /// 窓の最大フレーム数（前後 255 枚まで）
@@ -334,13 +329,13 @@ fn ringDiff(t: Image, s: Image, roi: Rect, dx: i32, dy: i32) ?f64 {
 
 /// 手元にある連続したフレーム列から、`target` を戻す（移動の推定・鎖・復元をまとめて行う）。
 /// GUI のように窓を丸ごと持っている呼び出し側用。CLI（restore_cmd.zig）は流しながら同じ部品を使う
-pub fn recoverInWindow(gpa: Allocator, frames: []const Image, target: usize, roi: Rect, min_peak: f64, max_ring_diff: ?f64, out: []u8, mask: []u8) !Recovered {
+pub fn recoverInWindow(gpa: Allocator, frames: []const Image, target: usize, roi: Rect, min_peak: f64, max_ring_diff: ?f64, out: []u8, prov: []Provenance) !Recovered {
     const shifts = try gpa.alloc(Shift, frames.len - 1);
     defer gpa.free(shifts);
     for (shifts, 0..) |*s, i| s.* = try estimateShift(gpa, frames[i], frames[i + 1], roi);
     const track = try Track.build(gpa, shifts, min_peak);
     defer track.deinit(gpa);
-    return recoverFrame(frames, track, target, roi, max_ring_diff, out, mask);
+    return recoverFrame(frames, track, target, roi, max_ring_diff, out, prov);
 }
 
 // ---- tests -------------------------------------------------------------------
@@ -470,50 +465,56 @@ test "temporal: recoverFrame restores the exact background under a pan, refuses 
 
     const out = try gpa.alloc(u8, w * h * 3);
     defer gpa.free(out);
-    const mask = try gpa.alloc(u8, w * h);
-    defer gpa.free(mask);
+    const prov = try gpa.alloc(Provenance, w * h);
+    defer gpa.free(prov);
     const truth = try view(gpa, s, sw, 200 - 6 * 4, 60, w, h);
     defer gpa.free(truth);
 
     // 中央のフレームは前後 4 フレームずつ（±24 px）使える。ROI の幅 30 のうち、左右どちらかに出る画素だけ戻る
-    const r = recoverFrame(&frames, track, 4, roi, null, out, mask);
-    try std.testing.expectEqual(@as(usize, 30 * 16), r.pixels);
+    const r = recoverFrame(&frames, track, 4, roi, null, out, prov);
+    try std.testing.expectEqual(@as(usize, 30 * 16), r.roiPixels());
+    // ROI の外は original（入力のまま）
+    try std.testing.expectEqual(Provenance.original, prov[0]);
+    try std.testing.expectEqual(@as(usize, w * h - 30 * 16), std.mem.count(Provenance, prov, &.{.original}));
     for (roi.y..roi.y + roi.h) |y| for (roi.x..roi.x + roi.w) |x| {
         const i = y * w + x;
-        if (mask[i] == 1) {
+        if (prov[i] == .temporal_real) {
             // 戻したと言った画素は、正解と完全に一致する
             try std.testing.expectEqualSlices(u8, truth[i * 3 ..][0..3], out[i * 3 ..][0..3]);
         } else {
-            // 戻せなかった画素は焼かれたまま残す
+            // 戻せなかった画素は unrecovered で、焼かれたまま残す
+            try std.testing.expectEqual(Provenance.unrecovered, prov[i]);
             try std.testing.expectEqualSlices(u8, &.{ 255, 0, 255 }, out[i * 3 ..][0..3]);
         }
     };
     // 右へ 24 px 動いたフレームで x+24 >= 70 なら ROI の外 → x >= 46。左へ 24 px なら x-24 < 40 → x < 64。
     // よって全列が戻る
-    try std.testing.expectEqual(r.pixels, r.recovered);
+    try std.testing.expectEqual(r.roiPixels(), r.recovered());
+    try std.testing.expectEqual(@as(usize, 0), r.counts.get(.unrecovered));
 
     // 推定した移動量が間違っている（実際は +6、推定は +9）と、帯の確認をしなければ間違った画素を貼る。
     // 帯の確認をすれば、帯が合わないので借りない
     for (&shifts) |*sh| sh.* = .{ .dx = 9, .dy = 0, .peak = 1 };
     const wrong = try Track.build(gpa, &shifts, 0.1);
     defer wrong.deinit(gpa);
-    const r_wrong = recoverFrame(&frames, wrong, 4, roi, null, out, mask);
-    try std.testing.expect(r_wrong.recovered > 0);
+    const r_wrong = recoverFrame(&frames, wrong, 4, roi, null, out, prov);
+    try std.testing.expect(r_wrong.recovered() > 0);
     var mismatched: usize = 0;
     for (roi.y..roi.y + roi.h) |y| for (roi.x..roi.x + roi.w) |x| {
         const i = y * w + x;
-        if (mask[i] == 1 and !std.mem.eql(u8, truth[i * 3 ..][0..3], out[i * 3 ..][0..3])) mismatched += 1;
+        if (prov[i] == .temporal_real and !std.mem.eql(u8, truth[i * 3 ..][0..3], out[i * 3 ..][0..3])) mismatched += 1;
     };
     try std.testing.expect(mismatched > 0);
-    const r_checked = recoverFrame(&frames, wrong, 4, roi, 6, out, mask);
-    try std.testing.expectEqual(@as(usize, 0), r_checked.recovered);
+    const r_checked = recoverFrame(&frames, wrong, 4, roi, 6, out, prov);
+    try std.testing.expectEqual(@as(usize, 0), r_checked.recovered());
+    try std.testing.expectEqual(r_checked.roiPixels(), r_checked.counts.get(.unrecovered));
     // 正しい移動量なら、帯の確認をしても全部戻る
-    try std.testing.expectEqual(r.pixels, recoverFrame(&frames, track, 4, roi, 6, out, mask).recovered);
+    try std.testing.expectEqual(r.roiPixels(), recoverFrame(&frames, track, 4, roi, 6, out, prov).recovered());
 
     // 動いていなければ何も戻らない（同じ場所が隠れたまま）
     for (&shifts) |*sh| sh.* = .{ .dx = 0, .dy = 0, .peak = 1 };
     const still = try Track.build(gpa, &shifts, 0.1);
     defer still.deinit(gpa);
-    const r0 = recoverFrame(&frames, still, 4, roi, null, out, mask);
-    try std.testing.expectEqual(@as(usize, 0), r0.recovered);
+    const r0 = recoverFrame(&frames, still, 4, roi, null, out, prov);
+    try std.testing.expectEqual(@as(usize, 0), r0.recovered());
 }
