@@ -1,0 +1,21 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # Zig の版は build.zig.zon の minimum_zig_version から読む（mlugg/setup-zig の既定動作）
+      - uses: mlugg/setup-zig@v2
+
+      # 何を回すかは build.zig の check ステップが持つ（.claude/skills/verify/SKILL.md）
+      - run: zig build check --summary all
