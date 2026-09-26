@@ -12,6 +12,9 @@
 //!   roi_fixture check-restore <name> <restore.json> <compare.json> <conditions>
 //!                     復元の結果を条件で判定する。conditions は "coverage>=0.99,ssim>=0.9" のような並び。
 //!                     キーは restore.json と compare.json のどちらかにある数値。入れ子は "provenance.unrecovered.fraction"
+//!   roi_fixture check-audio <input> <output>
+//!                     2 つの動画の音声（最良の音声ストリーム）のパケットが、数も中身（バイト列）もすべて同じか
+//!                     （restore --out が音声を再符号化せずに写したか）
 //!   roi_fixture crossmetrics <compare.jsonl> <ffmpeg-ssim.log> <ffmpeg-psnr.log>
 //!                     `vrestore compare --per-frame` の値が FFmpeg の ssim / psnr フィルタと一致するかを見る
 //!
@@ -127,6 +130,11 @@ pub fn main(init: std.process.Init) !u8 {
     }
     if (args.len == 6 and std.mem.eql(u8, args[1], "check-restore")) {
         const code = try checkRestore(arena, io, &out.interface, args[2], args[3], args[4], args[5]);
+        if (code != 0) try err.interface.writeAll(out.interface.buffered());
+        return code;
+    }
+    if (args.len == 4 and std.mem.eql(u8, args[1], "check-audio")) {
+        const code = try checkAudio(arena, &out.interface, args[2], args[3]);
         if (code != 0) try err.interface.writeAll(out.interface.buffered());
         return code;
     }
@@ -495,6 +503,45 @@ fn checkRestore(arena: std.mem.Allocator, io: Io, out: *Io.Writer, name: []const
     const line = try arena.dupe(u8, out.buffered());
     out.end = 0;
     try out.print("{s} {s}", .{ if (ok) "PASS" else "FAIL", line });
+    return if (ok) 0 else 1;
+}
+
+/// 1 行で結果を出す: <PASS|FAIL> audio packets=<入力> / <出力> bytes=<入力> / <出力> first_mismatch=<n|none>
+fn checkAudio(arena: std.mem.Allocator, out: *Io.Writer, a_path: []const u8, b_path: []const u8) !u8 {
+    const c = video.c;
+    var pkts: [2]std.ArrayList([]const u8) = .{ .empty, .empty };
+    for ([_][]const u8{ a_path, b_path }, &pkts) |p, *list| {
+        var ic: ?*c.AVFormatContext = null;
+        if (c.avformat_open_input(&ic, (try arena.dupeZ(u8, p)).ptr, null, null) < 0) return error.OpenFailed;
+        defer c.avformat_close_input(&ic);
+        if (c.avformat_find_stream_info(ic, null) < 0) return error.OpenFailed;
+        const idx = c.av_find_best_stream(ic, c.AVMEDIA_TYPE_AUDIO, -1, -1, null, 0);
+        if (idx < 0) continue; // 音声なし: 0 パケット
+        const pkt = c.av_packet_alloc() orelse return error.OutOfMemory;
+        defer {
+            var pp: ?*c.AVPacket = pkt;
+            c.av_packet_free(&pp);
+        }
+        while (c.av_read_frame(ic, pkt) >= 0) {
+            defer c.av_packet_unref(pkt);
+            if (pkt.*.stream_index != idx) continue;
+            try list.append(arena, try arena.dupe(u8, pkt.*.data[0..@intCast(pkt.*.size)]));
+        }
+    }
+    var bytes = [2]usize{ 0, 0 };
+    for (pkts, &bytes) |l, *n| for (l.items) |d| {
+        n.* += d.len;
+    };
+    var mismatch: ?usize = null;
+    for (0..@max(pkts[0].items.len, pkts[1].items.len)) |i| {
+        if (i >= pkts[0].items.len or i >= pkts[1].items.len or !std.mem.eql(u8, pkts[0].items[i], pkts[1].items[i])) {
+            mismatch = i;
+            break;
+        }
+    }
+    const ok = mismatch == null and pkts[0].items.len > 0;
+    try out.print("{s} audio packets={d} / {d} bytes={d} / {d} first_mismatch=", .{ if (ok) "PASS" else "FAIL", pkts[0].items.len, pkts[1].items.len, bytes[0], bytes[1] });
+    if (mismatch) |m| try out.print("{d}\n", .{m}) else try out.writeAll("none\n");
     return if (ok) 0 else 1;
 }
 
