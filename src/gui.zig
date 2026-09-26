@@ -151,9 +151,6 @@ const usage =
     \\
 ;
 
-/// 下端の帯（検出の得票率の棒）の高さ。時刻の移動は操作パネルのシークバーで行う
-const bar_h = 14;
-
 const App = struct {
     gpa: std.mem.Allocator,
     path: [:0]const u8,
@@ -471,7 +468,7 @@ pub fn main(init: std.process.Init) !u8 {
         100,
         100,
         @intFromFloat(@as(f64, @floatFromInt(dec.info.width)) * scale0),
-        @as(c_int, @intFromFloat(@as(f64, @floatFromInt(dec.info.height)) * scale0)) + bar_h,
+        @as(c_int, @intFromFloat(@as(f64, @floatFromInt(dec.info.height)) * scale0)),
         sdl.SDL_WINDOW_RESIZABLE,
     ) orelse {
         try err.interface.print("vrestore-gui: could not open a window: {s}\n", .{sdl.SDL_GetError()});
@@ -679,19 +676,12 @@ pub fn main(init: std.process.Init) !u8 {
     return 0;
 }
 
-fn windowWidth(ren: *sdl.SDL_Renderer) f32 {
-    var w: c_int = 0;
-    var h: c_int = 0;
-    _ = sdl.SDL_GetRendererOutputSize(ren, &w, &h);
-    return @floatFromInt(w);
-}
-
-/// 帯を除いた領域にフレームを置いたときの View
+/// 窓全体にフレームを置いたときの View
 fn viewOf(ren: *sdl.SDL_Renderer, app: *const App) state.View {
     var w: c_int = 0;
     var h: c_int = 0;
     _ = sdl.SDL_GetRendererOutputSize(ren, &w, &h);
-    return state.View.fit(app.dec.info.width, app.dec.info.height, @intCast(@max(1, w)), @intCast(@max(1, h - bar_h)));
+    return state.View.fit(app.dec.info.width, app.dec.info.height, @intCast(@max(1, w)), @intCast(@max(1, h)));
 }
 
 fn render(app: *App, win: *sdl.SDL_Window, ren: *sdl.SDL_Renderer, tex: *sdl.SDL_Texture) void {
@@ -712,7 +702,6 @@ fn saveScreenshot(arena: std.mem.Allocator, io: Io, ren: *sdl.SDL_Renderer, path
 
 fn draw(app: *App, win: *sdl.SDL_Window, ren: *sdl.SDL_Renderer, tex: *sdl.SDL_Texture) void {
     const v = viewOf(ren, app);
-    const ww = windowWidth(ren);
     _ = sdl.SDL_UpdateTexture(tex, null, app.pixels().ptr, @intCast(app.dec.info.width * 3));
     _ = sdl.SDL_SetRenderDrawColor(ren, 24, 24, 24, 255);
     _ = sdl.SDL_RenderClear(ren);
@@ -722,16 +711,6 @@ fn draw(app: *App, win: *sdl.SDL_Window, ren: *sdl.SDL_Renderer, tex: *sdl.SDL_T
     // 検出の枠は選択の枠の 1 段外側に描く。同じ位置に当たっても両方見える
     if (app.selection.dragging() orelse app.selection.rect) |r| drawRect(ren, v, r, .{ 0, 220, 255 }, 1);
     if (app.detection) |d| drawRect(ren, v, .{ .x = @intCast(d.x), .y = @intCast(d.y), .w = @intCast(d.width), .h = @intCast(d.height) }, if (d.reliable) .{ 255, 32, 32 } else .{ 255, 210, 0 }, 3);
-
-    // 下端の帯: 検出の得票率の棒（reliable なら赤、そうでなければ黄。閾値の位置に白い目盛り）
-    const by = v.y + v.h;
-    fill(ren, .{ .x = 0, .y = by, .w = ww, .h = bar_h }, .{ 48, 48, 48 });
-    if (app.detection) |d| {
-        const col: [3]u8 = if (d.reliable) .{ 255, 32, 32 } else .{ 255, 210, 0 };
-        fill(ren, .{ .x = 0, .y = by + 2, .w = ww * @as(f32, @floatCast(d.confidence)), .h = bar_h - 4 }, col);
-        const tick = ww * @as(f32, @floatCast(detect_roi.default_thresholds.min_confidence));
-        fill(ren, .{ .x = tick - 1, .y = by, .w = 2, .h = bar_h }, .{ 255, 255, 255 });
-    }
 
     if (ps.panelVisible(app.panel, app.selection.anchor != null)) drawPanel(app, ren, areaOf(v));
 
