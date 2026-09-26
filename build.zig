@@ -324,7 +324,7 @@ const RestoreCase = struct {
 
 const restore_cases = [_]RestoreCase{
     // 実測（crf 23）: coverage 1.000、SSIM 0.947（再エンコードだけの上限 0.948）、戻した画素の PSNR 38.2
-    .{ .roi = .{ .spec = "name=restore-pan15,bg=pan,pan_x=15,pan_y=0,x=240,y=150,frames=60", .crf = 23 }, .expect = "coverage>=0.99,ssim>=0.9,masked_psnr>=35" },
+    .{ .roi = .{ .spec = "name=restore-pan15,bg=pan,pan_x=15,pan_y=0,x=240,y=150,frames=60", .crf = 23 }, .expect = "coverage>=0.99,ssim>=0.9,masked_psnr>=35,provenance.temporal_real.fraction>=0.99" },
     // 実測: coverage 0.988、SSIM 0.926、戻した画素の PSNR 37.5
     .{ .roi = .{ .spec = "name=restore-pan7,bg=pan,pan_x=7,pan_y=3,x=240,y=150,frames=60", .crf = 23 }, .expect = "coverage>=0.95,ssim>=0.88,masked_psnr>=34" },
     // 遅いパン × 強い圧縮。全帯域の位相相関だと x264 のブロックの格子が (0,0) のピークを作り、動いていないと
@@ -334,7 +334,8 @@ const restore_cases = [_]RestoreCase{
     // ROI の周りの帯が合わないフレームからは借りないので、戻した画素のほとんどは正しいこと
     .{ .roi = .{ .spec = "name=restore-zoom,bg=zoom,x=240,y=150,frames=60", .crf = 23 }, .expect = "masked_bad_fraction<=0.02" },
     // 毎フレーム別の模様: 動きで説明できないので、1 画素も貼らない
-    .{ .roi = .{ .spec = "name=restore-cut,bg=cut,x=240,y=150,frames=60", .crf = 23 }, .expect = "coverage<=0" },
+    // 由来はすべて unrecovered（戻さなかった画素を戻したと数えない）
+    .{ .roi = .{ .spec = "name=restore-cut,bg=cut,x=240,y=150,frames=60", .crf = 23 }, .expect = "coverage<=0,provenance.unrecovered.fraction>=1" },
     // 動かない背景: 隠れた画素はどのフレームにも写っていないので、1 画素も戻らない
     .{ .roi = .{ .spec = "name=restore-flat,bg=flat,x=240,y=150,frames=60", .crf = 23 }, .expect = "coverage<=0" },
 };
@@ -372,8 +373,8 @@ fn restoreCase(b: *std.Build, tool: *std.Build.Step.Compile, exe: *std.Build.Ste
     restore.addFileArg(roi_json);
     restore.addArg("--raw");
     const out_rgb = restore.addOutputFileArg("restored.rgb");
-    restore.addArg("--mask");
-    const mask = restore.addOutputFileArg("mask.gray");
+    restore.addArg("--provenance");
+    const prov = restore.addOutputFileArg("provenance.bin");
     restore.addFileArg(v.mp4);
     const restore_json = restore.captureStdOut(.{});
     const restored_mkv = rawToFfv1(b, b.fmt("{s} encode restored", .{name}), out_rgb, "restored.mkv");
@@ -382,8 +383,8 @@ fn restoreCase(b: *std.Build, tool: *std.Build.Step.Compile, exe: *std.Build.Ste
     cmp.setName(b.fmt("{s} compare", .{name}));
     cmp.addArgs(&.{ "compare", "--roi" });
     cmp.addFileArg(roi_json);
-    cmp.addArg("--mask");
-    cmp.addFileArg(mask);
+    cmp.addArg("--provenance");
+    cmp.addFileArg(prov);
     cmp.addFileArg(clean_mkv);
     cmp.addFileArg(restored_mkv);
     const cmp_json = cmp.captureStdOut(.{});
