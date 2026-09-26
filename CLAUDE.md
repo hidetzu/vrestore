@@ -38,7 +38,7 @@ README・CI・ここにコマンドを写さない。
 - コンテナ・コーデックを自前で書かない。FFmpeg に任せる（[ADR 0001](docs/adr/0001-zig-for-control-and-image-processing-ffmpeg-for-codecs.md)）
 - GUI は SDL2 の別の実行ファイル `vrestore-gui`（[ADR 0004](docs/adr/0004-the-gui-is-a-separate-sdl2-executable-that-only-calls-the-detector.md)）。
   検出のロジックを GUI に書かない
-- 理由なしに入れないもの: 別の GUI フレームワーク、FFmpeg と SDL2 以外の実行時依存、2 つ目のビルドシステム、
+- 理由なしに入れないもの: 別の GUI フレームワーク、FFmpeg・SDL2・SDL2_ttf（`vrestore-gui` の文字、ADR 0009）以外の実行時依存、2 つ目のビルドシステム、
   シングルスレッド版が動く前のスレッド化、SIMD / GPU 最適化。入れるときは ADR を先に書く
 
 ## 4. 手元の素材

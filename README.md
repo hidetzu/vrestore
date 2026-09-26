@@ -42,16 +42,20 @@ vrestore detect-roi --ref watermark.png --debug-dir debug input.mp4
 
 Zig（版は [`build.zig.zon`](build.zig.zon) の `minimum_zig_version`）と FFmpeg が必要です。
 FFmpeg は `ffmpeg` コマンドと、pkg-config で見つかる開発用ライブラリ（libavformat / libavcodec / libswscale / libavutil）を使います。
-`vrestore-gui` には SDL2（pkg-config の `sdl2`）も要ります。
+`vrestore-gui` には SDL2（pkg-config の `sdl2`）と SDL2_ttf（Homebrew の `sdl2_ttf`、Ubuntu の `libsdl2-ttf-dev`）も要ります。
+パネルの文字はシステムのフォントで描きます（`--font` で指定、見つからなければ数字だけの内蔵フォント）。
 
 ```sh
 zig build gui        # zig-out/bin/vrestore-gui
 zig-out/bin/vrestore-gui input.mp4
 ```
 
-操作: ドラッグで範囲を選ぶ / Enter で検出 / R で表示中のフレームを復元 / Space で処理前・処理後（戻せなかった画素はマゼンタ）/
-P で各画素の由来を色で重ねる / M で動きのモデル（affine / translation）を切り替える / F で戻せなかった画素を周囲から埋めるか切り替える /
-← → で 1 フレーム（Shift で 1 秒、↑ ↓ で 10 秒）/ 下の帯のクリックで移動 / Esc で消す / Q で終了
+操作:
+- 再生: Space で再生 / 一時停止。映像の上の操作パネル（10 秒戻る・▶・10 秒進む、シークバー、時刻とフレーム番号）はドラッグで動かせる。H で隠す
+- 場面の共有: C で `A.mp4 t=1234.501 frame=36998` のような 1 行をクリップボードにコピー。`--frame 36998` / `--at 1234.501` で同じ場面を開ける
+- 移動: ← → で 1 フレーム（Shift で 1 秒、↑ ↓ で 10 秒）、操作パネルのシークバー
+- 検出と復元: ドラッグで範囲を選ぶ / Enter で検出 / R で表示中のフレームを復元 / B で処理前・処理後（戻せなかった画素はマゼンタ）/
+  P で各画素の由来を色で重ねる / M で動きのモデル（affine / translation）/ F で戻せなかった画素を周囲から埋めるか / Esc で消す / Q で終了
 
 ```sh
 zig build            # zig-out/bin/vrestore
