@@ -331,15 +331,16 @@ const App = struct {
 
     /// 選択範囲を参照画像にして検出する。Enter と --detect-and-exit はどちらもここを通る
     /// 復元の後、戻せなかった画素のうち埋めるものを絞るマスク。使うなら、必要になった時に一度だけ推定する
-    fn hiddenMask(app: *App, area: temporal.Rect) !?[]const bool {
+    fn hiddenMask(app: *App, roi_rect: temporal.Rect) !?restore_cmd.Hidden {
         if (app.mask_mode == .none) return null;
+        const area = restore_cmd.maskArea(app.mask_mode, roi_rect, app.dec.info.width, app.dec.info.height);
         if (app.mask == null) {
             var d = try video.Decoder.open(app.path);
             defer d.close();
             app.mask = try restore_cmd.estimateMask(app.gpa, &d, area);
         }
         const m = app.mask.?;
-        return if (m.accepted) m.hidden else null;
+        return if (m.accepted) .{ .mask = m.hidden, .area = area } else null;
     }
 
     fn clearMask(app: *App) void {
