@@ -207,6 +207,7 @@ test {
     _ = detect_roi;
     _ = compare;
     _ = @import("metrics.zig");
+    _ = @import("gui_state.zig");
 }
 
 test "parseArgs: no arguments shows help" {

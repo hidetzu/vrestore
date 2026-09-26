@@ -15,11 +15,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      # ffmpeg コマンドはテスト用動画の合成に、lib*-dev はリンクに使う
+      # ffmpeg コマンドはテスト用動画の合成に、lib*-dev はリンクに使う（libsdl2-dev は vrestore-gui）
       - run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ffmpeg pkg-config \
-            libavformat-dev libavcodec-dev libswscale-dev libavutil-dev
+            libavformat-dev libavcodec-dev libswscale-dev libavutil-dev libsdl2-dev
           ffmpeg -version | head -1
 
       # Zig の版は build.zig.zon の minimum_zig_version から読む（mlugg/setup-zig の既定動作）

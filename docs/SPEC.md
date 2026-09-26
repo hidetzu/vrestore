@@ -15,7 +15,7 @@
 |---|---|---|
 | CLI | `vrestore --version` が `build.zig.zon` の版を `vrestore <version>` と表示し、終了コード 0 で終わる | `build.zig` の `cli_version`（`zig build test` で実行ファイルを起動して stdout と終了コードを照合） |
 | CLI | 知らない引数にはその引数名と使い方を stderr に出し、終了コード 2 で終わる | `build.zig` の `cli_unknown`（stderr に引数名入りのエラー文が含まれることと終了コードを照合） |
-| 動画 | 動画を開き、幅・高さ・尺・コーデック名を返す。尺が取れない入力では尺を返さない | `src/video.zig` の test `"video: open reports size, duration and codec"` |
+| 動画 | 動画を開き、幅・高さ・尺・平均フレームレート・コーデック名を返す。尺が取れない入力では尺を返さない | `src/video.zig` の test `"video: open reports size, duration, frame rate and codec"` |
 | 動画 | 先頭から全フレームを順に RGB24 でデコードし、終端を報告する | test `"video: next decodes every frame in order, then reports the end"` |
 | 動画 | 指定時刻以降の最初のフレームへ seek する（キーフレームでない位置、後ろから前への seek を含む） | test `"video: seek lands on the exact frame, including non-keyframes"` |
 | 動画 | 尺全体から等間隔に N 枚取り出す | test `"video: sampleFrames spreads over the whole duration"` |
@@ -35,6 +35,11 @@
 | 指標 | 矩形の中で、R/G/B ごとの MSE と SSIM（x264 / FFmpeg vf_ssim と同じ 8x8 窓・4px 刻み）を出す。同じ画像なら SSIM 1・MSE 0、矩形の外は数えない | `src/metrics.zig` の test `"metrics: identical images score SSIM 1 and MSE 0"`、`"metrics: only pixels inside the rect count"`、`"metrics: MSE and PSNR of a uniform offset"` |
 | 指標（外部照合） | `vrestore compare --per-frame` の SSIM（R/G/B/全体）と MSE（R/G/B/平均）が、FFmpeg の `ssim` / `psnr` フィルタとフレームごとに一致する（SSIM は差 2e-6 以内、MSE は 0.006 以内。FFmpeg の出力桁の丸め分）。素材は RGB の可逆（ffv1 gbrp）なので、色変換の違いはこの照合に含まれない | `zig build metrics` の `metrics crosscheck` |
 | CLI | `vrestore compare [--rect x,y,w,h] [--per-frame] <reference> <test>` が、フレーム数と大きさが同じ 2 本を先頭から順に比べ、SSIM の平均と最小・MSE の平均・PSNR（平均 MSE から）を JSON 1 行で出す。フレーム数が違えばエラー | `src/compare.zig` の test `"compare: parseRect"`、`zig build metrics`（出力の値）。フレーム数違いのエラーは手で確かめただけ |
+| GUI | フレームを窓にアスペクト比を保って置き（レターボックス）、画面座標とフレームの画素座標を相互に変換する。余白は端に寄せる | `src/gui_state.zig` の test `"gui: fit letterboxes a wide frame into a tall window, and maps back"`、`"gui: toScreen is the inverse of toFrame for the corners of a rect"` |
+| GUI | ドラッグの向きによらず同じ矩形を選ぶ。クリックだけ（大きさ 0）は前の選択を消さない | test `"gui: selection works in any drag direction and ignores a plain click"` |
+| GUI | タイムラインの横位置から時刻を出す（端に寄せる）。選択範囲を表示中のフレームから切り出して参照画像にする | test `"gui: timeline maps position to time and clamps"`、`"gui: crop cuts the selected pixels"` |
+| GUI（E2E） | `vrestore-gui` が動画を開いて指定時刻のフレームを出し、選択範囲から CLI と同じ検出（`detect_roi.detectInVideo`）を回して、既知の位置を `dx=0, dy=0, reliable=true` で返す。SDL のダミー描画で窓を開かずに回す | `zig build gui` の `roi check gui` |
+| GUI | マウスのドラッグ・キー操作・タイムラインのクリック | ⚠ 自動の検査は無い（[ADR 0004](adr/0004-the-gui-is-a-separate-sdl2-executable-that-only-calls-the-detector.md) の帰結） |
 | リポジトリ衛生 | 動画・巨大ファイルが git の管理下に無い | `scripts/check-no-media.sh` |
 
 ## 2. ROI 検出の契約

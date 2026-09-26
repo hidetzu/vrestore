@@ -138,6 +138,43 @@ pub fn build(b: *std.Build) void {
     const e2e_step = b.step("e2e", "ROI detection on synthetic videos, checked against the known position");
     for (roi_cases) |c| e2e_step.dependOn(roiCase(b, tool, exe, c));
 
+    // ---- GUI（vrestore-gui）--------------------------------------------------
+    // SDL2 が要るので本体とは別の実行ファイルにして、既定の install には入れない（docs/adr/0004）
+    const gui_mod = b.createModule(.{
+        .root_source_file = b.path("src/gui.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    linkFfmpeg(gui_mod);
+    gui_mod.linkSystemLibrary("sdl2", .{ .use_pkg_config = .force });
+    const gui = b.addExecutable(.{ .name = "vrestore-gui", .root_module = gui_mod });
+    const gui_step = b.step("gui", "Build and install vrestore-gui (needs SDL2)");
+    gui_step.dependOn(&b.addInstallArtifact(gui, .{}).step);
+
+    const run_gui = b.addRunArtifact(gui);
+    if (b.args) |args| run_gui.addArgs(args);
+    b.step("run-gui", "Run vrestore-gui").dependOn(&run_gui.step);
+
+    // 画面なし（SDL のダミー描画）で、選択 → 検出の経路を Enter と同じ関数で回し、正解と照合する。
+    // 位置は正の座標で置き、参照 = ウォーターマーク 146x56（12 文字 x 3 行）+ 余白 6px を --select に渡す。
+    // 数字がずれれば roi check が FAIL するので、黙って通ることは無い
+    const gui_case = synthCase(b, tool, .{ .spec = "name=gui,bg=pan,x=40,y=30", .crf = 23 });
+    const gui_e2e = b.addRunArtifact(gui);
+    gui_e2e.setName("gui detect-and-exit");
+    gui_e2e.setEnvironmentVariable("SDL_VIDEODRIVER", "dummy");
+    gui_e2e.addArgs(&.{ "--at", "0", "--select", "34,24,158,68", "--detect-and-exit" });
+    gui_e2e.addFileArg(gui_case.mp4);
+    const gui_det = gui_e2e.captureStdOut(.{});
+    gui_e2e.expectExitCode(0);
+    const gui_chk = b.addRunArtifact(tool);
+    gui_chk.setName("roi check gui");
+    gui_chk.addArg("check");
+    gui_chk.addFileArg(gui_case.truth);
+    gui_chk.addFileArg(gui_det);
+    gui_chk.expectExitCode(0);
+    gui_step.dependOn(&gui_chk.step);
+
     // ---- 復元の指標を FFmpeg と突き合わせる ----------------------------------
     // SSIM / PSNR を自前の実装とだけ比べても何も示さないので、FFmpeg の ssim / psnr フィルタと
     // フレームごとに比べる（src/metrics.zig）。色変換の差を持ち込まないよう、素材は RGB のまま可逆で持つ
@@ -154,11 +191,12 @@ pub fn build(b: *std.Build) void {
     // git の状態を見るので、毎回実行する（キャッシュさせない）
     no_media.has_side_effects = true;
 
-    const check_step = b.step("check", "fmt --check, test, e2e, metrics, no-media, build");
+    const check_step = b.step("check", "fmt --check, test, e2e, metrics, gui, no-media, build");
     check_step.dependOn(&fmt.step);
     check_step.dependOn(test_step);
     check_step.dependOn(e2e_step);
     check_step.dependOn(metrics_step);
+    check_step.dependOn(gui_step);
     check_step.dependOn(&no_media.step);
     check_step.dependOn(b.getInstallStep());
 }
@@ -251,7 +289,10 @@ const roi_cases = [_]RoiCase{
     .{ .spec = "name=absent,bg=pan,opacity=0,expect=reject", .crf = 23 },
 };
 
-fn roiCase(b: *std.Build, tool: *std.Build.Step.Compile, exe: *std.Build.Step.Compile, c: RoiCase) *std.Build.Step {
+const SynthVideo = struct { truth: std.Build.LazyPath, mp4: std.Build.LazyPath };
+
+/// tools/roi_fixture で合成し、ffmpeg で yuv420p にエンコードする
+fn synthCase(b: *std.Build, tool: *std.Build.Step.Compile, c: RoiCase) SynthVideo {
     const spec = b.fmt("{s},crf={d}", .{ c.spec, c.crf });
     const name = spec[5..std.mem.indexOfScalar(u8, spec, ',').?];
 
@@ -269,7 +310,14 @@ fn roiCase(b: *std.Build, tool: *std.Build.Step.Compile, exe: *std.Build.Step.Co
     enc.setName(b.fmt("roi encode {s}", .{name}));
     enc.addFileArg(rgb);
     enc.addArgs(&.{ "-c:v", "libx264", "-preset", "veryfast", "-crf", b.fmt("{d}", .{c.crf}), "-pix_fmt", "yuv420p" });
-    const mp4 = enc.addOutputFileArg("case.mp4");
+    return .{ .truth = truth, .mp4 = enc.addOutputFileArg("case.mp4") };
+}
+
+fn roiCase(b: *std.Build, tool: *std.Build.Step.Compile, exe: *std.Build.Step.Compile, c: RoiCase) *std.Build.Step {
+    const name = c.spec[5..std.mem.indexOfScalar(u8, c.spec, ',').?];
+    const v = synthCase(b, tool, c);
+    const truth = v.truth;
+    const mp4 = v.mp4;
 
     const cut = b.addRunArtifact(tool);
     cut.setName(b.fmt("roi cutref {s}", .{name}));

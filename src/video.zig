@@ -50,6 +50,8 @@ pub const Info = struct {
     height: u32,
     /// コンテナから尺が取れないとき（fragmented MP4 など）は null
     duration_sec: ?f64,
+    /// 平均フレームレート。コンテナが持っていなければ null
+    frame_rate: ?f64,
     codec_name: []const u8,
 };
 
@@ -117,6 +119,10 @@ pub const Decoder = struct {
                 .width = @intCast(stream.codecpar.*.width),
                 .height = @intCast(stream.codecpar.*.height),
                 .duration_sec = duration_sec,
+                .frame_rate = if (stream.avg_frame_rate.num > 0 and stream.avg_frame_rate.den > 0)
+                    @as(f64, @floatFromInt(stream.avg_frame_rate.num)) / @as(f64, @floatFromInt(stream.avg_frame_rate.den))
+                else
+                    null,
                 .codec_name = std.mem.span(dec.?.name),
             },
         };
@@ -340,13 +346,14 @@ fn stepGray(k: usize) u8 {
     return @intCast(16 + 20 * k);
 }
 
-test "video: open reports size, duration and codec" {
+test "video: open reports size, duration, frame rate and codec" {
     var d = try Decoder.open(steps_mp4);
     defer d.close();
     try std.testing.expectEqual(@as(u32, 64), d.info.width);
     try std.testing.expectEqual(@as(u32, 48), d.info.height);
     try std.testing.expectApproxEqAbs(@as(f64, 1.0), d.info.duration_sec.?, 0.05);
     try std.testing.expectEqualStrings("h264", d.info.codec_name);
+    try std.testing.expectApproxEqAbs(@as(f64, 10), d.info.frame_rate.?, 1e-9);
 }
 
 test "video: next decodes every frame in order, then reports the end" {

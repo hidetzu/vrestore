@@ -40,35 +40,15 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
     };
     defer d.close();
 
-    if (ref.width > d.info.width or ref.height > d.info.height) {
-        try err.print("vrestore: the reference image ({d}x{d}) is larger than the video ({d}x{d}). Cut it from a frame of this video.\n", .{ ref.width, ref.height, d.info.width, d.info.height });
-        return 1;
-    }
-    if (ref.width < roi.min_template_side or ref.height < roi.min_template_side) {
-        try err.print("vrestore: the reference image ({d}x{d}) is too small; each side needs at least {d} px. Cut it larger, with some margin around the watermark.\n", .{ ref.width, ref.height, roi.min_template_side });
-        return 1;
-    }
-
-    const frames = video.sampleFrames(arena, &d, args.frames) catch |e| {
-        try err.print("vrestore: could not decode '{s}': {s}\n", .{ args.video, video.describe(e) });
+    const refimg: roi.Image = .{ .width = ref.width, .height = ref.height, .rgb = ref.rgb };
+    const result = detectInVideo(arena, gpa, &d, refimg, args.frames, args.thresholds) catch |e| {
+        try err.writeAll("vrestore: ");
+        try describeProblem(err, e, refimg, d.info);
+        try err.writeAll("\n");
         return 1;
     };
-    if (frames.len == 0) {
-        try err.print("vrestore: '{s}' has no decodable frame\n", .{args.video});
-        return 1;
-    }
-
-    const images = try arena.alloc(roi.Image, frames.len);
-    for (frames, images) |f, *img| img.* = .{ .width = f.width, .height = f.height, .rgb = f.rgb };
-    const det = roi.detect(gpa, images, .{ .width = ref.width, .height = ref.height, .rgb = ref.rgb }, args.thresholds) catch |e| switch (e) {
-        error.FlatTemplate => {
-            try err.print("vrestore: the reference image '{s}' has no edges to match (it is a flat color). Cut a region that contains the watermark.\n", .{args.reference});
-            return 1;
-        },
-        // 大きさは上で確かめているので、ここに来るのは内部の誤り
-        error.TemplateLargerThanImage, error.TemplateTooSmall, error.NoFrames => unreachable,
-        error.OutOfMemory => return error.OutOfMemory,
-    };
+    const det = result.detection;
+    const frames = result.frames;
 
     var json: Io.Writer.Allocating = .init(arena);
     try writeJson(&json.writer, det);
@@ -91,7 +71,51 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
     return 0;
 }
 
-fn explain(r: roi.Reason) []const u8 {
+pub const InVideoError = error{
+    ReferenceLargerThanVideo,
+    ReferenceTooSmall,
+    /// 参照画像に輪郭が無い
+    FlatReference,
+    NoDecodableFrame,
+} || video.Error;
+
+pub const InVideo = struct {
+    detection: roi.Detection,
+    /// 投票に使ったフレーム（`arena` の所有）。デバッグ画像は先頭を使う
+    frames: []video.Frame,
+};
+
+/// 動画 `d` から等間隔に `n` 枚取り出し、参照画像 `ref` の固定位置を探す。
+/// CLI（`run`）と GUI の共通の入口。GUI はここを呼ぶだけで、検出のロジックを持たない
+pub fn detectInVideo(arena: std.mem.Allocator, gpa: std.mem.Allocator, d: *video.Decoder, ref: roi.Image, n: usize, th: roi.Thresholds) InVideoError!InVideo {
+    if (ref.width > d.info.width or ref.height > d.info.height) return error.ReferenceLargerThanVideo;
+    if (ref.width < roi.min_template_side or ref.height < roi.min_template_side) return error.ReferenceTooSmall;
+
+    const frames = try video.sampleFrames(arena, d, n);
+    if (frames.len == 0) return error.NoDecodableFrame;
+    const images = try arena.alloc(roi.Image, frames.len);
+    for (frames, images) |f, *img| img.* = .{ .width = f.width, .height = f.height, .rgb = f.rgb };
+    const det = roi.detect(gpa, images, ref, th) catch |e| return switch (e) {
+        error.FlatTemplate => error.FlatReference,
+        // 大きさは上で確かめているので、ここに来るのは内部の誤り
+        error.TemplateLargerThanImage, error.TemplateTooSmall, error.NoFrames => unreachable,
+        error.OutOfMemory => error.OutOfMemory,
+    };
+    return .{ .detection = det, .frames = frames };
+}
+
+/// `detectInVideo` の失敗を、利用者が次に何をすればよいか分かる文にする
+pub fn describeProblem(w: *Io.Writer, e: InVideoError, ref: roi.Image, info: video.Info) Io.Writer.Error!void {
+    switch (e) {
+        error.ReferenceLargerThanVideo => try w.print("the reference ({d}x{d}) is larger than the video ({d}x{d}). Cut it from a frame of this video.", .{ ref.width, ref.height, info.width, info.height }),
+        error.ReferenceTooSmall => try w.print("the reference ({d}x{d}) is too small; each side needs at least {d} px. Cut it larger, with some margin around the watermark.", .{ ref.width, ref.height, roi.min_template_side }),
+        error.FlatReference => try w.writeAll("the reference has no edges to match (it is a flat color). Cut a region that contains the watermark."),
+        error.NoDecodableFrame => try w.writeAll("the video has no decodable frame"),
+        else => |ve| try w.print("could not decode the video: {s}", .{video.describe(@errorCast(ve))}),
+    }
+}
+
+pub fn explain(r: roi.Reason) []const u8 {
     return switch (r) {
         .low_confidence => "the frames disagree on the position (vote ratio below --min-confidence)",
         .low_margin => "another place matches almost as well (margin below --min-margin)",
