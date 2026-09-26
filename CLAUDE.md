@@ -32,7 +32,9 @@ README・CI・ここにコマンドを写さない。
 - **ROI 検出と背景復元を分ける**（[ADR 0002](docs/adr/0002-roi-detection-is-separate-from-background-recovery.md)）。
   復元アルゴリズムを変えても ROI 検出を触らない
 - コンテナ・コーデックを自前で書かない。FFmpeg に任せる（[ADR 0001](docs/adr/0001-zig-for-control-and-image-processing-ffmpeg-for-codecs.md)）
-- 理由なしに入れないもの: GUI フレームワーク、FFmpeg 以外の実行時依存、2 つ目のビルドシステム、
+- GUI は SDL2 の別の実行ファイル `vrestore-gui`（[ADR 0004](docs/adr/0004-the-gui-is-a-separate-sdl2-executable-that-only-calls-the-detector.md)）。
+  検出のロジックを GUI に書かない
+- 理由なしに入れないもの: 別の GUI フレームワーク、FFmpeg と SDL2 以外の実行時依存、2 つ目のビルドシステム、
   シングルスレッド版が動く前のスレッド化、SIMD / GPU 最適化。入れるときは ADR を先に書く
 
 ## 4. 手元の素材

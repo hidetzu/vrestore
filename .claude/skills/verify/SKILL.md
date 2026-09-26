@@ -14,6 +14,7 @@ description: vrestore の変更が壊れていないと言うために何を実�
 - ⚠ `zig version` がそれと一致することを最初に確かめる。Zig は版ごとに std が大きく変わる
 - FFmpeg: `ffmpeg` コマンド（テスト用動画の合成）と、pkg-config で見つかる libavformat / libavcodec /
   libswscale / libavutil（リンク）。CI で入れているものは `.github/workflows/ci.yml`
+- SDL2: pkg-config の `sdl2`（`vrestore-gui` だけが使う）
 
 ## fast
 
@@ -27,6 +28,7 @@ zig build check
 |---|---|
 | `zig fmt --check` | `build.zig` `build.zig.zon` `src/` の整形 |
 | `zig build test` | ユニットテスト（動画は ffmpeg で合成してから）と、実行ファイルを起動する `cli_*` |
+| `zig build gui` | `vrestore-gui` をビルドし、SDL のダミー描画で「フレーム表示 → 選択 → 検出」を回して正解と照合する（`roi check gui`） |
 | `zig build metrics` | `vrestore compare` の SSIM / MSE を FFmpeg の ssim / psnr フィルタとフレームごとに突き合わせる |
 | `zig build e2e` | ROI の合成 E2E。ケースは `build.zig` の `roi_cases`。1 ケース = 合成 → エンコード → 参照画像を切る → `detect-roi` → 正解と照合 |
 | `scripts/check-no-media.sh` | 動画・1 MiB 超のファイルが git の管理下（ステージ含む）に無いこと。件数を出す |
@@ -68,6 +70,14 @@ zig-out/bin/vrestore detect-roi --ref tmp/media/<参照画像>.png --debug-dir t
 
 ```sh
 scripts/roi-real.sh -j 6 tmp/media/<動画>     # 10 分前後。結果は tmp/out/real/
+```
+
+GUI のマウス・キー操作は自動の検査が無い。触ったら手で確かめる:
+
+```sh
+zig build gui && zig-out/bin/vrestore-gui tmp/media/<動画>
+# 画面を見ずに描画結果を確かめる（選択と検出の枠、タイムライン、得票率の棒）
+SDL_VIDEODRIVER=dummy zig-out/bin/vrestore-gui --select x,y,w,h --detect-and-exit --screenshot tmp/out/gui.png tmp/media/<動画>
 ```
 
 復元率の基準（焼き込んだまま / 再エンコードだけ / delogo）を実写で出す:
