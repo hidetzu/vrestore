@@ -177,6 +177,8 @@ fn parseRestore(args: []const []const u8) Command {
         } else if (std.mem.eql(u8, a, "--window")) {
             out.window = std.fmt.parseInt(usize, v, 10) catch 0;
             if (out.window == 0) return .{ .bad_arg = .{ .why = "--window needs a positive integer", .arg = v } };
+        } else if (std.mem.eql(u8, a, "--max-ring-diff")) {
+            out.max_ring_diff = if (std.mem.eql(u8, v, "off")) null else std.fmt.parseFloat(f64, v) catch return .{ .bad_arg = .{ .why = "--max-ring-diff needs a number or off", .arg = v } };
         } else if (std.mem.eql(u8, a, "--min-peak")) {
             out.min_peak = parseFraction(v) orelse return .{ .bad_arg = .{ .why = "--min-peak needs a number between 0 and 1", .arg = v } };
         } else {

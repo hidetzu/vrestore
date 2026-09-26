@@ -119,7 +119,7 @@ const App = struct {
         errdefer app.gpa.free(out);
         const mask = try app.gpa.alloc(u8, @as(usize, d.info.width) * d.info.height);
         errdefer app.gpa.free(mask);
-        app.recovered = try temporal.recoverInWindow(app.gpa, images, t, roi_rect, restore_cmd.default_min_peak, out, mask);
+        app.recovered = try temporal.recoverInWindow(app.gpa, images, t, roi_rect, restore_cmd.default_min_peak, restore_cmd.default_max_ring_diff, out, mask);
         app.restored = out;
         app.restored_mask = mask;
         app.show_after = true;

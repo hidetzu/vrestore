@@ -13,6 +13,11 @@ const temporal = @import("temporal.zig");
 /// ⚠ 較正は docs/SPEC.md §4。値を変えるときは scripts/restore-calibrate.sh をやり直す
 pub const default_min_peak = 0.5;
 
+/// ROI の周りの帯の差（R/G/B の差の絶対値の平均）がこれを超えるフレームからは借りない。null なら確かめない。
+/// 手持ちの実写（72 ケース）で、確かめないと戻した画素の 29.8% が外れ、6 で 1.8%（圧縮だけで外れるのは最大 1.1%）。
+/// 合成のパン（中央）の coverage は変わらない。⚠ 較正は docs/SPEC.md §4
+pub const default_max_ring_diff: ?f64 = 6;
+
 pub const Args = struct {
     video: []const u8 = "",
     rect: ?temporal.Rect = null,
@@ -20,6 +25,7 @@ pub const Args = struct {
     roi_json: ?[]const u8 = null,
     window: usize = 15,
     min_peak: f64 = default_min_peak,
+    max_ring_diff: ?f64 = default_max_ring_diff,
     /// RGB24 の生フレームの出力先。"-" なら標準出力（そのとき集計は標準エラーへ）
     raw_out: []const u8 = "",
     /// 1 画素 1 バイトのマスクの出力先。戻せなかった ROI の画素が 0、それ以外が 255
@@ -145,7 +151,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
         }
         const track = try temporal.Track.build(gpa, shifts, args.min_peak);
         defer track.deinit(gpa);
-        const r = temporal.recoverFrame(images, track, next_target - lo, rect, out_rgb, mask);
+        const r = temporal.recoverFrame(images, track, next_target - lo, rect, args.max_ring_diff, out_rgb, mask);
         total.recovered += r.recovered;
         total.pixels += r.pixels;
         coverage_min = @min(coverage_min, r.coverage());
