@@ -11,6 +11,14 @@ const temporal = @import("temporal.zig");
 const provenance = @import("provenance.zig");
 const motion = @import("motion.zig");
 const spatial = @import("spatial.zig");
+const wmask = @import("wmask.zig");
+
+/// ROI の中でウォーターマークの画素だけを隠れている扱いにするか（wmask.zig）。none なら ROI 全体を隠す。
+/// ⚠ 較正は docs/SPEC.md §4、決定は docs/adr/0010
+pub const MaskMode = enum { none, auto };
+pub const default_mask: MaskMode = .none;
+/// マスクを推定するときに動画全体から取るフレーム数
+pub const mask_frames = 60;
 
 /// 戻せなかった画素を周囲から推測して埋めるか（spatial.zig）。埋めた画素の由来は spatial_inpainted。
 /// ⚠ 較正は docs/SPEC.md §4、決定は docs/adr/0008
@@ -47,6 +55,7 @@ pub const Args = struct {
     min_peak: f64 = default_min_peak,
     motion: MotionModel = default_motion,
     fill: spatial.Method = default_fill,
+    mask: MaskMode = default_mask,
     max_ring_diff: ?f64 = default_max_ring_diff,
     /// RGB24 の生フレームの出力先。"-" なら標準出力（そのとき集計は標準エラーへ）
     raw_out: []const u8 = "",
@@ -58,7 +67,7 @@ pub const Args = struct {
 
 /// 手元にある連続したフレーム列から、`target` を戻す（動きの推定・鎖・復元をまとめて行う）。
 /// GUI のように窓を丸ごと持っている呼び出し側用。`run` は流しながら同じ部品（estimatePair）を使う
-pub fn recoverInWindow(gpa: std.mem.Allocator, model: MotionModel, fill: spatial.Method, frames: []const temporal.Image, target: usize, roi: temporal.Rect, min_peak: f64, max_ring_diff: ?f64, out: []u8, prov: []provenance.Provenance) !temporal.Recovered {
+pub fn recoverInWindow(gpa: std.mem.Allocator, model: MotionModel, fill: spatial.Method, frames: []const temporal.Image, target: usize, roi: temporal.Rect, hidden: ?[]const bool, min_peak: f64, max_ring_diff: ?f64, out: []u8, prov: []provenance.Provenance) !temporal.Recovered {
     const lumas = try gpa.alloc(?motion.Luma, frames.len);
     defer gpa.free(lumas);
     @memset(lumas, null);
@@ -72,12 +81,42 @@ pub fn recoverInWindow(gpa: std.mem.Allocator, model: MotionModel, fill: spatial
     const track = try temporal.Track.buildAffine(gpa, motions);
     defer track.deinit(gpa);
     const t = temporal.recoverFrame(frames, track, target, roi, max_ring_diff, out, prov);
-    return fillAndTally(gpa, fill, t, out, frames[target].width, frames[target].height, prov, roi);
+    return fillAndTally(gpa, fill, hidden, t, out, frames[target].width, frames[target].height, prov, roi);
 }
 
-/// Temporal の後に残った unrecovered を埋め、埋めた後の由来で数え直す
-fn fillAndTally(gpa: std.mem.Allocator, fill: spatial.Method, t: temporal.Recovered, out: []u8, w: u32, h: u32, prov: []provenance.Provenance, roi: temporal.Rect) !temporal.Recovered {
-    if (fill == .none) return t;
+/// 動画全体から `mask_frames` 枚を取り、ROI の中のウォーターマークの画素を見分ける。`d` は読む位置が変わる
+pub fn estimateMask(gpa: std.mem.Allocator, d: *video.Decoder, roi: temporal.Rect) !wmask.Estimate {
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const frames = try video.sampleFrames(arena, d, mask_frames);
+    const crops = try arena.alloc([]u8, frames.len);
+    const row = @as(usize, roi.w) * 3;
+    for (frames, crops) |f, *c| {
+        c.* = try arena.alloc(u8, row * roi.h);
+        for (0..roi.h) |j| @memcpy(c.*[j * row ..][0..row], f.rgb[((roi.y + j) * f.width + roi.x) * 3 ..][0..row]);
+    }
+    if (crops.len < 3) {
+        // フレームが足りず見分けられない。ROI 全体を隠す
+        const hidden = try gpa.alloc(bool, @as(usize, roi.w) * roi.h);
+        @memset(hidden, true);
+        return .{ .hidden = hidden, .accepted = false, .fraction = 1, .threshold = 0, .inside_mad = 0, .outside_mad = 0 };
+    }
+    return wmask.estimate(gpa, crops, roi.w, roi.h, .{});
+}
+
+/// Temporal の後に残った unrecovered を振り分けて埋め、由来を数え直す。
+///
+/// `hidden`（ROI の大きさ、wmask.zig）があれば、戻せなかった画素のうちウォーターマークの外のものは入力のまま
+/// （original）にし、ウォーターマークの画素だけを埋める。Temporal は ROI 全体に対して行う: ウォーターマークの
+/// すぐ隣の画素は圧縮でウォーターマークの色がにじんでいるので、別フレームの実画素で戻せるならそちらの方が近い
+/// （合成のパンで、Temporal もマスクで絞ると SSIM 0.942 → 0.804 に下がった）
+fn fillAndTally(gpa: std.mem.Allocator, fill: spatial.Method, hidden: ?[]const bool, t: temporal.Recovered, out: []u8, w: u32, h: u32, prov: []provenance.Provenance, roi: temporal.Rect) !temporal.Recovered {
+    if (hidden) |m| for (0..roi.h) |yy| for (0..roi.w) |xx| {
+        const i = (roi.y + yy) * w + roi.x + xx;
+        if (prov[i] == .unrecovered and !m[yy * roi.w + xx]) prov[i] = .original;
+    };
+    if (fill == .none and hidden == null) return t;
     _ = try spatial.fill(gpa, fill, out, w, h, prov, .{ .x = roi.x, .y = roi.y, .w = roi.w, .h = roi.h });
     var tally: temporal.Recovered = .{};
     for (roi.y..roi.y + roi.h) |y| for (roi.x..roi.x + roi.w) |x| tally.add(prov[y * w + x]);
@@ -168,6 +207,16 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
     defer if (shifts_file) |f| f.close(io);
     var shifts_w: ?Io.File.Writer = if (shifts_file) |f| .initStreaming(f, io, &shifts_buf) else null;
 
+    // マスク: 別に開いた decoder で動画全体から取る（流す方の読む位置を変えない）
+    var mask_est: ?wmask.Estimate = null;
+    defer if (mask_est) |m| m.deinit(gpa);
+    if (args.mask == .auto) {
+        var d2 = try video.Decoder.open(try arena.dupeZ(u8, args.video));
+        defer d2.close();
+        mask_est = try estimateMask(gpa, &d2, rect);
+    }
+    const hidden: ?[]const bool = if (mask_est) |m| (if (m.accepted) m.hidden else null) else null;
+
     const frame_bytes = d.frameBytes();
     const out_rgb = try arena.alloc(u8, frame_bytes);
     const prov = try arena.alloc(provenance.Provenance, @as(usize, w) * h);
@@ -230,7 +279,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
         }
         const track = try temporal.Track.buildAffine(gpa, motions);
         defer track.deinit(gpa);
-        const r = try fillAndTally(gpa, args.fill, temporal.recoverFrame(images, track, next_target - lo, rect, args.max_ring_diff, out_rgb, prov), out_rgb, w, h, prov, rect);
+        const r = try fillAndTally(gpa, args.fill, hidden, temporal.recoverFrame(images, track, next_target - lo, rect, args.max_ring_diff, out_rgb, prov), out_rgb, w, h, prov, rect);
         total.merge(r);
         coverage_min = @min(coverage_min, r.coverage());
 
@@ -258,6 +307,8 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
         next_target, rect.x, rect.y, rect.w, rect.h, @tagName(args.motion), @tagName(args.fill), args.window, args.min_peak, total.recovered(), total.roiPixels(), total.coverage(), coverage_min, cuts, peak_min, peak_max,
     });
     try total.writeJson(summary);
+    try summary.print(",\"mask\":\"{s}\"", .{@tagName(args.mask)});
+    if (mask_est) |m| try summary.print(",\"mask_accepted\":{},\"mask_fraction\":{d:.4},\"mask_inside_mad\":{d:.2},\"mask_outside_mad\":{d:.2}", .{ m.accepted, m.fraction, m.inside_mad, m.outside_mad });
     try summary.writeAll("}\n");
     return 0;
 }

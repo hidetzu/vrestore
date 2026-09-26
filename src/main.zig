@@ -31,6 +31,8 @@ const usage =
     \\      pixels it could not recover are left as they were. Prints the recovery coverage as JSON.
     \\      --window <n>        frames to look at on each side (default 15)
     \\      --motion <m>        translation (whole-frame shift) or affine (shift + rotation + zoom)
+    \\      --mask <m>          none (hide the whole ROI) or auto (hide only the watermark's own pixels,
+    \\                          found as those that stay the same across the video)
     \\      --fill <f>          none, directional or harmonic: guess the pixels still unrecovered from
     \\                          their surroundings (provenance spatial_inpainted; not counted in coverage)
     \\      --provenance <out>  also write where each pixel came from, 1 byte per pixel per frame:
@@ -182,6 +184,8 @@ fn parseRestore(args: []const []const u8) Command {
         } else if (std.mem.eql(u8, a, "--window")) {
             out.window = std.fmt.parseInt(usize, v, 10) catch 0;
             if (out.window == 0) return .{ .bad_arg = .{ .why = "--window needs a positive integer", .arg = v } };
+        } else if (std.mem.eql(u8, a, "--mask")) {
+            out.mask = std.meta.stringToEnum(restore_cmd.MaskMode, v) orelse return .{ .bad_arg = .{ .why = "--mask needs none or auto", .arg = v } };
         } else if (std.mem.eql(u8, a, "--fill")) {
             out.fill = std.meta.stringToEnum(@import("spatial.zig").Method, v) orelse return .{ .bad_arg = .{ .why = "--fill needs none, directional or harmonic", .arg = v } };
         } else if (std.mem.eql(u8, a, "--motion")) {
@@ -282,6 +286,7 @@ test {
     _ = @import("player_state.zig");
     _ = @import("glyphs.zig");
     _ = @import("fonts.zig");
+    _ = @import("wmask.zig");
     _ = @import("temporal.zig");
     _ = @import("provenance.zig");
     _ = @import("motion.zig");
