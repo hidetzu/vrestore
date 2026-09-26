@@ -175,6 +175,32 @@ pub fn build(b: *std.Build) void {
     gui_chk.expectExitCode(0);
     gui_step.dependOn(&gui_chk.step);
 
+    // GUI の R（復元）も、CLI の restore と同じ部品で動くことを画面なしで確かめる。
+    // restore-pan7 と同じ合成（中央 240,150、参照 = 146x56 + 余白 6）。表示中のフレームの coverage を見る
+    const gui_restore_case = synthCase(b, tool, restore_cases[1].roi);
+    const gui_restore = b.addRunArtifact(gui);
+    gui_restore.setName("gui restore-and-exit");
+    gui_restore.setEnvironmentVariable("SDL_VIDEODRIVER", "dummy");
+    gui_restore.addArgs(&.{ "--at", "3", "--select", "234,144,158,68", "--detect-and-exit", "--restore" });
+    gui_restore.addFileArg(gui_restore_case.mp4);
+    const gui_restore_out = gui_restore.captureStdOut(.{});
+    gui_restore.expectExitCode(0);
+    const gui_restore_chk = b.addRunArtifact(tool);
+    gui_restore_chk.setName("gui restore check");
+    gui_restore_chk.addArgs(&.{ "check-restore", "gui-restore" });
+    gui_restore_chk.addFileArg(gui_restore_out);
+    gui_restore_chk.addFileArg(gui_restore_out);
+    // 実測（crf 23、3.0 秒のフレーム）: coverage 1.0000
+    gui_restore_chk.addArg("coverage>=0.95");
+    gui_restore_chk.expectExitCode(0);
+    gui_step.dependOn(&gui_restore_chk.step);
+
+    // ---- Temporal Recovery の合成 E2E ----------------------------------------
+    // 合成 → エンコード → detect-roi → restore → 正解（ウォーターマーク無しの同じ背景）と compare。
+    // 判定値は較正（scripts/restore-calibrate.sh、docs/SPEC.md §4）の実測から余裕を取ったもの
+    const restore_step = b.step("restore-e2e", "Temporal Recovery on synthetic videos, compared with the clean original");
+    for (restore_cases) |c| restore_step.dependOn(restoreCase(b, tool, exe, c));
+
     // ---- 復元の指標を FFmpeg と突き合わせる ----------------------------------
     // SSIM / PSNR を自前の実装とだけ比べても何も示さないので、FFmpeg の ssim / psnr フィルタと
     // フレームごとに比べる（src/metrics.zig）。色変換の差を持ち込まないよう、素材は RGB のまま可逆で持つ
@@ -191,11 +217,12 @@ pub fn build(b: *std.Build) void {
     // git の状態を見るので、毎回実行する（キャッシュさせない）
     no_media.has_side_effects = true;
 
-    const check_step = b.step("check", "fmt --check, test, e2e, metrics, gui, no-media, build");
+    const check_step = b.step("check", "fmt --check, test, e2e, restore-e2e, metrics, gui, no-media, build");
     check_step.dependOn(&fmt.step);
     check_step.dependOn(test_step);
     check_step.dependOn(e2e_step);
     check_step.dependOn(metrics_step);
+    check_step.dependOn(restore_step);
     check_step.dependOn(gui_step);
     check_step.dependOn(&no_media.step);
     check_step.dependOn(b.getInstallStep());
@@ -288,6 +315,94 @@ const roi_cases = [_]RoiCase{
     // ウォーターマークの無い動画から切った参照。背景が動くので、どこにも固定されていない
     .{ .spec = "name=absent,bg=pan,opacity=0,expect=reject", .crf = 23 },
 };
+
+const RestoreCase = struct {
+    roi: RoiCase,
+    /// tools/roi_fixture check-restore の条件
+    expect: []const u8,
+};
+
+const restore_cases = [_]RestoreCase{
+    // 実測（crf 23）: coverage 1.000、SSIM 0.947（再エンコードだけの上限 0.948）、戻した画素の PSNR 38.2
+    .{ .roi = .{ .spec = "name=restore-pan15,bg=pan,pan_x=15,pan_y=0,x=240,y=150,frames=60", .crf = 23 }, .expect = "coverage>=0.99,ssim>=0.9,masked_psnr>=35" },
+    // 実測: coverage 0.988、SSIM 0.926、戻した画素の PSNR 37.5
+    .{ .roi = .{ .spec = "name=restore-pan7,bg=pan,pan_x=7,pan_y=3,x=240,y=150,frames=60", .crf = 23 }, .expect = "coverage>=0.95,ssim>=0.88,masked_psnr>=34" },
+    // 遅いパン × 強い圧縮。全帯域の位相相関だと x264 のブロックの格子が (0,0) のピークを作り、動いていないと
+    // 推定した（CLAUDE.md §7）。実測（低い周波数だけ）: coverage 0.680、戻した画素の PSNR 32.2
+    .{ .roi = .{ .spec = "name=restore-pan3-crf35,bg=pan,pan_x=3,pan_y=1,x=240,y=150,frames=60", .crf = 35 }, .expect = "coverage>=0.6,masked_psnr>=30" },
+    // 毎フレーム別の模様: 動きで説明できないので、1 画素も貼らない
+    .{ .roi = .{ .spec = "name=restore-cut,bg=cut,x=240,y=150,frames=60", .crf = 23 }, .expect = "coverage<=0" },
+    // 動かない背景: 隠れた画素はどのフレームにも写っていないので、1 画素も戻らない
+    .{ .roi = .{ .spec = "name=restore-flat,bg=flat,x=240,y=150,frames=60", .crf = 23 }, .expect = "coverage<=0" },
+};
+
+fn restoreCase(b: *std.Build, tool: *std.Build.Step.Compile, exe: *std.Build.Step.Compile, c: RestoreCase) *std.Build.Step {
+    const name = c.roi.spec[5..std.mem.indexOfScalar(u8, c.roi.spec, ',').?];
+    const v = synthCase(b, tool, c.roi);
+    const spec = b.fmt("{s},crf={d}", .{ c.roi.spec, c.roi.crf });
+
+    // 正解: 同じケースをウォーターマーク無しで合成し、可逆で持つ
+    const clean = b.addRunArtifact(tool);
+    clean.setName(b.fmt("{s} synth-clean", .{name}));
+    clean.addArgs(&.{ "synth-clean", spec });
+    const clean_rgb = clean.addOutputFileArg("clean.rgb");
+    _ = clean.addOutputFileArg("truth-clean.json");
+    const clean_mkv = rawToFfv1(b, b.fmt("{s} encode clean", .{name}), clean_rgb, "clean.mkv");
+
+    const cut = b.addRunArtifact(tool);
+    cut.setName(b.fmt("{s} cutref", .{name}));
+    cut.addArg("cutref");
+    cut.addFileArg(v.mp4);
+    cut.addFileArg(v.truth);
+    const ref = cut.addOutputFileArg("ref.png");
+    const detect = b.addRunArtifact(exe);
+    detect.setName(b.fmt("{s} detect", .{name}));
+    detect.addArgs(&.{ "detect-roi", "--ref" });
+    detect.addFileArg(ref);
+    detect.addFileArg(v.mp4);
+    const roi_json = detect.captureStdOut(.{});
+    _ = detect.captureStdErr(.{});
+
+    const restore = b.addRunArtifact(exe);
+    restore.setName(b.fmt("{s} restore", .{name}));
+    restore.addArgs(&.{ "restore", "--roi" });
+    restore.addFileArg(roi_json);
+    restore.addArg("--raw");
+    const out_rgb = restore.addOutputFileArg("restored.rgb");
+    restore.addArg("--mask");
+    const mask = restore.addOutputFileArg("mask.gray");
+    restore.addFileArg(v.mp4);
+    const restore_json = restore.captureStdOut(.{});
+    const restored_mkv = rawToFfv1(b, b.fmt("{s} encode restored", .{name}), out_rgb, "restored.mkv");
+
+    const cmp = b.addRunArtifact(exe);
+    cmp.setName(b.fmt("{s} compare", .{name}));
+    cmp.addArgs(&.{ "compare", "--roi" });
+    cmp.addFileArg(roi_json);
+    cmp.addArg("--mask");
+    cmp.addFileArg(mask);
+    cmp.addFileArg(clean_mkv);
+    cmp.addFileArg(restored_mkv);
+    const cmp_json = cmp.captureStdOut(.{});
+
+    const chk = b.addRunArtifact(tool);
+    chk.setName(b.fmt("{s} check", .{name}));
+    chk.addArgs(&.{ "check-restore", name });
+    chk.addFileArg(restore_json);
+    chk.addFileArg(cmp_json);
+    chk.addArg(c.expect);
+    chk.expectExitCode(0);
+    return &chk.step;
+}
+
+/// RGB24 の生フレーム（640x360、10 fps。synthCase と同じ）を ffv1 の可逆で包む
+fn rawToFfv1(b: *std.Build, step_name: []const u8, rgb: std.Build.LazyPath, out_name: []const u8) std.Build.LazyPath {
+    const enc = b.addSystemCommand(&.{ "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", "640x360", "-r", "10", "-i" });
+    enc.setName(step_name);
+    enc.addFileArg(rgb);
+    enc.addArgs(&.{ "-c:v", "ffv1", "-pix_fmt", "gbrp" });
+    return enc.addOutputFileArg(out_name);
+}
 
 const SynthVideo = struct { truth: std.Build.LazyPath, mp4: std.Build.LazyPath };
 
