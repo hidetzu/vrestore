@@ -138,6 +138,12 @@ pub fn build(b: *std.Build) void {
     const e2e_step = b.step("e2e", "ROI detection on synthetic videos, checked against the known position");
     for (roi_cases) |c| e2e_step.dependOn(roiCase(b, tool, exe, c));
 
+    // ---- 復元の指標を FFmpeg と突き合わせる ----------------------------------
+    // SSIM / PSNR を自前の実装とだけ比べても何も示さないので、FFmpeg の ssim / psnr フィルタと
+    // フレームごとに比べる（src/metrics.zig）。色変換の差を持ち込まないよう、素材は RGB のまま可逆で持つ
+    const metrics_step = b.step("metrics", "Cross-check vrestore compare against FFmpeg ssim / psnr");
+    metrics_step.dependOn(metricsCrosscheck(b, tool, exe));
+
     // check: 変更が壊れていないと言うために回すものの全部。
     // 何を回すかはここだけが持つ（.claude/skills/verify/SKILL.md と CI はここを呼ぶ）
     const fmt = b.addFmt(.{
@@ -148,10 +154,11 @@ pub fn build(b: *std.Build) void {
     // git の状態を見るので、毎回実行する（キャッシュさせない）
     no_media.has_side_effects = true;
 
-    const check_step = b.step("check", "fmt --check, test, e2e, no-media, build");
+    const check_step = b.step("check", "fmt --check, test, e2e, metrics, no-media, build");
     check_step.dependOn(&fmt.step);
     check_step.dependOn(test_step);
     check_step.dependOn(e2e_step);
+    check_step.dependOn(metrics_step);
     check_step.dependOn(&no_media.step);
     check_step.dependOn(b.getInstallStep());
 }
@@ -171,6 +178,48 @@ fn createRootModule(
     mod.addOptions("build_options", options);
     linkFfmpeg(mod);
     return mod;
+}
+
+fn metricsCrosscheck(b: *std.Build, tool: *std.Build.Step.Compile, exe: *std.Build.Step.Compile) *std.Build.Step {
+    // a: 模様、b: a に時間方向に変わるノイズを足したもの。96x64 / 10 fps / 0.5 秒、ffv1 の gbrp（可逆）
+    const gen_a = b.addSystemCommand(&.{ "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=96x64:r=10:d=0.5", "-c:v", "ffv1", "-pix_fmt", "gbrp" });
+    gen_a.setName("metrics synth a.mkv");
+    const a = gen_a.addOutputFileArg("a.mkv");
+    const gen_b = b.addSystemCommand(&.{ "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i" });
+    gen_b.setName("metrics synth b.mkv");
+    gen_b.addFileArg(a);
+    gen_b.addArgs(&.{ "-vf", "noise=alls=20:allf=t", "-c:v", "ffv1", "-pix_fmt", "gbrp" });
+    const bv = gen_b.addOutputFileArg("b.mkv");
+
+    // 端数のある位置と大きさ（4 で割り切れない）で、窓の数え方の違いも拾う
+    const crop = "crop=41:30:5:7";
+    const stats = [_][]const u8{ "ssim", "psnr" };
+    var logs: [2]std.Build.LazyPath = undefined;
+    for (stats, &logs) |f, *log| {
+        const run = b.addSystemCommand(&.{ "ffmpeg", "-hide_banner", "-loglevel", "error", "-i" });
+        run.setName(b.fmt("metrics ffmpeg {s}", .{f}));
+        run.addFileArg(a);
+        run.addArg("-i");
+        run.addFileArg(bv);
+        run.addArgs(&.{ "-lavfi", b.fmt("[0]{s}[x];[1]{s}[y];[x][y]{s}=stats_file=-", .{ crop, crop, f }), "-f", "null", "-" });
+        log.* = run.captureStdOut(.{});
+    }
+
+    const ours = b.addRunArtifact(exe);
+    ours.setName("metrics vrestore compare");
+    ours.addArgs(&.{ "compare", "--per-frame", "--rect", "5,7,41,30" });
+    ours.addFileArg(a);
+    ours.addFileArg(bv);
+    const ours_out = ours.captureStdOut(.{});
+
+    const chk = b.addRunArtifact(tool);
+    chk.setName("metrics crosscheck");
+    chk.addArg("crossmetrics");
+    chk.addFileArg(ours_out);
+    chk.addFileArg(logs[0]);
+    chk.addFileArg(logs[1]);
+    chk.expectExitCode(0);
+    return &chk.step;
 }
 
 /// FFmpeg は pkg-config で見つける（docs/adr/0001）

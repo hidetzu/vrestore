@@ -3,6 +3,8 @@
 //!   roi_fixture synth  <case> <out.rgb> <truth.json>   RGB24 の生フレームと正解を書く
 //!   roi_fixture cutref <video> <truth.json> <out.png>  エンコード済み動画のフレームから参照画像を切る
 //!   roi_fixture check  <truth.json> <detection.json>   dx / dy / IoU / reliable を判定する
+//!   roi_fixture crossmetrics <compare.jsonl> <ffmpeg-ssim.log> <ffmpeg-psnr.log>
+//!                     `vrestore compare --per-frame` の値が FFmpeg の ssim / psnr フィルタと一致するかを見る
 //!
 //! 実素材・他者のウォーターマークを使わずに済むよう、ウォーターマークはランダムな「文字風」グリフで描く
 //! (フォントに依存しないので CI でも同じ絵になる)。
@@ -90,6 +92,11 @@ pub fn main(init: std.process.Init) !u8 {
     if (args.len == 4 and std.mem.eql(u8, args[1], "check")) {
         // PASS の行は stdout（zig build では表示されない）、FAIL の行は stderr にも出して失敗文に載せる
         const code = try check(arena, io, &out.interface, args[2], args[3]);
+        if (code != 0) try err.interface.writeAll(out.interface.buffered());
+        return code;
+    }
+    if (args.len == 5 and std.mem.eql(u8, args[1], "crossmetrics")) {
+        const code = try crossmetrics(arena, io, &out.interface, args[2], args[3], args[4]);
         if (code != 0) try err.interface.writeAll(out.interface.buffered());
         return code;
     }
@@ -335,6 +342,74 @@ fn check(arena: std.mem.Allocator, io: Io, out: *Io.Writer, truth_path: []const 
         if (ok) "PASS" else "FAIL", t.case, t.expect, dx, dy, i, d.reliable, d.confidence, d.margin orelse -1, d.psr orelse -1, t.crf, t.opacity,
     });
     return if (ok) 0 else 1;
+}
+
+const CompareFrame = struct {
+    n: u32,
+    ssim: [3]f64,
+    ssim_all: f64,
+    mse: [3]f64,
+    mse_avg: f64,
+};
+
+/// FFmpeg の stats_file の 1 行（"n:1 R:0.82 G:0.68 ..."）から `key:` の値を取る
+fn statValue(line: []const u8, key: []const u8) !f64 {
+    var it = std.mem.tokenizeScalar(u8, line, ' ');
+    while (it.next()) |tok| {
+        if (tok.len > key.len and std.mem.startsWith(u8, tok, key) and tok[key.len] == ':')
+            return std.fmt.parseFloat(f64, tok[key.len + 1 ..]);
+    }
+    return error.MissingStat;
+}
+
+/// 許容差: FFmpeg は SSIM を小数 6 桁、MSE を小数 2 桁で出す。こちらも SSIM は 6 桁で出すので、丸めの分だけ許す
+const ssim_tolerance = 2e-6;
+const mse_tolerance = 0.006;
+
+fn crossmetrics(arena: std.mem.Allocator, io: Io, out: *Io.Writer, ours_path: []const u8, ssim_path: []const u8, psnr_path: []const u8) !u8 {
+    const cwd = Io.Dir.cwd();
+    const ours = try cwd.readFileAlloc(io, ours_path, arena, .limited(1 << 20));
+    const ssim_log = try cwd.readFileAlloc(io, ssim_path, arena, .limited(1 << 20));
+    const psnr_log = try cwd.readFileAlloc(io, psnr_path, arena, .limited(1 << 20));
+
+    var frames: std.ArrayList(CompareFrame) = .empty;
+    var lines = std.mem.tokenizeScalar(u8, ours, '\n');
+    while (lines.next()) |l| {
+        if (!std.mem.startsWith(u8, l, "{\"n\":")) continue; // 最後の集計行は飛ばす
+        try frames.append(arena, try std.json.parseFromSliceLeaky(CompareFrame, arena, l, .{}));
+    }
+    var ssim_lines = std.mem.tokenizeScalar(u8, ssim_log, '\n');
+    var psnr_lines = std.mem.tokenizeScalar(u8, psnr_log, '\n');
+    var worst_ssim: f64 = 0;
+    var worst_mse: f64 = 0;
+    var bad: usize = 0;
+    for (frames.items) |f| {
+        const sl = ssim_lines.next() orelse return error.FrameCountMismatch;
+        const pl = psnr_lines.next() orelse return error.FrameCountMismatch;
+        const theirs_ssim = [3]f64{ try statValue(sl, "R"), try statValue(sl, "G"), try statValue(sl, "B") };
+        const theirs_mse = [3]f64{ try statValue(pl, "mse_r"), try statValue(pl, "mse_g"), try statValue(pl, "mse_b") };
+        for (0..3) |c| {
+            worst_ssim = @max(worst_ssim, @abs(f.ssim[c] - theirs_ssim[c]));
+            worst_mse = @max(worst_mse, @abs(f.mse[c] - theirs_mse[c]));
+        }
+        worst_ssim = @max(worst_ssim, @abs(f.ssim_all - try statValue(sl, "All")));
+        worst_mse = @max(worst_mse, @abs(f.mse_avg - try statValue(pl, "mse_avg")));
+        if (worst_ssim > ssim_tolerance or worst_mse > mse_tolerance) bad += 1;
+    }
+    if (ssim_lines.next() != null or psnr_lines.next() != null) return error.FrameCountMismatch;
+    const ok = bad == 0 and frames.items.len > 0;
+    try out.print("{s} crossmetrics frames={d} max|dSSIM|={e:.2} max|dMSE|={d:.4} (tolerance {e:.0} / {d})\n", .{
+        if (ok) "PASS" else "FAIL", frames.items.len, worst_ssim, worst_mse, ssim_tolerance, mse_tolerance,
+    });
+    return if (ok) 0 else 1;
+}
+
+test "statValue" {
+    const l = "n:1 R:0.820558 G:0.684694 B:0.460817 All:0.655356 (4.626299)";
+    try std.testing.expectEqual(@as(f64, 0.684694), try statValue(l, "G"));
+    try std.testing.expectEqual(@as(f64, 0.655356), try statValue(l, "All"));
+    try std.testing.expectEqual(@as(f64, 94.01), try statValue("n:1 mse_avg:93.73 mse_r:94.01", "mse_r"));
+    try std.testing.expectError(error.MissingStat, statValue(l, "Y"));
 }
 
 test "parseCase" {
