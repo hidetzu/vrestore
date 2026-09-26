@@ -175,6 +175,25 @@ pub fn build(b: *std.Build) void {
     gui_chk.expectExitCode(0);
     gui_step.dependOn(&gui_chk.step);
 
+    // 場面の共有（C と同じ 1 行）: --frame で開いた場面、再生の経路（tickTo）で進めた場面、末尾で止まること。
+    // steps.mp4 は 10 fps・10 フレーム
+    const share_cases = [_]struct { name: []const u8, args: []const []const u8, want: []const u8 }{
+        .{ .name = "gui share frame", .args = &.{ "--frame", "7" }, .want = "steps.mp4 t=0.700 frame=7\n" },
+        .{ .name = "gui share play", .args = &.{ "--at", "0", "--play-frames", "3" }, .want = "steps.mp4 t=0.300 frame=3\n" },
+        .{ .name = "gui share end", .args = &.{ "--frame", "2", "--play-frames", "20" }, .want = "steps.mp4 t=0.900 frame=9\n" },
+    };
+    for (share_cases) |sc| {
+        const run = b.addRunArtifact(gui);
+        run.setName(sc.name);
+        run.setEnvironmentVariable("SDL_VIDEODRIVER", "dummy");
+        run.addArgs(sc.args);
+        run.addArg("--share-and-exit");
+        run.addFileArg(steps_mp4);
+        run.expectStdOutEqual(sc.want);
+        run.expectExitCode(0);
+        gui_step.dependOn(&run.step);
+    }
+
     // GUI の R（復元）も、CLI の restore と同じ部品で動くことを画面なしで確かめる。
     // restore-pan7 と同じ合成（中央 240,150、参照 = 146x56 + 余白 6）。表示中のフレームの coverage を見る
     const gui_restore_case = synthCase(b, tool, restore_cases[1].roi);
