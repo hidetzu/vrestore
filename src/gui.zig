@@ -9,6 +9,7 @@
 //!   Enter / D                選んだ範囲を参照画像にして検出する
 //!   R                        検出した ROI を、前後のフレームの実画素で戻す（Temporal Recovery）
 //!   Space                    処理前 / 処理後を切り替える（処理後で戻せなかった画素はマゼンタ）
+//!   P                        処理後の画面に、各画素の由来（provenance）を色で重ねる / 外す
 //!   ← / →                    1 フレーム戻る / 進む（Shift で 1 秒、↑ / ↓ で 10 秒）
 //!   Home / End               先頭 / 末尾
 //!   クリック・ドラッグ（下の帯）  その時刻へ移動
@@ -24,6 +25,8 @@ const state = @import("gui_state.zig");
 const compare = @import("compare.zig");
 const temporal = @import("temporal.zig");
 const restore_cmd = @import("restore_cmd.zig");
+const provenance = @import("provenance.zig");
+const Provenance = provenance.Provenance;
 
 const sdl = @cImport({
     @cInclude("SDL.h");
@@ -39,6 +42,7 @@ const usage =
     \\                          (the same path as pressing Enter; used by the tests)
     \\  --restore               with --detect-and-exit, also restore the current frame (as pressing R)
     \\                          and print its coverage as a second JSON line
+    \\  --show-provenance       with --restore, show the provenance colors (as pressing P)
     \\  --screenshot <png>      with --detect-and-exit, also save what the window shows
     \\
 ;
@@ -58,10 +62,12 @@ const App = struct {
     detection: ?roi.Detection = null,
     /// 表示中のフレームを戻したもの（R）。フレームを動かすと捨てる
     restored: ?[]u8 = null,
-    /// 戻せた画素が 1、戻せなかった ROI の画素が 0（フレーム全体）
-    restored_mask: ?[]u8 = null,
-    recovered: temporal.Recovered = .{ .recovered = 0, .pixels = 0 },
+    /// 各画素の由来（フレーム全体）
+    restored_prov: ?[]Provenance = null,
+    recovered: provenance.Tally = .{},
     show_after: bool = false,
+    /// 処理後の画面に由来の色を重ねる（P）
+    show_provenance: bool = false,
     /// 表示用の画素（処理後で、戻せなかった画素をマゼンタにしたもの）
     display: []u8,
     /// 検出できなかったときの理由（窓のタイトルに出す）
@@ -70,9 +76,9 @@ const App = struct {
 
     fn clearRestored(app: *App) void {
         if (app.restored) |r| app.gpa.free(r);
-        if (app.restored_mask) |m| app.gpa.free(m);
+        if (app.restored_prov) |m| app.gpa.free(m);
         app.restored = null;
-        app.restored_mask = null;
+        app.restored_prov = null;
         app.show_after = false;
     }
 
@@ -117,23 +123,30 @@ const App = struct {
 
         const out = try app.gpa.alloc(u8, d.frameBytes());
         errdefer app.gpa.free(out);
-        const mask = try app.gpa.alloc(u8, @as(usize, d.info.width) * d.info.height);
-        errdefer app.gpa.free(mask);
-        app.recovered = try temporal.recoverInWindow(app.gpa, images, t, roi_rect, restore_cmd.default_min_peak, restore_cmd.default_max_ring_diff, out, mask);
+        const prov = try app.gpa.alloc(Provenance, @as(usize, d.info.width) * d.info.height);
+        errdefer app.gpa.free(prov);
+        app.recovered = try temporal.recoverInWindow(app.gpa, images, t, roi_rect, restore_cmd.default_min_peak, restore_cmd.default_max_ring_diff, out, prov);
         app.restored = out;
-        app.restored_mask = mask;
+        app.restored_prov = prov;
         app.show_after = true;
     }
 
-    /// 画面に出す画素。処理後なら戻した画素、戻せなかった画素はマゼンタ（推測で埋めていないことを見せる）
+    /// 画面に出す画素。処理後なら戻した画素、戻せなかった画素はマゼンタ（推測で埋めていないことを見せる）。
+    /// P を押していれば、由来ごとの色（Provenance.color）を半分重ねる。未復元は常にマゼンタで塗る
     fn pixels(app: *App) []const u8 {
         if (!app.show_after) return app.rgb;
         const r = app.restored orelse return app.rgb;
-        const m = app.restored_mask.?;
+        const prov = app.restored_prov.?;
         @memcpy(app.display, r);
-        for (m, 0..) |v, i| if (v == 0) {
-            app.display[i * 3 ..][0..3].* = .{ 255, 0, 255 };
-        };
+        for (prov, 0..) |p, i| {
+            const col = p.color() orelse continue;
+            const px = app.display[i * 3 ..][0..3];
+            if (p == .unrecovered) {
+                px.* = col;
+            } else if (app.show_provenance) {
+                for (px, col) |*v, c| v.* = @intCast((@as(u16, v.*) + c) / 2);
+            }
+        }
         return app.display;
     }
 
@@ -198,6 +211,7 @@ pub fn main(init: std.process.Init) !u8 {
     var select: ?state.Rect = null;
     var detect_and_exit = false;
     var restore_too = false;
+    var show_prov = false;
     var screenshot: ?[]const u8 = null;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -206,6 +220,8 @@ pub fn main(init: std.process.Init) !u8 {
             detect_and_exit = true;
         } else if (std.mem.eql(u8, a, "--restore")) {
             restore_too = true;
+        } else if (std.mem.eql(u8, a, "--show-provenance")) {
+            show_prov = true;
         } else if (std.mem.eql(u8, a, "--at") and i + 1 < args.len) {
             i += 1;
             at = std.fmt.parseFloat(f64, args[i]) catch return badArg(&err.interface, "--at needs seconds", args[i]);
@@ -287,7 +303,10 @@ pub fn main(init: std.process.Init) !u8 {
     defer app.clearRestored();
     if (detect_and_exit) {
         try app.detect();
-        if (restore_too and app.detection != null) try app.restore();
+        if (restore_too and app.detection != null) {
+            try app.restore();
+            app.show_provenance = show_prov;
+        }
         draw(&app, win, ren, tex);
         if (screenshot) |png_path| saveScreenshot(arena, io, ren, png_path) catch |e| {
             try err.interface.print("vrestore-gui: could not save the screenshot '{s}': {s}\n", .{ png_path, @errorName(e) });
@@ -301,7 +320,9 @@ pub fn main(init: std.process.Init) !u8 {
                     try err.interface.print("vrestore-gui: {s}\n", .{app.problem[0..app.problem_len]});
                     return 1;
                 }
-                try out.interface.print("{{\"time_sec\":{d:.3},\"recovered\":{d},\"pixels\":{d},\"coverage\":{d:.4}}}\n", .{ app.time_sec, app.recovered.recovered, app.recovered.pixels, app.recovered.coverage() });
+                try out.interface.print("{{\"time_sec\":{d:.3},\"recovered\":{d},\"pixels\":{d},\"coverage\":{d:.4},\"provenance\":", .{ app.time_sec, app.recovered.recovered(), app.recovered.roiPixels(), app.recovered.coverage() });
+                try app.recovered.writeJson(&out.interface);
+                try out.interface.writeAll("}\n");
             }
             return 0;
         }
@@ -361,6 +382,12 @@ pub fn main(init: std.process.Init) !u8 {
                     },
                     sdl.SDL_SCANCODE_SPACE => {
                         if (app.restored != null) app.show_after = !app.show_after;
+                    },
+                    sdl.SDL_SCANCODE_P => {
+                        if (app.restored != null) {
+                            app.show_provenance = !app.show_provenance;
+                            app.show_after = true;
+                        }
                     },
                     sdl.SDL_SCANCODE_RIGHT => if (shift) try app.showAt(app.time_sec + 1) else try app.step(),
                     sdl.SDL_SCANCODE_LEFT => try app.showAt(app.time_sec - if (shift) 1 else app.frame_dur),
@@ -446,7 +473,12 @@ fn draw(app: *App, win: *sdl.SDL_Window, ren: *sdl.SDL_Renderer, tex: *sdl.SDL_T
 fn title(w: *Io.Writer, app: *const App) !void {
     try w.print("vrestore-gui | {d:.3}s / {d:.1}s", .{ app.time_sec, app.duration });
     if (app.restored != null) {
-        try w.print(" | {s} | restored {d:.1}% of the ROI (magenta: not recovered) | Space: before/after", .{ if (app.show_after) "AFTER" else "BEFORE", app.recovered.coverage() * 100 });
+        try w.print(" | {s} | restored {d:.1}% of the ROI", .{ if (app.show_after) "AFTER" else "BEFORE", app.recovered.coverage() * 100 });
+        // 由来ごとの割合（ROI の中）。色は P で重ねたときのもの
+        for (std.enums.values(Provenance)) |p| if (p.inRoi()) {
+            try w.print(" {s} {d:.1}%", .{ @tagName(p), app.recovered.fraction(p) * 100 });
+        };
+        try w.writeAll(if (app.show_provenance) " (green: temporal_real, magenta: unrecovered) | Space: before/after, P: provenance off" else " (magenta: unrecovered) | Space: before/after, P: provenance");
     }
     if (app.selection.rect) |r| try w.print(" | selected {d},{d} {d}x{d}", .{ r.x, r.y, r.w, r.h });
     if (app.detection) |d| {
