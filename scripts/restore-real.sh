@@ -186,6 +186,17 @@ if mc:
     acc = [m for m in mc if m["accepted"]]
     print(f"\nmask: accepted {len(acc)}/{len(mc)}; recall min {min(m['recall'] for m in mc):.4f} mean {sum(m['recall'] for m in mc)/len(mc):.4f}; "
           f"precision mean (accepted) {sum(m['precision'] for m in acc)/max(1,len(acc)):.4f}; hidden fraction mean (accepted) {sum(m['fraction'] for m in acc)/max(1,len(acc)):.3f}")
+# 入力のまま残した画素（由来 original）のうち正解から外れたもの。残ったウォーターマークの見積もり
+for r in ("fill-harmonic", "fill-harmonic-mask"):
+    kept = bad = allpx = 0
+    for n in rows:
+        pv = rows[n][r].get("provenance", {})
+        o = pv.get("original")
+        if o:
+            kept += o["pixels"]
+            bad += o["bad_fraction"] * o["pixels"]
+        allpx += sum(v["pixels"] for v in pv.values())
+    print(f"{r}: kept as input {kept/max(1,allpx):.3f} of the watermark rect, of which bad {bad/max(1,kept):.4f} (bad kept / rect {bad/max(1,allpx):.4f})")
 print("\nmean over cases (SSIM mean), and cases where the row beats watermarked:")
 for r in order:
     vals = [rows[n][r]["ssim"] for n in rows]
