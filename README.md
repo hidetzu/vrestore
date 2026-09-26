@@ -13,6 +13,8 @@
 - `vrestore detect-roi --ref <image> <video>` — 消したいウォーターマークを切り出した画像を渡すと、
   それが動画内のどこに固定されているかを探し、位置と信頼度を JSON で出す。
   `--debug-dir <dir>` で、検出した矩形を重ねたフレームと切り出し画像も書き出す
+- `vrestore compare --rect x,y,w,h <original> <processed>` — 処理後の動画が元の動画にどれだけ一致するかを、
+  矩形の中で SSIM / PSNR で出す（復元の良さを測るためのもの）
 - `vrestore probe <video>` — 動画を FFmpeg で開いて 1 フレーム目までデコードし、幅・高さ・尺・コーデックを JSON で出す
 
 ```sh

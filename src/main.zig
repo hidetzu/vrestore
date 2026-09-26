@@ -4,6 +4,7 @@ const build_options = @import("build_options");
 const video = @import("video.zig");
 const roi = @import("roi.zig");
 const detect_roi = @import("detect_roi.zig");
+const compare = @import("compare.zig");
 
 const usage =
     \\usage: vrestore <command> [args]
@@ -23,6 +24,10 @@ const usage =
     \\      --min-margin <f>        reliable needs (peak - best elsewhere) >= f
     \\      --min-psr <f>           reliable needs PSR >= f (0 = not used)
     \\
+    \\  compare [--rect x,y,w,h] [--per-frame] <reference> <test>
+    \\      compare <test> with the original <reference> frame by frame, inside the rect
+    \\      (default: whole frame). Prints SSIM and PSNR as JSON; both videos need the same frames.
+    \\
     \\  --version       print the version
     \\  --help          print this message
     \\
@@ -33,6 +38,7 @@ const Command = union(enum) {
     version,
     probe: []const u8,
     detect_roi: detect_roi.Args,
+    compare: compare.Args,
     /// 引数が足りない。どのコマンドかを持つ
     missing_arg: []const u8,
     /// 引数の形が違う。利用者に見せる文と、問題の引数
@@ -52,6 +58,7 @@ fn parseArgs(args: []const []const u8) Command {
         return .{ .probe = args[1] };
     }
     if (std.mem.eql(u8, a, "detect-roi")) return parseDetectRoi(args[1..]);
+    if (std.mem.eql(u8, a, "compare")) return parseCompare(args[1..]);
     return .{ .unknown = a };
 }
 
@@ -95,6 +102,34 @@ fn parseDetectRoi(args: []const []const u8) Command {
     return .{ .detect_roi = out };
 }
 
+fn parseCompare(args: []const []const u8) Command {
+    var out: compare.Args = .{};
+    var paths: [2][]const u8 = undefined;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "--per-frame")) {
+            out.per_frame = true;
+        } else if (std.mem.eql(u8, a, "--rect")) {
+            if (i + 1 >= args.len) return .{ .bad_arg = .{ .why = "option needs a value", .arg = a } };
+            i += 1;
+            out.rect = compare.parseRect(args[i]) orelse
+                return .{ .bad_arg = .{ .why = "--rect needs x,y,w,h", .arg = args[i] } };
+        } else if (std.mem.startsWith(u8, a, "--")) {
+            return .{ .unknown = a };
+        } else {
+            if (n == 2) return .{ .bad_arg = .{ .why = "compare takes two videos", .arg = a } };
+            paths[n] = a;
+            n += 1;
+        }
+    }
+    if (n < 2) return .{ .missing_arg = "compare" };
+    out.reference = paths[0];
+    out.test_video = paths[1];
+    return .{ .compare = out };
+}
+
 fn parseFraction(s: []const u8) ?f64 {
     const v = std.fmt.parseFloat(f64, s) catch return null;
     return if (v >= 0 and v <= 1) v else null;
@@ -125,12 +160,13 @@ pub fn main(init: std.process.Init) !u8 {
         },
         .probe => |path| return probe(arena, &out.interface, &err.interface, path),
         .detect_roi => |a| return detect_roi.run(init.gpa, io, &out.interface, &err.interface, a),
+        .compare => |a| return compare.run(init.gpa, &out.interface, &err.interface, a),
         .bad_arg => |b| {
             try err.interface.print("vrestore: {s}: '{s}'\n\n{s}", .{ b.why, b.arg, usage });
             return 2;
         },
         .missing_arg => |cmd| {
-            try err.interface.print("vrestore: '{s}' needs a video file\n\n{s}", .{ cmd, usage });
+            try err.interface.print("vrestore: '{s}' needs {s}\n\n{s}", .{ cmd, if (std.mem.eql(u8, cmd, "compare")) "two videos" else "a video file", usage });
             return 2;
         },
         .unknown => |a| {
@@ -169,6 +205,8 @@ test {
     _ = video;
     _ = roi;
     _ = detect_roi;
+    _ = compare;
+    _ = @import("metrics.zig");
 }
 
 test "parseArgs: no arguments shows help" {
@@ -196,6 +234,16 @@ test "parseArgs: detect-roi" {
     try std.testing.expectEqualStrings("0", parseArgs(&.{ "detect-roi", "--ref", "r", "--frames", "0", "v" }).bad_arg.arg);
     try std.testing.expectEqualStrings("1.5", parseArgs(&.{ "detect-roi", "--ref", "r", "--min-margin", "1.5", "v" }).bad_arg.arg);
     try std.testing.expectEqualStrings("detect-roi", parseArgs(&.{ "detect-roi", "--ref", "r" }).missing_arg);
+}
+
+test "parseArgs: compare" {
+    const got = parseArgs(&.{ "compare", "--rect", "1,2,30,40", "--per-frame", "ref.mp4", "out.mp4" }).compare;
+    try std.testing.expectEqualStrings("ref.mp4", got.reference);
+    try std.testing.expectEqualStrings("out.mp4", got.test_video);
+    try std.testing.expectEqual(@as(u32, 30), got.rect.?.w);
+    try std.testing.expect(got.per_frame);
+    try std.testing.expectEqualStrings("compare", parseArgs(&.{ "compare", "a.mp4" }).missing_arg);
+    try std.testing.expectEqualStrings("1,2", parseArgs(&.{ "compare", "--rect", "1,2", "a", "b" }).bad_arg.arg);
 }
 
 test "parseArgs: unknown argument is kept verbatim" {
