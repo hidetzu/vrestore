@@ -66,7 +66,7 @@ run_case() {
 	"$vr" detect-roi --ref "$d/ref.png" "$d/wm.mp4" >"$d/roi.json" 2>/dev/null
 	local mp=()
 	[ -n "$min_peak" ] && mp=(--min-peak "$min_peak")
-	"$vr" restore --roi "$d/roi.json" --raw "$d/out.rgb" --mask "$d/mask.gray" "${mp[@]}" "$d/wm.mp4" >"$d/restore.json"
+	"$vr" restore --roi "$d/roi.json" --raw "$d/out.rgb" --provenance "$d/provenance.bin" "${mp[@]}" "$d/wm.mp4" >"$d/restore.json"
 	ffmpeg -hide_banner -loglevel error -y $raw -i "$d/out.rgb" -c:v ffv1 -pix_fmt gbrp "$d/restored.mkv"
 	rm -f "$d/out.rgb"
 	local rect
@@ -75,13 +75,13 @@ run_case() {
 import json, subprocess, sys
 name, d = sys.argv[1], sys.argv[2]
 def cmp(f, mask=None):
-    a = ["$vr", "compare", "--rect", "$rect"] + (["--mask", mask] if mask else []) + [d + "/clean.mkv", d + "/" + f]
+    a = ["$vr", "compare", "--rect", "$rect"] + (["--provenance", mask] if mask else []) + [d + "/clean.mkv", d + "/" + f]
     return json.loads(subprocess.run(a, capture_output=True, check=True, text=True).stdout)
 row = {"case": name, "roi": json.load(open(d + "/roi.json")), "restore": json.load(open(d + "/restore.json")),
-       "watermarked": cmp("wm.mp4"), "reencode": cmp("reencode.mp4"), "temporal": cmp("restored.mkv", d + "/mask.gray")}
+       "watermarked": cmp("wm.mp4"), "reencode": cmp("reencode.mp4"), "temporal": cmp("restored.mkv", d + "/provenance.bin")}
 print(json.dumps(row))
 PY
-	rm -f "$d/mask.gray"
+	rm -f "$d/provenance.bin"
 }
 export -f run_case
 

@@ -60,11 +60,6 @@ enc() { ffmpeg -hide_banner -loglevel error -y "$@"; }
 for crf in 20 32; do
 	[ -e "$out/reencode-crf$crf.mp4" ] || enc -i "$out/orig.mkv" -c:v libx264 -preset veryfast -crf "$crf" -pix_fmt yuv420p "$out/reencode-crf$crf.mp4"
 done
-# 全画素が 255 のマスク: 再エンコードだけの行でも「外れた画素の割合」を出し、圧縮だけでどれだけ外れるかを見る
-if [ ! -e "$out/all.mask" ]; then
-	nf=$(ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of csv=p=0 "$out/orig.mkv")
-	python3 -c "import sys; sys.stdout.buffer.write(b'\xff' * ($W * $H * $nf))" >"$out/all.mask"
-fi
 
 specs=()
 for d in "${designs[@]}"; do
@@ -101,7 +96,7 @@ run_spec() {
 	enc -i "$d/watermarked.mp4" -vf "delogo=x=$rx:y=$ry:w=$rw:h=$rh" -c:v ffv1 -pix_fmt yuv420p "$d/delogo-roi.mkv"
 	enc -i "$d/watermarked.mp4" -vf "delogo=x=$x:y=$y:w=$ww:h=$wh" -c:v ffv1 -pix_fmt yuv420p "$d/delogo-tight.mkv"
 
-	"$vr" restore --roi "$d/detection.json" --raw "$d/temporal.rgb" --mask "$d/temporal.mask" "$d/watermarked.mp4" >"$d/temporal.json"
+	"$vr" restore --roi "$d/detection.json" --raw "$d/temporal.rgb" --provenance "$d/temporal.prov" "$d/watermarked.mp4" >"$d/temporal.json"
 	enc -f rawvideo -pix_fmt rgb24 -s "${W}x${H}" -r "$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of csv=p=0 "$d/watermarked.mp4")" \
 		-i "$d/temporal.rgb" -c:v ffv1 -pix_fmt yuv444p "$d/temporal.mkv"
 	rm -f "$d/temporal.rgb"
@@ -116,8 +111,7 @@ run_spec() {
 		*) f=$d/$row.mkv ;;
 		esac
 		local mask=()
-		[ "$row" = temporal ] && mask=(--mask "$d/temporal.mask")
-		[ "$row" = reencode ] && mask=(--mask "$out/all.mask")
+		[ "$row" = temporal ] && mask=(--provenance "$d/temporal.prov")
 		printf '%s %s %s\n' "$name" "$row" "$("$vr" compare --rect "$rect" "${mask[@]}" "$out/orig.mkv" "$f")"
 	done
 }
@@ -149,7 +143,7 @@ print("\ntemporal: recovered fraction of the watermark rect / PSNR over recovere
 for name in sorted(rows):
     t = rows[name]["temporal"]
     mp = "-" if t.get("masked_psnr") is None else f"{t['masked_psnr']:.1f}"
-    print(f"  {name:<26} {t['masked_fraction']:.3f}  {mp:>5}  bad {t['masked_bad_fraction']:.3f}   reencode bad {rows[name]['reencode']['masked_bad_fraction']:.3f}")
+    print(f"  {name:<26} {t['masked_fraction']:.3f}  {mp:>5}  bad {t['masked_bad_fraction']:.3f}   reencode bad {rows[name]['reencode']['bad_fraction']:.3f}")
 print("\nmean over cases (SSIM mean):")
 for r in order:
     vals = [rows[n][r]["ssim"] for n in rows]

@@ -43,13 +43,15 @@
 | 復元 | 位相相関（低い周波数だけ）で隣り合うフレームの平行移動を推定する。上下左右どちら向きでも、固定のウォーターマークがあっても正しい | `src/temporal.zig` の test `"temporal: estimateShift finds a pan in every direction, ignoring a fixed watermark"` |
 | 復元 | 位相相関の窓をウォーターマークの ROI と重ならない所から取る | test `"temporal: chooseWindow keeps the window off the ROI and takes the largest"` |
 | 復元 | 相関のピークが閾値未満のペアで鎖を切り、動いていないとは見なさない | test `"temporal: Track cuts the chain at an unestimated pair instead of assuming no motion"` |
-| 復元 | 戻したと言った画素は正解と一致し、戻せなかった画素は焼かれたまま残ってマスクが 0 になる。推定した移動量が間違っていれば、ROI の周りの帯が合わないのでそのフレームからは借りない。動かない背景では何も戻らない | test `"temporal: recoverFrame restores the exact background under a pan, refuses frames whose surroundings do not match, and reports what it could not"` |
-| CLI | `vrestore restore (--roi <detection.json> \| --rect) --raw <out.rgb> [--mask <out.gray>] <video>` が RGB24 の生フレームとマスクを書き、coverage などを JSON で出す | `zig build restore-e2e` |
-| CLI | `vrestore compare --mask` が、マスクのある画素（戻した画素）だけの PSNR、それが矩形の何割か、そのうち正解からどれかの色で 32 より離れた画素の割合（`masked_bad_fraction`）を出す。`--roi` で detect-roi の JSON を矩形にする | test `"metrics: mseMasked counts only masked pixels inside the rect"`、`zig build restore-e2e` |
+| 復元 | 戻したと言った画素（由来 `temporal_real`）は正解と一致し、戻せなかった画素は焼かれたまま残って由来が `unrecovered` になる。ROI の外は `original`。推定した移動量が間違っていれば、ROI の周りの帯が合わないのでそのフレームからは借りない。動かない背景では何も戻らない | test `"temporal: recoverFrame restores the exact background under a pan, refuses frames whose surroundings do not match, and reports what it could not"` |
+| 由来 | 各画素の由来（provenance）を 1 バイトで表す: 0 `original`（ROI の外）、1 `unrecovered`、2 `temporal_real`。3 / 4 は予約（`alpha_recovered` / `spatial_inpainted`）。知らない値は読まない | `src/provenance.zig` の test `"provenance: byte values are part of the file format"` |
+| 由来 | coverage は ROI の中の画素のうち、証拠から戻した由来（今は `temporal_real` だけ）の割合。ROI の外は数えない | test `"provenance: coverage counts recovered pixels over the ROI, not pixels outside it"` |
+| CLI | `vrestore restore (--roi <detection.json> \| --rect) --raw <out.rgb> [--provenance <out>] <video>` が RGB24 の生フレームと由来を書き、coverage と由来ごとの画素数を JSON で出す | `zig build restore-e2e`（`restore-pan15` で `temporal_real` の割合 ≥ 0.99、`restore-cut` で `unrecovered` の割合 = 1） |
+| CLI | `vrestore compare --provenance` が、由来ごとに画素数・割合・PSNR・外れた画素（どれかの色で 32 より大きい差）の割合を出す。`masked_*` は coverage に数える由来の画素をまとめたもの。由来によらない矩形全体の外れた画素の割合（`bad_fraction`）はいつも出す。`--roi` で detect-roi の JSON を矩形にする | test `"metrics: mseWhere counts only pixels with the label inside the rect"`、`"metrics: badPixels counts pixels off by more than bad_pixel_error in any color"`、`zig build restore-e2e` |
 | 復元（合成 E2E） | パンする背景で、ウォーターマークの ROI をほぼすべて戻し、正解に近い（パン 15 px: coverage ≥ 0.99・SSIM ≥ 0.9・戻した画素の PSNR ≥ 35。パン 7,3: ≥ 0.95・≥ 0.88・≥ 34。遅いパン × crf 35: coverage ≥ 0.6・戻した画素の PSNR ≥ 30） | `zig build restore-e2e` の `restore-pan15` `restore-pan7` `restore-pan3-crf35` |
 | 復元（合成 E2E） | 動きで説明できない（毎フレーム別の模様）・動かない背景では、1 画素も戻さない | `zig build restore-e2e` の `restore-cut` `restore-flat` |
 | 復元（合成 E2E） | 画面全体の平行移動ではない動き（ズーム）で、戻した画素のうち外れた画素が 2% 以下 | `zig build restore-e2e` の `restore-zoom` |
-| GUI | R で表示中のフレームを戻し（CLI と同じ部品・閾値）、Space で処理前 / 処理後を切り替える。戻せなかった画素はマゼンタ | `zig build gui` の `gui restore check`（coverage のみ）。表示は `--screenshot` で目視。キー操作は自動の検査なし |
+| GUI | R で表示中のフレームを戻し（CLI と同じ部品・閾値）、Space で処理前 / 処理後を切り替える。戻せなかった画素はマゼンタ。P で各画素の由来の色（`temporal_real` 緑、`unrecovered` マゼンタ）を重ね、窓のタイトルに由来ごとの割合を出す | `zig build gui` の `gui restore check`（coverage のみ）。表示は `--screenshot` で目視。キー操作は自動の検査なし |
 | リポジトリ衛生 | 動画・巨大ファイルが git の管理下に無い | `scripts/check-no-media.sh` |
 
 ## 2. ROI 検出の契約
@@ -201,6 +203,16 @@ SSIM・coverage は 12 ケースの平均。
 画面の角（背景が画面外へ出る・帯の一部が画面外で確かめられない）。戻した画素の PSNR が上限より 1〜4 dB 低いのは、
 強い圧縮で移動量が ±1 px ずれるため（未検証）。
 
+### provenance への置き換えで評価値が変わらないこと
+
+2026-09-26、同じ環境。二値マスクを provenance に置き換える前に保存した `scripts/restore-calibrate.sh` の結果と、
+置き換えた後に同じ 120 ケースを回した結果を比べた。
+
+| 何を比べたか | 値 |
+|---|---|
+| restore の recovered / pixels / coverage / coverage_min / pairs_cut / peak_min / peak_max、compare の SSIM / SSIM 最小 / MSE / PSNR / 戻した画素の数・割合・PSNR・外れた画素の割合、焼き込んだまま・再エンコードだけの SSIM / PSNR、検出の位置と reliable | 120 ケース × 24 値 = 2,880 個すべて一致 |
+| 由来の内訳（unrecovered + temporal_real）と pixels、temporal_real と recovered | 120 ケースすべて一致 |
+
 ### Temporal Recovery: 手持ちの実写に焼き込んだ素材（帯の確認の較正）
 
 2026-09-26、同じ環境。手元の実写 1 本（640x360、29.97 fps、手持ちの揺れ・被写体の動き・寄り引きがある）から
@@ -217,7 +229,7 @@ SSIM・coverage は 12 ケースの平均。
 
 | 何を測ったか | 値 |
 |---|---|
-| 再エンコードだけで外れた画素（全画素のマスク、72 ケース） | 最大 1.1% |
+| 再エンコードだけで外れた画素（矩形の全画素、72 ケース） | 最大 1.1% |
 | 合成のパン（中央）の coverage への影響（閾値 6） | 変わらない（15,0: 1.000、7,3: 0.988、3,1: 0.680 → 0.680） |
 | 合成のズーム（1%/フレーム、crf 23）: 確かめない → 閾値 6 | 外れた画素 3.6% → 0.0%、戻した割合 0.375 → 0.104 |
 
