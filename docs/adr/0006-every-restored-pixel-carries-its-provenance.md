@@ -11,7 +11,7 @@
   | 1 | `unrecovered` | ROI の中で、どの方式でも戻せなかった。入力の画素（焼かれたまま）を残している |
   | 2 | `temporal_real` | 背景が動いて見えている別フレームの実画素（ADR 0005） |
   | 3 | （予約）`alpha_recovered` | 半透明のウォーターマークを外して戻した画素 |
-  | 4 | （予約）`spatial_inpainted` | 周囲から推測して埋めた画素 |
+  | 4 | `spatial_inpainted` | 周囲から推測して埋めた画素（ADR 0008 で実装） |
 
 - **coverage は「映像内の証拠から戻せた割合」** で、`Provenance.isRecovered()` が true の由来だけを数える。
   予約した値のうち、`alpha_recovered` は証拠（透けて残った背景）から戻すので数える見込み、

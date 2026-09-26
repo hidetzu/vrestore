@@ -31,8 +31,10 @@ const usage =
     \\      pixels it could not recover are left as they were. Prints the recovery coverage as JSON.
     \\      --window <n>        frames to look at on each side (default 15)
     \\      --motion <m>        translation (whole-frame shift) or affine (shift + rotation + zoom)
+    \\      --fill <f>          none, directional or harmonic: guess the pixels still unrecovered from
+    \\                          their surroundings (provenance spatial_inpainted; not counted in coverage)
     \\      --provenance <out>  also write where each pixel came from, 1 byte per pixel per frame:
-    \\                          0 = outside the ROI, 1 = unrecovered, 2 = temporal_real
+    \\                          0 = outside the ROI, 1 = unrecovered, 2 = temporal_real, 4 = spatial_inpainted
     \\
     \\  compare [--rect x,y,w,h | --roi <detection.json>] [--per-frame] [--provenance <file>] <reference> <test>
     \\      compare <test> with the original <reference> frame by frame, inside the rect
@@ -180,6 +182,8 @@ fn parseRestore(args: []const []const u8) Command {
         } else if (std.mem.eql(u8, a, "--window")) {
             out.window = std.fmt.parseInt(usize, v, 10) catch 0;
             if (out.window == 0) return .{ .bad_arg = .{ .why = "--window needs a positive integer", .arg = v } };
+        } else if (std.mem.eql(u8, a, "--fill")) {
+            out.fill = std.meta.stringToEnum(@import("spatial.zig").Method, v) orelse return .{ .bad_arg = .{ .why = "--fill needs none, directional or harmonic", .arg = v } };
         } else if (std.mem.eql(u8, a, "--motion")) {
             out.motion = std.meta.stringToEnum(restore_cmd.MotionModel, v) orelse return .{ .bad_arg = .{ .why = "--motion needs translation or affine", .arg = v } };
         } else if (std.mem.eql(u8, a, "--max-ring-diff")) {
@@ -278,6 +282,7 @@ test {
     _ = @import("temporal.zig");
     _ = @import("provenance.zig");
     _ = @import("motion.zig");
+    _ = @import("spatial.zig");
     _ = restore_cmd;
 }
 

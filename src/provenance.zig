@@ -17,7 +17,8 @@ pub const Provenance = enum(u8) {
     /// Temporal Recovery: 背景が動いて見えている別フレームの実画素（docs/adr/0005）
     temporal_real = 2,
     // 予約: alpha_recovered = 3（半透明のウォーターマークを外して戻した画素）
-    // 予約: spatial_inpainted = 4（周囲から推測して埋めた画素）
+    /// Spatial Inpainting: 周囲の見えている画素から推測して埋めた（spatial.zig）。映像内の証拠ではない
+    spatial_inpainted = 4,
 
     /// 映像内の証拠から戻した画素か。coverage はこれを数える。
     /// ⚠ 推測で埋めた画素（spatial_inpainted を足したとき）は false にする。coverage は「戻せた割合」であって
@@ -26,6 +27,8 @@ pub const Provenance = enum(u8) {
         return switch (p) {
             .original, .unrecovered => false,
             .temporal_real => true,
+            // 推測で埋めた画素は「戻せた」に数えない（docs/adr/0006）
+            .spatial_inpainted => false,
         };
     }
 
@@ -33,7 +36,7 @@ pub const Provenance = enum(u8) {
     pub fn inRoi(p: Provenance) bool {
         return switch (p) {
             .original => false,
-            .unrecovered, .temporal_real => true,
+            .unrecovered, .temporal_real, .spatial_inpainted => true,
         };
     }
 
@@ -43,6 +46,7 @@ pub const Provenance = enum(u8) {
             .original => null,
             .unrecovered => .{ 255, 0, 255 },
             .temporal_real => .{ 0, 200, 90 },
+            .spatial_inpainted => .{ 255, 150, 0 },
         };
     }
 };
@@ -114,8 +118,10 @@ test "provenance: byte values are part of the file format" {
     try std.testing.expectEqual(@as(u8, 0), @intFromEnum(Provenance.original));
     try std.testing.expectEqual(@as(u8, 1), @intFromEnum(Provenance.unrecovered));
     try std.testing.expectEqual(@as(u8, 2), @intFromEnum(Provenance.temporal_real));
+    try std.testing.expectEqual(@as(u8, 4), @intFromEnum(Provenance.spatial_inpainted));
     try std.testing.expectEqual(Provenance.temporal_real, fromByte(2).?);
-    // 予約した値（3, 4）と知らない値は読めない
+    try std.testing.expectEqual(Provenance.spatial_inpainted, fromByte(4).?);
+    // 予約した値（3）と知らない値は読めない
     try std.testing.expectEqual(@as(?Provenance, null), fromByte(3));
     try std.testing.expectEqual(@as(?Provenance, null), fromByte(255));
 }
@@ -133,5 +139,10 @@ test "provenance: coverage counts recovered pixels over the ROI, not pixels outs
     var buf: [128]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try t.writeJson(&w);
-    try std.testing.expectEqualStrings("{\"unrecovered\":3,\"temporal_real\":7}", w.buffered());
+    try std.testing.expectEqualStrings("{\"unrecovered\":3,\"temporal_real\":7,\"spatial_inpainted\":0}", w.buffered());
+
+    // 推測で埋めた画素は ROI の画素には数えるが、coverage（戻せた割合）には数えない
+    for (0..3) |_| t.add(.spatial_inpainted);
+    try std.testing.expectEqual(@as(usize, 13), t.roiPixels());
+    try std.testing.expectEqual(@as(usize, 7), t.recovered());
 }

@@ -320,6 +320,8 @@ const RestoreCase = struct {
     roi: RoiCase,
     /// restore --motion。null なら既定（restore_cmd.default_motion）
     motion: ?[]const u8 = null,
+    /// restore --fill。null なら既定（restore_cmd.default_fill）
+    fill: ?[]const u8 = null,
     /// tools/roi_fixture check-restore の条件
     expect: []const u8,
 };
@@ -343,6 +345,11 @@ const restore_cases = [_]RestoreCase{
     // 毎フレーム別の模様: 動きで説明できないので、1 画素も貼らない
     // 由来はすべて unrecovered（戻さなかった画素を戻したと数えない）
     .{ .roi = .{ .spec = "name=restore-cut,bg=cut,x=240,y=150,frames=60", .crf = 23 }, .expect = "coverage<=0,provenance.unrecovered.fraction>=1" },
+    // 動かない滑らかな背景を、周囲から推測して埋める（--fill harmonic）。
+    // 埋めた画素は spatial_inpainted で、coverage には数えない。実測（crf 23）: SSIM 0.997、PSNR 42.9
+    .{ .roi = .{ .spec = "name=restore-flat-fill,bg=flat,x=240,y=150,frames=60", .crf = 23 }, .fill = "harmonic", .expect = "coverage<=0,provenance.spatial_inpainted.fraction>=0.99,ssim>=0.95" },
+    // パンで Temporal が戻せなかった残りだけを埋める。戻した実画素はそのまま。実測: SSIM 0.928 → 0.942
+    .{ .roi = .{ .spec = "name=restore-pan7-fill,bg=pan,pan_x=7,pan_y=3,x=240,y=150,frames=60", .crf = 23 }, .fill = "harmonic", .expect = "coverage>=0.95,ssim>=0.935,masked_psnr>=34,provenance.temporal_real.fraction>=0.95" },
     // 動かない背景: 隠れた画素はどのフレームにも写っていないので、1 画素も戻らない
     .{ .roi = .{ .spec = "name=restore-flat,bg=flat,x=240,y=150,frames=60", .crf = 23 }, .expect = "coverage<=0" },
 };
@@ -378,6 +385,7 @@ fn restoreCase(b: *std.Build, tool: *std.Build.Step.Compile, exe: *std.Build.Ste
     restore.setName(b.fmt("{s} restore", .{name}));
     restore.addArg("restore");
     if (c.motion) |m| restore.addArgs(&.{ "--motion", m });
+    if (c.fill) |f| restore.addArgs(&.{ "--fill", f });
     restore.addArg("--roi");
     restore.addFileArg(roi_json);
     restore.addArg("--raw");

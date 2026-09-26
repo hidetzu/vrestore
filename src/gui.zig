@@ -11,6 +11,7 @@
 //!   Space                    処理前 / 処理後を切り替える（処理後で戻せなかった画素はマゼンタ）
 //!   P                        処理後の画面に、各画素の由来（provenance）を色で重ねる / 外す
 //!   M                        動きのモデルを切り替える（translation / affine）。次の R から使う
+//!   F                        戻せなかった画素を周囲から推測して埋めるか切り替える（none / harmonic）。次の R から使う
 //!   ← / →                    1 フレーム戻る / 進む（Shift で 1 秒、↑ / ↓ で 10 秒）
 //!   Home / End               先頭 / 末尾
 //!   クリック・ドラッグ（下の帯）  その時刻へ移動
@@ -28,6 +29,7 @@ const temporal = @import("temporal.zig");
 const restore_cmd = @import("restore_cmd.zig");
 const provenance = @import("provenance.zig");
 const Provenance = provenance.Provenance;
+const spatial = @import("spatial.zig");
 
 const sdl = @cImport({
     @cInclude("SDL.h");
@@ -45,6 +47,7 @@ const usage =
     \\                          and print its coverage as a second JSON line
     \\  --show-provenance       with --restore, show the provenance colors (as pressing P)
     \\  --motion <m>            translation or affine (as pressing M)
+    \\  --fill <f>              none, directional or harmonic (F toggles none / harmonic)
     \\  --screenshot <png>      with --detect-and-exit, also save what the window shows
     \\
 ;
@@ -72,6 +75,8 @@ const App = struct {
     show_provenance: bool = false,
     /// 動きのモデル（M で切り替え）
     motion_model: restore_cmd.MotionModel = restore_cmd.default_motion,
+    /// 戻せなかった画素を埋める方式（F で切り替え）
+    fill: spatial.Method = restore_cmd.default_fill,
     /// 表示用の画素（処理後で、戻せなかった画素をマゼンタにしたもの）
     display: []u8,
     /// 検出できなかったときの理由（窓のタイトルに出す）
@@ -129,7 +134,7 @@ const App = struct {
         errdefer app.gpa.free(out);
         const prov = try app.gpa.alloc(Provenance, @as(usize, d.info.width) * d.info.height);
         errdefer app.gpa.free(prov);
-        app.recovered = try restore_cmd.recoverInWindow(app.gpa, app.motion_model, images, t, roi_rect, restore_cmd.default_min_peak, restore_cmd.default_max_ring_diff, out, prov);
+        app.recovered = try restore_cmd.recoverInWindow(app.gpa, app.motion_model, app.fill, images, t, roi_rect, restore_cmd.default_min_peak, restore_cmd.default_max_ring_diff, out, prov);
         app.restored = out;
         app.restored_prov = prov;
         app.show_after = true;
@@ -217,6 +222,7 @@ pub fn main(init: std.process.Init) !u8 {
     var restore_too = false;
     var show_prov = false;
     var motion_model = restore_cmd.default_motion;
+    var fill_method = restore_cmd.default_fill;
     var screenshot: ?[]const u8 = null;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -227,6 +233,9 @@ pub fn main(init: std.process.Init) !u8 {
             restore_too = true;
         } else if (std.mem.eql(u8, a, "--show-provenance")) {
             show_prov = true;
+        } else if (std.mem.eql(u8, a, "--fill") and i + 1 < args.len) {
+            i += 1;
+            fill_method = std.meta.stringToEnum(spatial.Method, args[i]) orelse return badArg(&err.interface, "--fill needs none, directional or harmonic", args[i]);
         } else if (std.mem.eql(u8, a, "--motion") and i + 1 < args.len) {
             i += 1;
             motion_model = std.meta.stringToEnum(restore_cmd.MotionModel, args[i]) orelse return badArg(&err.interface, "--motion needs translation or affine", args[i]);
@@ -269,6 +278,7 @@ pub fn main(init: std.process.Init) !u8 {
         .display = try arena.alloc(u8, dec.frameBytes()),
         .duration = dec.info.duration_sec orelse 0,
         .motion_model = motion_model,
+        .fill = fill_method,
         .frame_dur = 1 / fps,
     };
     try app.showAt(at);
@@ -396,6 +406,10 @@ pub fn main(init: std.process.Init) !u8 {
                         app.clearRestored();
                         app.motion_model = if (app.motion_model == .translation) .affine else .translation;
                     },
+                    sdl.SDL_SCANCODE_F => {
+                        app.clearRestored();
+                        app.fill = if (app.fill == .none) .harmonic else .none;
+                    },
                     sdl.SDL_SCANCODE_P => {
                         if (app.restored != null) {
                             app.show_provenance = !app.show_provenance;
@@ -484,14 +498,14 @@ fn draw(app: *App, win: *sdl.SDL_Window, ren: *sdl.SDL_Renderer, tex: *sdl.SDL_T
 }
 
 fn title(w: *Io.Writer, app: *const App) !void {
-    try w.print("vrestore-gui | {d:.3}s / {d:.1}s | motion {s}", .{ app.time_sec, app.duration, @tagName(app.motion_model) });
+    try w.print("vrestore-gui | {d:.3}s / {d:.1}s | motion {s} fill {s}", .{ app.time_sec, app.duration, @tagName(app.motion_model), @tagName(app.fill) });
     if (app.restored != null) {
         try w.print(" | {s} | restored {d:.1}% of the ROI", .{ if (app.show_after) "AFTER" else "BEFORE", app.recovered.coverage() * 100 });
         // 由来ごとの割合（ROI の中）。色は P で重ねたときのもの
         for (std.enums.values(Provenance)) |p| if (p.inRoi()) {
             try w.print(" {s} {d:.1}%", .{ @tagName(p), app.recovered.fraction(p) * 100 });
         };
-        try w.writeAll(if (app.show_provenance) " (green: temporal_real, magenta: unrecovered) | Space: before/after, P: provenance off" else " (magenta: unrecovered) | Space: before/after, P: provenance");
+        try w.writeAll(if (app.show_provenance) " (green: temporal_real, orange: spatial_inpainted, magenta: unrecovered) | Space: before/after, P: provenance off" else " (magenta: unrecovered) | Space: before/after, P: provenance");
     }
     if (app.selection.rect) |r| try w.print(" | selected {d},{d} {d}x{d}", .{ r.x, r.y, r.w, r.h });
     if (app.detection) |d| {
