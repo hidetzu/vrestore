@@ -64,7 +64,9 @@
 | 復元（明るさ） | 借りた画素に、ROI の周りの帯で測った明るさの差（表示中 − 借りたフレーム、R/G/B の平均）を足す。露出がフレームごとに 1 ずつ変わる動画でも、戻した画素は表示中のフレームの正解と一致する | test `"temporal: recoverFrame matches the brightness of the borrowed pixels to the frame shown"` |
 | 由来 | 各画素の由来（provenance）を 1 バイトで表す: 0 `original`（ROI の外）、1 `unrecovered`、2 `temporal_real`、4 `spatial_inpainted`。3 は予約（`alpha_recovered`）。知らない値は読まない | `src/provenance.zig` の test `"provenance: byte values are part of the file format"` |
 | 由来 | coverage は ROI の中の画素のうち、証拠から戻した由来（今は `temporal_real` だけ）の割合。ROI の外と、推測で埋めた `spatial_inpainted` は数えない | test `"provenance: coverage counts recovered pixels over the ROI, not pixels outside it"` |
-| CLI | `vrestore restore (--roi <detection.json> \| --rect) --raw <out.rgb> [--provenance <out>] [--motion affine\|translation] [--fill none\|directional\|harmonic] [--mask none\|auto] <video>` が RGB24 の生フレームと由来を書き、coverage と由来ごとの画素数を JSON で出す | `zig build restore-e2e`（`restore-pan15` で `temporal_real` の割合 ≥ 0.99、`restore-cut` で `unrecovered` の割合 = 1） |
+| CLI | `vrestore restore (--roi <detection.json> \| --rect) (--out <out.mp4> \| --raw <out.rgb>) [--crf <n>] [--audio copy\|none] [--provenance <out>] [--motion affine\|translation] [--fill none\|directional\|harmonic] [--mask none\|auto] <video>` が全フレームを H.264 の MP4 と / または RGB24 の生フレームに書き、由来を書き、coverage と由来ごとの画素数を JSON で出す | `zig build restore-e2e`（`restore-pan15` で `temporal_real` の割合 ≥ 0.99、`restore-cut` で `unrecovered` の割合 = 1） |
+| 書き出し | `--out` の MP4 は、入力と同じ数のフレームを元の時刻で持ち、`--raw` で同時に書いた RGB との差は H.264 の符号化の分だけ（合成のパンで PSNR 42.2 dB・SSIM 0.984、判定 ≥ 38 / ≥ 0.97）。元の音声（AAC）のパケットは数も中身も同じ（再符号化しない） | `zig build restore-e2e` の `restore-export`（`check-restore` と `roi_fixture check-audio`） |
+| 書き出し（音声） | 元に音声が無ければ音声なし（JSON は `"audio":"absent"`）、`--audio none` なら入れない。MP4 に入らない音声（ADPCM・μ-law・WMA などで手元で確認）なら書き始める前に止める | 手元で確認（自動の検査なし） |
 | CLI | `vrestore compare --provenance` が、由来ごとに画素数・割合・PSNR・外れた画素（どれかの色で 32 より大きい差）の割合を出す。`masked_*` は coverage に数える由来の画素をまとめたもの。由来によらない矩形全体の外れた画素の割合（`bad_fraction`）はいつも出す。`--roi` で detect-roi の JSON を矩形にする | test `"metrics: mseWhere counts only pixels with the label inside the rect"`、`"metrics: badPixels counts pixels off by more than bad_pixel_error in any color"`、`zig build restore-e2e` |
 | 復元（合成 E2E） | パンする背景で、ウォーターマークの ROI をほぼすべて戻し、正解に近い（パン 15 px: coverage ≥ 0.99・SSIM ≥ 0.9・戻した画素の PSNR ≥ 35。パン 7,3: ≥ 0.95・≥ 0.88・≥ 34。遅いパン × crf 35: coverage ≥ 0.6・戻した画素の PSNR ≥ 30） | `zig build restore-e2e` の `restore-pan15` `restore-pan7` `restore-pan3-crf35` |
 | 復元（合成 E2E） | 動きで説明できない（毎フレーム別の模様）・動かない背景では、1 画素も戻さない | `zig build restore-e2e` の `restore-cut` `restore-flat` |
@@ -113,7 +115,7 @@ yuv420p の動画を `ffmpeg -vf crop` で切ると座標と大きさが偶数�
 | マスクの既定での使用 | `--mask auto` で使える（ADR 0010、0011）。既定は ROI 全体を隠す。実写で取りこぼしはほぼ無くなったが、背景の動かない縁も隠すので適合率は 0.30〜0.40 |
 | Temporal の被写体ごとの動き（ROI 周辺の block motion / optical flow） | 動きは画面全体の affine（ADR 0007）。手持ちの実写で戻らないのは、背景が窓の中で露出していないためで、局所的な動きを追っても戻らない（SPEC §4） |
 | ウォーターマークの自動発見 | 解く問題を「指定されたものの位置」に絞る |
-| MP4 の書き出し | 復元が無い段階で出すものが無い |
+| 音声の再符号化、MP4 以外の出力形式、映像のコーデックの選択 | 出力は H.264（libx264）の MP4 だけ。音声はそのまま写し、MP4 に入らない形式なら止めて `--audio none` を案内する（ADR 0013） |
 | 動画プレイヤー UI | CLI / テストで境界を作るのが先。導入時に ADR を書く |
 | GPU / SIMD 最適化 | 測って遅いと分かってから |
 | 動かない背景とウォーターマークの区別 | 解く問題は「参照画像がどこに固定されているか」なので、背景が静止している動画では、切った背景そのものが毎フレーム同じ位置にあり、正しく見つかる（較正で観測）。それがウォーターマークかどうかは判定しない |

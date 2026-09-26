@@ -15,14 +15,15 @@
   `--debug-dir <dir>` で、検出した矩形を重ねたフレームと切り出し画像も書き出す
 - `vrestore-gui <video>` — フレームを見ながらウォーターマークの範囲をドラッグで選び、Enter で検出する確認用の画面。
   検出した位置が枠で重なり、得票率・margin・reliable が窓のタイトルに出る（`zig build gui` で作る。SDL2 が要る）
-- `vrestore restore --roi detection.json --raw out.rgb --provenance out.prov input.mp4` — 検出した ROI の画素を、
+- `vrestore restore --roi detection.json --out restored.mp4 input.mp4` — 検出した ROI の画素を、
   背景が動いて見えている別のフレームの実画素で戻す（Temporal Recovery）。戻せなかった画素は焼かれたまま残し、
   各画素の由来（provenance: 戻した `temporal_real` / 戻せなかった `unrecovered`）と coverage（戻せた割合）で
   報告する。動きは画面全体の affine（平行移動 + 回転 + 拡大縮小）で追う（`--motion translation` で平行移動だけ）。
   `--mask auto` で、ROI の中のウォーターマークの画素（動画を通して色が変わらない画素）だけを埋め、文字の間などに
   見えている本物の背景は残す（実写で取りこぼしがあるので既定は使わない）。
   `--fill harmonic` で、戻せなかった画素を周囲から推測して埋める（由来 `spatial_inpainted`、coverage には数えない。
-  既定では埋めない）。出力は RGB24 の生フレーム（ffmpeg でエンコードする）。
+  既定では埋めない）。`--out` で全フレームを H.264 の MP4 に書き出し、元の音声を再符号化せずに入れる
+  （`--crf` で画質、`--audio none` で音声なし）。`--raw out.rgb` で RGB24 の生フレーム、`--provenance` で各画素の由来も書ける。
   背景が動かない動画（固定カメラ）では何も戻らない
 - `vrestore compare --rect x,y,w,h <original> <processed>` — 処理後の動画が元の動画にどれだけ一致するかを、
   矩形の中で SSIM / PSNR で出す（復元の良さを測るためのもの）
