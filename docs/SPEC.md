@@ -52,20 +52,22 @@
 | 復元 | ブロックの動きから、1% の拡大 + 0.5 度の回転を画面の四隅で 1 px 未満の誤差で推定する | test `"motion: estimateAffine finds a small zoom and rotation between two frames"` |
 | 補間 | `--fill` は unrecovered の画素だけを埋めて `spatial_inpainted` にし、見えている画素（ROI の外・Temporal の実画素）は変えない | `src/spatial.zig` の test `"spatial: fills only unrecovered pixels and labels them spatial_inpainted"` |
 | 補間 | harmonic は埋めた各画素を上下左右の平均にする（ラプラス方程式を解く）。directional はそうならない。線形の勾配は harmonic で正解との差 1 以内 | test `"spatial: harmonic makes every filled pixel the average of its neighbours, directional does not"`、`"spatial: harmonic reproduces a linear gradient exactly, directional is close"` |
+| マスク | 背景が変わる中で変わらない画素（ウォーターマーク）を見分け、1 px 広げる。背景も変わらなければ見分けられないとして ROI 全体を隠す。大津の二値化で 2 つの塊を分ける | `src/wmask.zig` の test `"wmask: finds the pixels that stay the same while the background changes"`、`"wmask: falls back to hiding the whole ROI when the background does not move either"`、`"wmask: otsu splits two clusters"` |
+| マスク（合成 E2E） | `--mask auto` で、毎フレーム別の模様の背景を harmonic で埋めて SSIM ≥ 0.72、本物のウォーターマークの画素の再現率 ≥ 0.99 | `zig build restore-e2e` の `restore-cut-mask`（check-mask を含む） |
 | 補間（合成 E2E） | 動かない滑らかな背景を harmonic で埋めると SSIM ≥ 0.95、coverage は 0 のまま。パンでは Temporal の実画素を変えずに残りを埋める | `zig build restore-e2e` の `restore-flat-fill` `restore-pan7-fill` |
 | 復元 | 位相相関の窓をウォーターマークの ROI と重ならない所から取る | test `"temporal: chooseWindow keeps the window off the ROI and takes the largest"` |
 | 復元 | 相関のピークが閾値未満のペアで鎖を切り、動いていないとは見なさない | test `"temporal: Track cuts the chain at an unestimated pair instead of assuming no motion"` |
 | 復元 | 戻したと言った画素（由来 `temporal_real`）は正解と一致し、戻せなかった画素は焼かれたまま残って由来が `unrecovered` になる。ROI の外は `original`。推定した移動量が間違っていれば、ROI の周りの帯が合わないのでそのフレームからは借りない。動かない背景では何も戻らない | test `"temporal: recoverFrame restores the exact background under a pan, refuses frames whose surroundings do not match, and reports what it could not"` |
 | 由来 | 各画素の由来（provenance）を 1 バイトで表す: 0 `original`（ROI の外）、1 `unrecovered`、2 `temporal_real`、4 `spatial_inpainted`。3 は予約（`alpha_recovered`）。知らない値は読まない | `src/provenance.zig` の test `"provenance: byte values are part of the file format"` |
 | 由来 | coverage は ROI の中の画素のうち、証拠から戻した由来（今は `temporal_real` だけ）の割合。ROI の外と、推測で埋めた `spatial_inpainted` は数えない | test `"provenance: coverage counts recovered pixels over the ROI, not pixels outside it"` |
-| CLI | `vrestore restore (--roi <detection.json> \| --rect) --raw <out.rgb> [--provenance <out>] [--motion affine\|translation] [--fill none\|directional\|harmonic] <video>` が RGB24 の生フレームと由来を書き、coverage と由来ごとの画素数を JSON で出す | `zig build restore-e2e`（`restore-pan15` で `temporal_real` の割合 ≥ 0.99、`restore-cut` で `unrecovered` の割合 = 1） |
+| CLI | `vrestore restore (--roi <detection.json> \| --rect) --raw <out.rgb> [--provenance <out>] [--motion affine\|translation] [--fill none\|directional\|harmonic] [--mask none\|auto] <video>` が RGB24 の生フレームと由来を書き、coverage と由来ごとの画素数を JSON で出す | `zig build restore-e2e`（`restore-pan15` で `temporal_real` の割合 ≥ 0.99、`restore-cut` で `unrecovered` の割合 = 1） |
 | CLI | `vrestore compare --provenance` が、由来ごとに画素数・割合・PSNR・外れた画素（どれかの色で 32 より大きい差）の割合を出す。`masked_*` は coverage に数える由来の画素をまとめたもの。由来によらない矩形全体の外れた画素の割合（`bad_fraction`）はいつも出す。`--roi` で detect-roi の JSON を矩形にする | test `"metrics: mseWhere counts only pixels with the label inside the rect"`、`"metrics: badPixels counts pixels off by more than bad_pixel_error in any color"`、`zig build restore-e2e` |
 | 復元（合成 E2E） | パンする背景で、ウォーターマークの ROI をほぼすべて戻し、正解に近い（パン 15 px: coverage ≥ 0.99・SSIM ≥ 0.9・戻した画素の PSNR ≥ 35。パン 7,3: ≥ 0.95・≥ 0.88・≥ 34。遅いパン × crf 35: coverage ≥ 0.6・戻した画素の PSNR ≥ 30） | `zig build restore-e2e` の `restore-pan15` `restore-pan7` `restore-pan3-crf35` |
 | 復元（合成 E2E） | 動きで説明できない（毎フレーム別の模様）・動かない背景では、1 画素も戻さない | `zig build restore-e2e` の `restore-cut` `restore-flat` |
 | 復元（合成 E2E） | 画面全体の平行移動ではない動き（ズーム）で、戻した画素のうち外れた画素が 2% 以下 | `zig build restore-e2e` の `restore-zoom` |
 | 復元（合成 E2E） | 回転 + パンで、affine（既定）が ROI の 8 割以上を戻し、SSIM ≥ 0.75、外れた画素 ≤ 1% | `zig build restore-e2e` の `restore-rotpan`（平行移動では coverage 0.57・SSIM 0.44 で FAIL） |
 | 復元（合成 E2E） | `--motion translation` でもパン 7,3 を戻す | `zig build restore-e2e` の `restore-pan7-translation` |
-| GUI | Space で再生 / 一時停止、H で操作パネルを隠す、C で場面（動画名・時刻・フレーム番号）をクリップボードと標準出力へ。B で処理前 / 処理後。F で戻せなかった画素を埋めるか（none / harmonic）を切り替え、M で動きのモデル（affine / translation）を切り替え、窓のタイトルに出す。R で表示中のフレームを戻し（CLI と同じ部品・閾値）、戻せなかった画素はマゼンタで見せる。P で各画素の由来の色（`temporal_real` 緑、`unrecovered` マゼンタ）を重ね、窓のタイトルに由来ごとの割合を出す | `zig build gui` の `gui restore check`（coverage のみ）。表示は `--screenshot` で目視。キー操作は自動の検査なし |
+| GUI | K でマスク（auto / none）を切り替え、Space で再生 / 一時停止、H で操作パネルを隠す、C で場面（動画名・時刻・フレーム番号）をクリップボードと標準出力へ。B で処理前 / 処理後。F で戻せなかった画素を埋めるか（none / harmonic）を切り替え、M で動きのモデル（affine / translation）を切り替え、窓のタイトルに出す。R で表示中のフレームを戻し（CLI と同じ部品・閾値）、戻せなかった画素はマゼンタで見せる。P で各画素の由来の色（`temporal_real` 緑、`unrecovered` マゼンタ）を重ね、窓のタイトルに由来ごとの割合を出す | `zig build gui` の `gui restore check`（coverage のみ）。表示は `--screenshot` で目視。キー操作は自動の検査なし |
 | リポジトリ衛生 | 動画・巨大ファイルが git の管理下に無い | `scripts/check-no-media.sh` |
 
 ## 2. ROI 検出の契約
@@ -104,7 +106,7 @@ yuv420p の動画を `ffmpeg -vf crop` で切ると座標と大きさが偶数�
 | 実装しない | 理由 |
 |---|---|
 | 背景復元の Alpha Inversion / 生成 | Temporal と Spatial（推測、既定では行わない）だけ（[ADR 0005](adr/0005-temporal-recovery-copies-real-pixels-and-leaves-the-rest-unrecovered.md)、[ADR 0008](adr/0008-spatial-inpainting-is-opt-in-and-never-counted-as-recovered.md)） |
-| ROI の中でウォーターマークの画素だけを見分けること | ROI（参照画像の余白込み）を丸ごと埋めるので、背景が見えている余白も推測で埋める（ADR 0008 の帰結） |
+| マスクの既定での使用 | `--mask auto` で使える（ADR 0010）。実写で本物のウォーターマークの画素の取りこぼしがあるので、既定は ROI 全体を隠す |
 | Temporal の被写体ごとの動き（ROI 周辺の block motion / optical flow） | 動きは画面全体の affine（ADR 0007）。手持ちの実写で戻らないのは、背景が窓の中で露出していないためで、局所的な動きを追っても戻らない（SPEC §4） |
 | ウォーターマークの自動発見 | 解く問題を「指定されたものの位置」に絞る |
 | MP4 の書き出し | 復元が無い段階で出すものが無い |
@@ -334,6 +336,38 @@ affine で戻る割合が小さいのは正しい。平行移動が「戻した�
 
 解釈: 「delogo（ぴったりの矩形）」は焼き込んだ位置を知っている測定側だけが使えるもので、埋める範囲が小さいぶん元に近い。
 検出した ROI は余白を含むので、harmonic は余白まで埋めている。
+
+### ウォーターマークのマスク（`--mask auto`）
+
+2026-09-26、同じ環境。harmonic で埋める。
+
+合成（640x360 / 10 fps / 60 フレーム / crf 23、中央の ROI、各 1 ケース）。再現率 = 本物のウォーターマークの画素のうち
+隠れている扱いにした割合、適合率 = 隠した画素のうち本物だった割合（`roi_fixture check-mask`）:
+
+| 背景 | SSIM: ROI 全体 → マスク | 外れた画素 | 再現率 | 適合率: ROI 全体 → マスク |
+|---|---|---|---|---|
+| パン 7,3 | 0.942 → 0.942 | 0.01% → 0.00% | 1.0000 | 0.44 → 0.46 |
+| 遅いパン 3,1 | 0.855 → 0.881 | 6.36% → 1.14% | 1.0000 | 0.44 → 0.51 |
+| 毎フレーム別の模様 | 0.649 → 0.758 | 29.89% → 2.92% | 1.0000 | 0.44 → 0.65 |
+| 回転 0.2 度 + パン 5,2 | 0.920 → 0.923 | 0.71% → 0.09% | 1.0000 | 0.44 → 0.47 |
+| 静止（見分けられないので ROI 全体） | 0.997 → 0.997 | 0 → 0 | 1.0000 | 0.44 → 0.44 |
+
+手持ちの実写に焼き込んだ 3 区間（各 24 ケース、「Spatial Inpainting」と同じ条件、動きは affine）。
+ウォーターマークの外接矩形の SSIM（24 ケースの平均）と、焼いた PNG の不透明な画素に対する再現率:
+
+| 区間 | 焼き込んだまま | harmonic（ROI 全体） | harmonic（マスク） | 参考: delogo（ぴったりの矩形） | マスクを使えた | 再現率 最小 / 平均 | 適合率 平均 | 隠す割合 平均 |
+|---|---|---|---|---|---|---|---|---|
+| 600 秒 | 0.234 | 0.360 | 0.441 | 0.443 | 22 / 24 | 0.930 / 0.992 | 0.30 | 87% |
+| 2500 秒 | 0.185 | 0.673 | 0.781 | 0.709 | 24 / 24 | 0.976 / 0.997 | 0.37 | 75% |
+| 5000 秒 | 0.186 | 0.545 | 0.656 | 0.622 | 24 / 24 | 0.985 / 0.996 | 0.43 | 65% |
+
+| 何を測ったか | 値 |
+|---|---|
+| 72 ケースでのマスクの効果（SSIM の差、マスク − ROI 全体） | 平均 +0.100、最小 −0.057、最大 +0.326。下がったのは 9 / 72 |
+| PSNR の平均（3 区間）: ROI 全体 → マスク | 16.10 → 18.31、19.54 → 23.33、21.06 → 24.94 dB |
+| 最初の設計（Temporal の範囲もマスクで絞る）での合成のパン 7,3 | SSIM 0.942 → 0.804（採らなかった、ADR 0010） |
+
+解釈: 取りこぼし（再現率 < 1）の画素はウォーターマークが残る。実写の固定カメラ（24 ケース）はこの PR の時点で未測定。
 
 ### Temporal Recovery: 実写（固定カメラ）
 

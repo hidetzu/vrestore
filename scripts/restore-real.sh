@@ -12,6 +12,8 @@
 #                   焼かれたまま残る。戻した画素だけの PSNR と coverage も出す
 #   fill-directional / fill-harmonic
 #                   temporal の後、戻せなかった画素を周囲から推測して埋めたもの（--fill）
+#   fill-harmonic-mask
+#                   fill-harmonic に --mask auto を足したもの。戻せなかった画素のうちウォーターマークの外は入力のまま
 # 復元方式の出力は可逆で保存する（出力の再圧縮で落ちる分を混ぜない）。
 #
 # 使い方: scripts/restore-real.sh [-s 開始秒] [-d 秒数] [-j 並列数] [-M translation|affine] <video>
@@ -106,18 +108,38 @@ run_spec() {
 	enc -f rawvideo -pix_fmt rgb24 -s "${W}x${H}" -r "$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of csv=p=0 "$d/watermarked.mp4")" \
 		-i "$d/temporal.rgb" -c:v ffv1 -pix_fmt yuv444p "$d/temporal.mkv"
 	rm -f "$d/temporal.rgb"
-	local fm
-	for fm in directional harmonic; do
-		"$vr" restore --motion "$motion" --fill "$fm" --roi "$d/detection.json" --raw "$d/fill-$fm.rgb" --provenance "$d/fill-$fm.prov" "$d/watermarked.mp4" >"$d/fill-$fm.json"
+	local fm mk
+	for fm in directional harmonic harmonic-mask; do
+		mk=none
+		[ "$fm" = harmonic-mask ] && mk=auto
+		"$vr" restore --motion "$motion" --fill "${fm%-mask}" --mask "$mk" --roi "$d/detection.json" --raw "$d/fill-$fm.rgb" --provenance "$d/fill-$fm.prov" "$d/watermarked.mp4" >"$d/fill-$fm.json"
 		enc -f rawvideo -pix_fmt rgb24 -s "${W}x${H}" -r "$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of csv=p=0 "$d/watermarked.mp4")" \
 			-i "$d/fill-$fm.rgb" -c:v ffv1 -pix_fmt yuv444p "$d/fill-$fm.mkv"
 		rm -f "$d/fill-$fm.rgb"
 	done
+	# 焼いたウォーターマークの本当の画素（PNG の不透明な所）と、マスクで隠れている扱いにした画素（由来が original 以外）を比べる
+	python3 - "$wm" "$x" "$y" "$W" "$H" "$d/fill-harmonic-mask.prov" "$d/fill-harmonic-mask.json" >"$d/mask-check.json" <<'PY'
+import sys, json
+from PIL import Image
+wm, x, y, W, H, prov, res = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5]), sys.argv[6], sys.argv[7]
+a = Image.open(wm).getchannel("A")
+p = open(prov, "rb").read(W * H)
+tp = t = hd = 0
+for yy in range(a.height):
+    for xx in range(a.width):
+        if a.getpixel((xx, yy)) > 0:
+            t += 1
+            tp += p[(y + yy) * W + x + xx] != 0
+hd = sum(1 for b in p if b != 0)
+r = json.load(open(res))
+print(json.dumps({"recall": tp / max(1, t), "precision": tp / max(1, hd), "truth": t, "hidden": hd,
+                  "accepted": r.get("mask_accepted"), "fraction": r.get("mask_fraction")}))
+PY
 
 	# 測るのはウォーターマークの外接矩形（焼き込んだ場所）。temporal のマスクは ROI（余白込み）について出ているが、
 	# マスクのある画素だけを数えるので、外接矩形の中の戻した画素の PSNR になる
 	local rect=$x,$y,$ww,$wh row f
-	for row in watermarked reencode delogo-roi delogo-tight temporal fill-directional fill-harmonic; do
+	for row in watermarked reencode delogo-roi delogo-tight temporal fill-directional fill-harmonic fill-harmonic-mask; do
 		case $row in
 		watermarked) f=$d/watermarked.mp4 ;;
 		reencode) f=$out/reencode-crf$crf.mp4 ;;
@@ -142,7 +164,7 @@ rows = collections.defaultdict(dict)
 for line in open(sys.argv[1]):
     name, row, js = line.split(" ", 2)
     rows[name][row] = json.loads(js)
-order = ["watermarked", "reencode", "delogo-roi", "delogo-tight", "temporal", "fill-directional", "fill-harmonic"]
+order = ["watermarked", "reencode", "delogo-roi", "delogo-tight", "temporal", "fill-directional", "fill-harmonic", "fill-harmonic-mask"]
 print(f"\n{'case':<26}" + "".join(f"{r:>22}" for r in order))
 print(f"{'':<26}" + "".join(f"{'SSIM mean/min  PSNR':>22}" for _ in order))
 for name in sorted(rows):
@@ -158,6 +180,12 @@ for name in sorted(rows):
     t = rows[name]["temporal"]
     mp = "-" if t.get("masked_psnr") is None else f"{t['masked_psnr']:.1f}"
     print(f"  {name:<26} {t['masked_fraction']:.3f}  {mp:>5}  bad {t['masked_bad_fraction']:.3f}   reencode bad {rows[name]['reencode']['bad_fraction']:.3f}")
+import glob, os
+mc = [json.load(open(f)) for f in glob.glob(os.path.join(os.path.dirname(sys.argv[1]), "cases", "*", "mask-check.json"))]
+if mc:
+    acc = [m for m in mc if m["accepted"]]
+    print(f"\nmask: accepted {len(acc)}/{len(mc)}; recall min {min(m['recall'] for m in mc):.4f} mean {sum(m['recall'] for m in mc)/len(mc):.4f}; "
+          f"precision mean (accepted) {sum(m['precision'] for m in acc)/max(1,len(acc)):.4f}; hidden fraction mean (accepted) {sum(m['fraction'] for m in acc)/max(1,len(acc)):.3f}")
 print("\nmean over cases (SSIM mean), and cases where the row beats watermarked:")
 for r in order:
     vals = [rows[n][r]["ssim"] for n in rows]

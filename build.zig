@@ -345,6 +345,8 @@ const RestoreCase = struct {
     motion: ?[]const u8 = null,
     /// restore --fill。null なら既定（restore_cmd.default_fill）
     fill: ?[]const u8 = null,
+    /// restore --mask。"auto" なら、本物のウォーターマークの画素を取りこぼしていないかも判定する（再現率 >= 0.99）
+    mask: ?[]const u8 = null,
     /// tools/roi_fixture check-restore の条件
     expect: []const u8,
 };
@@ -373,6 +375,9 @@ const restore_cases = [_]RestoreCase{
     .{ .roi = .{ .spec = "name=restore-flat-fill,bg=flat,x=240,y=150,frames=60", .crf = 23 }, .fill = "harmonic", .expect = "coverage<=0,provenance.spatial_inpainted.fraction>=0.99,ssim>=0.95" },
     // パンで Temporal が戻せなかった残りだけを埋める。戻した実画素はそのまま。実測: SSIM 0.928 → 0.942
     .{ .roi = .{ .spec = "name=restore-pan7-fill,bg=pan,pan_x=7,pan_y=3,x=240,y=150,frames=60", .crf = 23 }, .fill = "harmonic", .expect = "coverage>=0.95,ssim>=0.935,masked_psnr>=34,provenance.temporal_real.fraction>=0.95" },
+    // 毎フレーム別の模様を、ウォーターマークの画素だけ埋める（--mask auto）。本物の背景が見えている画素は残す。
+    // 実測（crf 23）: ROI 全体を埋めると SSIM 0.649、マスクで 0.758。再現率 1.0000
+    .{ .roi = .{ .spec = "name=restore-cut-mask,bg=cut,x=240,y=150,frames=60", .crf = 23 }, .fill = "harmonic", .mask = "auto", .expect = "coverage<=0,ssim>=0.72,mask_accepted>=1" },
     // 動かない背景: 隠れた画素はどのフレームにも写っていないので、1 画素も戻らない
     .{ .roi = .{ .spec = "name=restore-flat,bg=flat,x=240,y=150,frames=60", .crf = 23 }, .expect = "coverage<=0" },
 };
@@ -409,6 +414,7 @@ fn restoreCase(b: *std.Build, tool: *std.Build.Step.Compile, exe: *std.Build.Ste
     restore.addArg("restore");
     if (c.motion) |m| restore.addArgs(&.{ "--motion", m });
     if (c.fill) |f| restore.addArgs(&.{ "--fill", f });
+    if (c.mask) |m| restore.addArgs(&.{ "--mask", m });
     restore.addArg("--roi");
     restore.addFileArg(roi_json);
     restore.addArg("--raw");
@@ -436,6 +442,22 @@ fn restoreCase(b: *std.Build, tool: *std.Build.Step.Compile, exe: *std.Build.Ste
     chk.addFileArg(cmp_json);
     chk.addArg(c.expect);
     chk.expectExitCode(0);
+
+    if (c.mask != null) {
+        // 焼いたウォーターマークの本当の画素と、隠れている扱いにした画素（由来が original 以外）を比べる
+        const truth_mask = b.addRunArtifact(tool);
+        truth_mask.setName(b.fmt("{s} synth-mask", .{name}));
+        truth_mask.addArgs(&.{ "synth-mask", spec });
+        const mask_bin = truth_mask.addOutputFileArg("mask.bin");
+        const mchk = b.addRunArtifact(tool);
+        mchk.setName(b.fmt("{s} check-mask", .{name}));
+        mchk.addArg("check-mask");
+        mchk.addFileArg(mask_bin);
+        mchk.addFileArg(prov);
+        mchk.addArgs(&.{ "640", "360", "0.99" });
+        mchk.expectExitCode(0);
+        chk.step.dependOn(&mchk.step);
+    }
     return &chk.step;
 }
 
