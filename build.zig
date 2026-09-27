@@ -402,11 +402,13 @@ const restore_cases = [_]RestoreCase{
     // 毎フレーム別の模様: 動きで説明できないので、1 画素も貼らない
     // 由来はすべて unrecovered（戻さなかった画素を戻したと数えない）
     .{ .roi = .{ .spec = "name=restore-cut,bg=cut,x=240,y=150,frames=60", .crf = 23 }, .expect = "coverage<=0,provenance.unrecovered.fraction>=1" },
-    // 動かない滑らかな背景を、周囲から推測して埋める（--fill harmonic）。
+    // 動かない滑らかな背景を、周囲から推測して埋める（--fill harmonic）。背景が動かないので、埋めた画素は
+    // 前のフレームと混ぜて落ち着かせる（stable_fill.blended = 59 / 59）。
     // 埋めた画素は spatial_inpainted で、coverage には数えない。実測（crf 23）: SSIM 0.997、PSNR 42.9
-    .{ .roi = .{ .spec = "name=restore-flat-fill,bg=flat,x=240,y=150,frames=60", .crf = 23 }, .fill = "harmonic", .expect = "coverage<=0,provenance.spatial_inpainted.fraction>=0.99,ssim>=0.95" },
-    // パンで Temporal が戻せなかった残りだけを埋める。戻した実画素はそのまま。実測: SSIM 0.928 → 0.942
-    .{ .roi = .{ .spec = "name=restore-pan7-fill,bg=pan,pan_x=7,pan_y=3,x=240,y=150,frames=60", .crf = 23 }, .fill = "harmonic", .expect = "coverage>=0.95,ssim>=0.935,masked_psnr>=34,provenance.temporal_real.fraction>=0.95" },
+    .{ .roi = .{ .spec = "name=restore-flat-fill,bg=flat,x=240,y=150,frames=60", .crf = 23 }, .fill = "harmonic", .expect = "coverage<=0,provenance.spatial_inpainted.fraction>=0.99,ssim>=0.95,stable_fill.blended>=59" },
+    // パンで Temporal が戻せなかった残りだけを埋める。戻した実画素はそのまま。背景が動くので、埋めた画素を
+    // 前のフレームと混ぜない（混ぜると別の場所の推測が重なる）。実測: SSIM 0.928 → 0.942
+    .{ .roi = .{ .spec = "name=restore-pan7-fill,bg=pan,pan_x=7,pan_y=3,x=240,y=150,frames=60", .crf = 23 }, .fill = "harmonic", .expect = "coverage>=0.95,ssim>=0.935,masked_psnr>=34,provenance.temporal_real.fraction>=0.95,stable_fill.blended<=0" },
     // 毎フレーム別の模様を、ウォーターマークの画素だけ埋める（--mask auto）。本物の背景が見えている画素は残す。
     // 実測（crf 23）: ROI 全体を埋めると SSIM 0.649、マスクで 0.758。再現率 1.0000
     .{ .roi = .{ .spec = "name=restore-cut-mask,bg=cut,x=240,y=150,frames=60", .crf = 23 }, .fill = "harmonic", .mask = "auto", .expect = "coverage<=0,ssim>=0.67,mask_accepted>=1" },

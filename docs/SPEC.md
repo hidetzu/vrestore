@@ -58,6 +58,8 @@
 | マスクの範囲 | マスクを使うときは、推定して埋める範囲を ROI の周り 8 px まで広げる（動画の端で止める）。ROI の外でもマスクの内側なら埋め、マスクの外は入力のまま。Temporal の範囲は広げない | test `"maskArea: widens only with the mask, and stops at the frame edge"`、`"fillAndTally: fills the watermark pixels outside the ROI too, and keeps the rest as input"` |
 | マスク（ROI 全体に戻す判定） | 隠す割合の判定（2%〜95%）は、縁を足す前・広げる前の変わりにくい画素で行う。縁と広げた分で 100% になっても、見分けられていればマスクを使う | `src/wmask.zig` の test `"wmask: whether the mask is used is judged before the edges and the dilation widen it"` |
 | マスク（合成 E2E） | `--mask auto` で、毎フレーム別の模様の背景を harmonic で埋めて SSIM ≥ 0.67（ROI 全体を埋めると 0.649）、本物のウォーターマークの画素の再現率 ≥ 0.99 | `zig build restore-e2e` の `restore-cut-mask`（check-mask を含む） |
+| 埋めの落ち着かせ | 前のフレームでも埋めた画素は、見えている背景の明るさの変化 Δ を足した前の値と混ぜる（λ = 0.3）。明るさが 1 フレームに +1 変わる背景で、埋めた値の乱れ（±6）が半分未満になり、フェードに遅れない（±3 以内）。範囲の中をすべて埋めていても周りの画素で Δ を測る。見えている画素がばらばらに変わる（動いた）ときは混ぜない | `src/stabilize.zig` の test `"stabilize: a static background averages the jitter of the fill, and a fade is followed without lag"`、`"stabilize: the brightness change is measured around the area when every pixel in it is guessed"`、`"stabilize: when the visible background changes (it moved), the fill is not blended"` |
+| 埋めの落ち着かせ（合成 E2E） | 動かない背景では全フレームで混ぜ、動く背景では混ぜない | `zig build restore-e2e` の `restore-flat-fill`（`stable_fill.blended` ≥ 59）、`restore-pan7-fill`（≤ 0） |
 | 補間（合成 E2E） | 動かない滑らかな背景を harmonic で埋めると SSIM ≥ 0.95、coverage は 0 のまま。パンでは Temporal の実画素を変えずに残りを埋める | `zig build restore-e2e` の `restore-flat-fill` `restore-pan7-fill` |
 | 復元 | 位相相関の窓をウォーターマークの ROI と重ならない所から取る | test `"temporal: chooseWindow keeps the window off the ROI and takes the largest"` |
 | 復元 | 相関のピークが閾値未満のペアで鎖を切り、動いていないとは見なさない | test `"temporal: Track cuts the chain at an unestimated pair instead of assuming no motion"` |
@@ -396,6 +398,37 @@ affine で戻る割合が小さいのは正しい。平行移動が「戻した�
 減るが、隠す（推測で埋める）画素が増えるので、背景が動く素材では外接矩形の SSIM が下がる。
 SSIM は少数の画素に残るウォーターマークをほとんど罰しない。この評価のウォーターマーク（PNG を焼いたもの）は縁のにじみが少なく、
 手持ちの実写に元から焼かれていた縁取り付きの文字で見えた点線の縁取り（2 px 広げると消えた、目視）は、この表には出にくい。
+
+### 埋めの落ち着かせ（`--stable-fill`、ADR 0015）
+
+2026-09-27、同じ環境。
+
+手持ちの実写 A の先頭 30 秒（平らな灰色のフェードイン）、マスク auto（この 30 秒では見分けられず ROI 全体）+ harmonic。
+ちらつき = 埋めた面（検出した ROI の内側）のフレーム間の変化から、その平均の変化（フェード）を引いた残りの絶対値の平均:
+
+| 設定 | 1〜11 フレーム（フェード中） | 1〜119 フレーム | フェード中の埋めた面の明るさの、混ぜない場合との差（最大） |
+|---|---|---|---|
+| 混ぜない | 0.67 | 0.47 | 0 |
+| λ = 0.3（既定） | 0.48 | 0.25 | 0.44 |
+| λ = 0.15 | 0.43 | 0.19 | 0.49 |
+| λ = 0.1 | 0.46 | 0.18 | 0.68 |
+| 参考: 埋めていない周りの背景 | 0.12 | 0.02 | — |
+
+実写 96 ケース（「ウォーターマークのマスク」と同じ、今回のマスク + harmonic、混ぜない → λ = 0.3）。SSIM / PSNR は外接矩形の全フレーム、
+ちらつきと埋めた画素の誤差は先頭 60 フレームの、続けて埋めた画素:
+
+| 素材 | SSIM | PSNR | 埋めた画素の誤差 | ちらつき（正解） | 混ぜたフレームの割合 |
+|---|---|---|---|---|---|
+| A 600 秒 | 0.3795 → 0.3795 | 17.05 → 17.05 | 24.75 → 24.70 | 1.20 → 1.08（2.55） | 49% |
+| A 2500 秒 | 0.7410 → 0.7410 | 21.38 → 21.39 | 11.84 → 11.98 | 1.19 → 1.14（1.76） | 46% |
+| A 5000 秒 | 0.6024 → 0.6022 | 23.10 → 23.11 | 15.72 → 15.72 | 2.97 → 2.95（7.55） | 31% |
+| 固定カメラ | 0.5488 → 0.5478 | 18.80 → 18.81 | 26.89 → 26.91 | 3.70 → 3.65（7.33） | 40% |
+
+SSIM が下がったのは 15 / 96（最大 −0.0026）、上がったのは 0。合成 6 ケースは、背景が動く 5 ケースで全フレーム混ぜず（結果は同じ）、
+静止で全フレーム混ぜて PSNR 42.91 → 42.95。
+
+解釈: 正解との近さはほぼ変えずに、平らな背景で目に付くちらつきを減らす。評価の 96 ケースは模様のある背景が多く、
+埋めた面のちらつきは正解より小さいので、効果は小さい。
 
 ### 書き出しの時間（`restore --out`）
 

@@ -32,6 +32,8 @@ const usage =
     \\      left as they were. Prints the recovery coverage as JSON.
     \\      --crf <n>           H.264 quality for --out, 0-51, lower is better and larger (default 18)
     \\      --audio <a>         copy (put the original audio in --out as is, default) or none
+    \\      --stable-fill <s>   on (default) or off: blend the guessed pixels with the previous frame's where
+    \\                          the visible background only changed in brightness (steadies the fill)
     \\      --progress <file>   rewrite <file> every 15 frames with "frames <done> <expected total>"
     \\      --window <n>        frames to look at on each side (default 15)
     \\      --motion <m>        translation (whole-frame shift) or affine (shift + rotation + zoom)
@@ -186,6 +188,8 @@ fn parseRestore(args: []const []const u8) Command {
         } else if (std.mem.eql(u8, a, "--crf")) {
             out.crf = std.fmt.parseInt(u8, v, 10) catch 255;
             if (out.crf > 51) return .{ .bad_arg = .{ .why = "--crf needs an integer from 0 to 51", .arg = v } };
+        } else if (std.mem.eql(u8, a, "--stable-fill")) {
+            out.stable_fill = if (std.mem.eql(u8, v, "on")) true else if (std.mem.eql(u8, v, "off")) false else return .{ .bad_arg = .{ .why = "--stable-fill needs on or off", .arg = v } };
         } else if (std.mem.eql(u8, a, "--progress")) {
             out.progress_out = v;
         } else if (std.mem.eql(u8, a, "--audio")) {
@@ -301,6 +305,7 @@ test {
     _ = @import("fonts.zig");
     _ = @import("wmask.zig");
     _ = @import("export_job.zig");
+    _ = @import("stabilize.zig");
     _ = @import("temporal.zig");
     _ = @import("provenance.zig");
     _ = @import("motion.zig");
