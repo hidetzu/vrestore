@@ -13,6 +13,7 @@ const motion = @import("motion.zig");
 const spatial = @import("spatial.zig");
 const wmask = @import("wmask.zig");
 const mp4 = @import("mp4.zig");
+const stabilize = @import("stabilize.zig");
 
 /// ROI の中でウォーターマークの画素だけを隠れている扱いにするか（wmask.zig）。none なら ROI 全体を隠す。
 /// ⚠ 較正は docs/SPEC.md §4、決定は docs/adr/0010
@@ -93,6 +94,8 @@ pub const Args = struct {
     /// 進み具合を書くファイル（書き出しを呼ぶ GUI が読む）。`progress_every` フレームごとに
     /// "frames <済んだ数> <全体の見込み>\n" で書き直す。全体が分からなければ 0
     progress_out: ?[]const u8 = null,
+    /// 推測で埋めた画素を時間方向に落ち着かせる（stabilize.zig）
+    stable_fill: bool = true,
     /// 画素ごとの由来（provenance.zig の形式、1 画素 1 バイト）の出力先
     provenance_out: ?[]const u8 = null,
     /// 隣り合うフレームの移動量の推定を 1 行ずつ書く（診断用）: "<frame> <dx> <dy> <peak>"
@@ -309,6 +312,8 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
     // 見分けられなかったときは ROI 全体を隠す（広げた範囲は使わない）
     const hidden: ?Hidden = if (mask_est) |m| (if (m.accepted) .{ .mask = m.hidden, .area = maskArea(args.mask, rect, w, h) } else null) else null;
 
+    var stable: ?stabilize.State = null;
+    defer if (stable) |st| st.deinit(gpa);
     const frame_bytes = d.frameBytes();
     const out_rgb = try arena.alloc(u8, frame_bytes);
     const prov = try arena.alloc(provenance.Provenance, @as(usize, w) * h);
@@ -372,6 +377,11 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
         const track = try temporal.Track.buildAffine(gpa, motions);
         defer track.deinit(gpa);
         const r = try fillAndTally(gpa, args.fill, hidden, temporal.recoverFrame(images, track, next_target - lo, rect, args.max_ring_diff, out_rgb, prov), out_rgb, w, h, prov, rect);
+        if (args.stable_fill and args.fill != .none) {
+            const area = if (hidden) |m| m.area else rect;
+            if (stable == null) stable = try stabilize.State.init(gpa, .{ .x = area.x, .y = area.y, .w = area.w, .h = area.h }, w, h);
+            stable.?.apply(out_rgb, images[next_target - lo].rgb, w, prov, .{});
+        }
         total.merge(r);
         coverage_min = @min(coverage_min, r.coverage());
 
@@ -410,6 +420,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
     });
     try total.writeJson(summary);
     try summary.print(",\"mask\":\"{s}\"", .{@tagName(args.mask)});
+    if (stable) |st| try summary.print(",\"stable_fill\":{{\"blended\":{d},\"reset\":{d}}}", .{ st.blended, st.reset });
     if (mask_est) |m| try summary.print(",\"mask_accepted\":{},\"mask_fraction\":{d:.4},\"mask_inside_mad\":{d:.2},\"mask_outside_mad\":{d:.2}", .{ m.accepted, m.fraction, m.inside_mad, m.outside_mad });
     if (mp4_w) |*m| {
         try summary.print(",\"out\":{{\"frames\":{d},\"crf\":{d},\"audio\":", .{ m.frames, args.crf });
