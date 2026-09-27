@@ -17,6 +17,8 @@ const mp4 = @import("mp4.zig");
 /// ROI の中でウォーターマークの画素だけを隠れている扱いにするか（wmask.zig）。none なら ROI 全体を隠す。
 /// ⚠ 較正は docs/SPEC.md §4、決定は docs/adr/0010
 pub const MaskMode = enum { none, auto };
+pub const progress_every = 15;
+
 /// --out の MP4 に元の音声を入れるか
 pub const AudioMode = enum { copy, none };
 pub const default_mask: MaskMode = .none;
@@ -88,6 +90,9 @@ pub const Args = struct {
     mp4_out: ?[]const u8 = null,
     crf: u8 = 18,
     audio: AudioMode = .copy,
+    /// 進み具合を書くファイル（書き出しを呼ぶ GUI が読む）。`progress_every` フレームごとに
+    /// "frames <済んだ数> <全体の見込み>\n" で書き直す。全体が分からなければ 0
+    progress_out: ?[]const u8 = null,
     /// 画素ごとの由来（provenance.zig の形式、1 画素 1 バイト）の出力先
     provenance_out: ?[]const u8 = null,
     /// 隣り合うフレームの移動量の推定を 1 行ずつ書く（診断用）: "<frame> <dx> <dy> <peak>"
@@ -219,6 +224,12 @@ pub fn estimatePair(gpa: std.mem.Allocator, model: MotionModel, prev: temporal.I
     }
 }
 
+fn writeProgress(io: Io, path: []const u8, done: u64, total: u64) !void {
+    var buf: [64]u8 = undefined;
+    const line = try std.fmt.bufPrint(&buf, "frames {d} {d}\n", .{ done, total });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = line });
+}
+
 pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, args: Args) !u8 {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
@@ -251,6 +262,9 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
         return 1;
     }
     const rect = given;
+
+    // 全体のフレーム数の見込み（進み具合の分母）。尺かフレームレートが分からなければ 0
+    const expected_frames: u64 = if (d.info.duration_sec) |ds| (if (d.info.frame_rate) |fr| @intFromFloat(@round(ds * fr)) else 0) else 0;
 
     // 出力先
     var raw_buf: [64 * 1024]u8 = undefined;
@@ -361,6 +375,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
         total.merge(r);
         coverage_min = @min(coverage_min, r.coverage());
 
+        if (args.progress_out) |pp| if ((next_target + 1) % progress_every == 0) try writeProgress(io, pp, next_target + 1, expected_frames);
         if (want_raw) try raw_w.interface.writeAll(out_rgb);
         if (mp4_w) |*m| m.write(out_rgb, slots.items[next_target - lo].pts) catch |e| {
             try err.print("vrestore: could not write '{s}': {s}\n", .{ args.mp4_out.?, mp4.describe(e) });
@@ -378,6 +393,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
         }
     }
     if (want_raw) try raw_w.interface.flush();
+    if (args.progress_out) |pp| try writeProgress(io, pp, next_target, next_target);
     if (mp4_w) |*m| m.finish() catch |e| {
         try err.print("vrestore: could not write '{s}': {s}\n", .{ args.mp4_out.?, mp4.describe(e) });
         return 1;

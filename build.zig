@@ -153,8 +153,10 @@ pub fn build(b: *std.Build) void {
     // ヘッダは SDL2 と同じ場所にあるので、ライブラリだけを直接リンクする
     gui_mod.linkSystemLibrary("SDL2_ttf", .{ .use_pkg_config = .no });
     const gui = b.addExecutable(.{ .name = "vrestore-gui", .root_module = gui_mod });
-    const gui_step = b.step("gui", "Build and install vrestore-gui (needs SDL2)");
+    const gui_step = b.step("gui", "Build and install vrestore-gui and vrestore (needs SDL2)");
     gui_step.dependOn(&b.addInstallArtifact(gui, .{}).step);
+    // E（書き出し）は隣の vrestore を子プロセスで動かす（docs/adr/0014）
+    gui_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
 
     const run_gui = b.addRunArtifact(gui);
     if (b.args) |args| run_gui.addArgs(args);
@@ -217,6 +219,35 @@ pub fn build(b: *std.Build) void {
     gui_restore_chk.addArg("coverage>=0.95");
     gui_restore_chk.expectExitCode(0);
     gui_step.dependOn(&gui_restore_chk.step);
+
+    // GUI の E（全フレームの書き出し）を画面なしで: 同じ合成に音声を付け、子プロセスの vrestore で MP4 にする。
+    // フレーム数と、音声のパケットが入力と同じこと
+    const gui_audio = addSineAudio(b, "gui export", gui_restore_case.mp4);
+    const gui_export = b.addRunArtifact(gui);
+    gui_export.setName("gui export-and-exit");
+    gui_export.setEnvironmentVariable("SDL_VIDEODRIVER", "dummy");
+    gui_export.addArgs(&.{ "--at", "3", "--select", "234,144,158,68", "--detect-and-exit", "--vrestore" });
+    gui_export.addArtifactArg(exe);
+    gui_export.addArg("--export");
+    const gui_export_mp4 = gui_export.addOutputFileArg("gui-export.mp4");
+    gui_export.addFileArg(gui_audio);
+    const gui_export_out = gui_export.captureStdOut(.{});
+    gui_export.expectExitCode(0);
+    const gui_export_chk = b.addRunArtifact(tool);
+    gui_export_chk.setName("gui export check");
+    gui_export_chk.addArgs(&.{ "check-restore", "gui-export" });
+    gui_export_chk.addFileArg(gui_export_out);
+    gui_export_chk.addFileArg(gui_export_out);
+    gui_export_chk.addArg("out.frames>=60,out.frames<=60,out.audio.copied_packets>=1");
+    gui_export_chk.expectExitCode(0);
+    const gui_export_audio = b.addRunArtifact(tool);
+    gui_export_audio.setName("gui export check-audio");
+    gui_export_audio.addArg("check-audio");
+    gui_export_audio.addFileArg(gui_audio);
+    gui_export_audio.addFileArg(gui_export_mp4);
+    gui_export_audio.expectExitCode(0);
+    gui_export_chk.step.dependOn(&gui_export_audio.step);
+    gui_step.dependOn(&gui_export_chk.step);
 
     // ---- Temporal Recovery の合成 E2E ----------------------------------------
     // 合成 → エンコード → detect-roi → restore → 正解（ウォーターマーク無しの同じ背景）と compare。
@@ -470,11 +501,7 @@ fn exportCase(b: *std.Build, tool: *std.Build.Step.Compile, exe: *std.Build.Step
     const name = "restore-export";
     const roi_case: RoiCase = .{ .spec = "name=restore-export,bg=pan,pan_x=7,pan_y=3,x=240,y=150,frames=60", .crf = 23 };
     const v = synthCase(b, tool, roi_case);
-    const mux = b.addSystemCommand(&.{ "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i" });
-    mux.setName(name ++ " add audio");
-    mux.addFileArg(v.mp4);
-    mux.addArgs(&.{ "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=6", "-c:v", "copy", "-c:a", "aac", "-shortest" });
-    const with_audio = mux.addOutputFileArg("with-audio.mp4");
+    const with_audio = addSineAudio(b, name, v.mp4);
 
     const cut = b.addRunArtifact(tool);
     cut.setName(name ++ " cutref");
@@ -525,6 +552,15 @@ fn exportCase(b: *std.Build, tool: *std.Build.Step.Compile, exe: *std.Build.Step
     achk.expectExitCode(0);
     chk.step.dependOn(&achk.step);
     return &chk.step;
+}
+
+/// 合成の動画（6 秒）に、440 Hz の正弦波の AAC を付ける（書き出しが音声を写すかを見るため）
+fn addSineAudio(b: *std.Build, name: []const u8, mp4: std.Build.LazyPath) std.Build.LazyPath {
+    const mux = b.addSystemCommand(&.{ "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i" });
+    mux.setName(b.fmt("{s} add audio", .{name}));
+    mux.addFileArg(mp4);
+    mux.addArgs(&.{ "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=6", "-c:v", "copy", "-c:a", "aac", "-shortest" });
+    return mux.addOutputFileArg("with-audio.mp4");
 }
 
 /// RGB24 の生フレーム（640x360、10 fps。synthCase と同じ）を ffv1 の可逆で包む
