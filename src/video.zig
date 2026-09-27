@@ -12,8 +12,8 @@ pub const c = @cImport({
 });
 
 // AVERROR() / FFERRTAG() は関数形式のマクロで translate-c を通らないので、libavutil/error.h の定義どおりに組み立てる
-const averror_eagain: c_int = -@as(c_int, c.EAGAIN);
-const averror_eof = fferrtag('E', 'O', 'F', ' ');
+pub const averror_eagain: c_int = -@as(c_int, c.EAGAIN);
+pub const averror_eof = fferrtag('E', 'O', 'F', ' ');
 const averror_stream_not_found = fferrtag(0xF8, 'S', 'T', 'R');
 
 fn fferrtag(a: u8, b: u8, d: u8, e: u8) c_int {
@@ -62,6 +62,9 @@ pub const Frame = struct {
     rgb: []u8,
     /// 動画内の時刻（秒）。ストリームの開始時刻を 0 とする
     time_sec: f64,
+    /// ストリームの time_base での時刻（デコーダの best_effort_timestamp）。分からなければ AV_NOPTS_VALUE。
+    /// 書き出すとき（mp4.zig）に元の時刻をそのまま使う
+    pts: i64 = c.AV_NOPTS_VALUE,
 
     pub fn pixel(f: Frame, x: u32, y: u32) [3]u8 {
         const i = (@as(usize, y) * f.width + x) * 3;
@@ -164,6 +167,7 @@ pub const Decoder = struct {
                     .height = d.info.height,
                     .rgb = rgb,
                     .time_sec = d.ptsToSec(pts),
+                    .pts = pts,
                 };
             }
             if (r == averror_eof) return null;

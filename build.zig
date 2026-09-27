@@ -223,6 +223,7 @@ pub fn build(b: *std.Build) void {
     // 判定値は較正（scripts/restore-calibrate.sh、docs/SPEC.md §4）の実測から余裕を取ったもの
     const restore_step = b.step("restore-e2e", "Temporal Recovery on synthetic videos, compared with the clean original");
     for (restore_cases) |c| restore_step.dependOn(restoreCase(b, tool, exe, c));
+    restore_step.dependOn(exportCase(b, tool, exe));
 
     // ---- 復元の指標を FFmpeg と突き合わせる ----------------------------------
     // SSIM / PSNR を自前の実装とだけ比べても何も示さないので、FFmpeg の ssim / psnr フィルタと
@@ -458,6 +459,71 @@ fn restoreCase(b: *std.Build, tool: *std.Build.Step.Compile, exe: *std.Build.Ste
         mchk.expectExitCode(0);
         chk.step.dependOn(&mchk.step);
     }
+    return &chk.step;
+}
+
+/// restore --out の合成 E2E: 背景がパンする合成動画に正弦波の音声（AAC）を付け、MP4 に書き出す。
+/// - 音声のパケットが、数も中身も入力と同じ（再符号化していない）
+/// - フレーム数が入力と同じ（60）
+/// - --raw で同時に書いた RGB と比べて、符号化で落ちる分しか違わない（実測は mp4 と raw の比較で PSNR・SSIM）
+fn exportCase(b: *std.Build, tool: *std.Build.Step.Compile, exe: *std.Build.Step.Compile) *std.Build.Step {
+    const name = "restore-export";
+    const roi_case: RoiCase = .{ .spec = "name=restore-export,bg=pan,pan_x=7,pan_y=3,x=240,y=150,frames=60", .crf = 23 };
+    const v = synthCase(b, tool, roi_case);
+    const mux = b.addSystemCommand(&.{ "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i" });
+    mux.setName(name ++ " add audio");
+    mux.addFileArg(v.mp4);
+    mux.addArgs(&.{ "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=6", "-c:v", "copy", "-c:a", "aac", "-shortest" });
+    const with_audio = mux.addOutputFileArg("with-audio.mp4");
+
+    const cut = b.addRunArtifact(tool);
+    cut.setName(name ++ " cutref");
+    cut.addArg("cutref");
+    cut.addFileArg(v.mp4);
+    cut.addFileArg(v.truth);
+    const ref = cut.addOutputFileArg("ref.png");
+    const detect = b.addRunArtifact(exe);
+    detect.setName(name ++ " detect");
+    detect.addArgs(&.{ "detect-roi", "--ref" });
+    detect.addFileArg(ref);
+    detect.addFileArg(with_audio);
+    const roi_json = detect.captureStdOut(.{});
+    _ = detect.captureStdErr(.{});
+
+    const restore = b.addRunArtifact(exe);
+    restore.setName(name ++ " restore");
+    restore.addArgs(&.{ "restore", "--fill", "harmonic", "--roi" });
+    restore.addFileArg(roi_json);
+    restore.addArg("--raw");
+    const out_rgb = restore.addOutputFileArg("restored.rgb");
+    restore.addArg("--out");
+    const out_mp4 = restore.addOutputFileArg("restored.mp4");
+    restore.addFileArg(with_audio);
+    const restore_json = restore.captureStdOut(.{});
+    const raw_mkv = rawToFfv1(b, name ++ " encode raw", out_rgb, "raw.mkv");
+
+    const cmp = b.addRunArtifact(exe);
+    cmp.setName(name ++ " compare mp4 with raw");
+    cmp.addArg("compare");
+    cmp.addFileArg(raw_mkv);
+    cmp.addFileArg(out_mp4);
+    const cmp_json = cmp.captureStdOut(.{});
+
+    const chk = b.addRunArtifact(tool);
+    chk.setName(name ++ " check");
+    chk.addArgs(&.{ "check-restore", name });
+    chk.addFileArg(restore_json);
+    chk.addFileArg(cmp_json);
+    chk.addArg("out.frames>=60,out.frames<=60,out.audio.copied_packets>=1,psnr>=38,ssim>=0.97");
+    chk.expectExitCode(0);
+
+    const achk = b.addRunArtifact(tool);
+    achk.setName(name ++ " check-audio");
+    achk.addArg("check-audio");
+    achk.addFileArg(with_audio);
+    achk.addFileArg(out_mp4);
+    achk.expectExitCode(0);
+    chk.step.dependOn(&achk.step);
     return &chk.step;
 }
 
