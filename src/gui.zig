@@ -36,6 +36,7 @@ const Provenance = provenance.Provenance;
 const spatial = @import("spatial.zig");
 const wmask = @import("wmask.zig");
 const ps = @import("player_state.zig");
+const export_job = @import("export_job.zig");
 const glyphs = @import("glyphs.zig");
 const fonts = @import("fonts.zig");
 
@@ -151,6 +152,13 @@ const usage =
     \\  --fill <f>              none, directional or harmonic (F toggles none / harmonic)
     \\  --mask <m>              none or auto (K toggles): hide only the watermark's own pixels
     \\  --screenshot <png>      with --detect-and-exit, also save what the window shows
+    \\  --export <out.mp4>      with --detect-and-exit, export every frame as E does (the same child
+    \\                          process) and print its summary JSON
+    \\  --vrestore <path>       the vrestore CLI that E runs (default: the one next to vrestore-gui)
+    \\
+    \\Keys: E exports every frame with the current M / F / K settings to <video>-restored.mp4 next
+    \\to the video (with the original audio; the ROI is saved as <video>-restored.roi.json);
+    \\X stops it.
     \\
 ;
 
@@ -192,6 +200,93 @@ const App = struct {
     /// 検出できなかったときの理由（窓のタイトルに出す）
     problem: [256]u8 = undefined,
     problem_len: usize = 0,
+    io: Io,
+    /// 書き出しに使う vrestore（--vrestore）。無ければ vrestore-gui と同じディレクトリのもの
+    cli_path: ?[]const u8 = null,
+    /// 全フレームの書き出し（E）。子プロセスの vrestore restore --out が動いている間だけ
+    job: ?Job = null,
+
+    const Job = struct {
+        arena: std.heap.ArenaAllocator,
+        pid: std.posix.pid_t,
+        paths: export_job.Paths,
+        started_ms: u64,
+        last: ?export_job.Progress = null,
+    };
+
+    /// 検出した ROI と今の設定（M / F / K）で、全フレームを MP4 に書き出す子プロセスを始める。
+    /// `out_prefix` が無ければ、元の動画の隣に上書きしない名前で置く
+    fn startExport(app: *App, out_prefix: ?[]const u8) !void {
+        if (app.job != null) return app.setProblem("already exporting (X: stop)", .{});
+        const det = app.detection orelse return app.setProblem("detect the ROI first (Enter), then E", .{});
+        var arena_state: std.heap.ArenaAllocator = .init(app.gpa);
+        errdefer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const io = app.io;
+        const cwd = Io.Dir.cwd();
+        // CLI は GUI と同じディレクトリにある（zig build gui が両方入れる）
+        const vrestore = app.cli_path orelse blk: {
+            const dir = std.process.executableDirPathAlloc(io, arena) catch return app.setProblem("could not find where vrestore-gui is", .{});
+            break :blk try std.fs.path.join(arena, &.{ dir, "vrestore" });
+        };
+        cwd.access(io, vrestore, .{}) catch return app.setProblem("vrestore is not next to vrestore-gui ({s})", .{vrestore});
+        const paths = if (out_prefix) |pre| try export_job.pathsFor(arena, pre) else try export_job.paths(arena, app.path, io, struct {
+            fn f(ioo: Io, path: []const u8) bool {
+                Io.Dir.cwd().access(ioo, path, .{}) catch return false;
+                return true;
+            }
+        }.f);
+        var json: Io.Writer.Allocating = .init(arena);
+        try detect_roi.writeJson(&json.writer, det);
+        cwd.writeFile(io, .{ .sub_path = paths.roi_json, .data = json.written() }) catch |e| return app.setProblem("could not write {s}: {s}", .{ paths.roi_json, @errorName(e) });
+        cwd.deleteFile(io, paths.progress) catch {};
+        const summary = cwd.createFile(io, paths.summary_json, .{}) catch |e| return app.setProblem("could not write {s}: {s}", .{ paths.summary_json, @errorName(e) });
+        defer summary.close(io);
+        const log = cwd.createFile(io, paths.log, .{}) catch |e| return app.setProblem("could not write {s}: {s}", .{ paths.log, @errorName(e) });
+        defer log.close(io);
+        const argv = try export_job.restoreArgs(arena, vrestore, paths, app.path, .{ .motion = @tagName(app.motion_model), .fill = @tagName(app.fill), .mask = @tagName(app.mask_mode) });
+        const child = std.process.spawn(io, .{ .argv = argv, .stdin = .ignore, .stdout = .{ .file = summary }, .stderr = .{ .file = log } }) catch |e| return app.setProblem("could not start vrestore: {s}", .{@errorName(e)});
+        app.job = .{ .arena = arena_state, .pid = child.id.?, .paths = paths, .started_ms = sdl.SDL_GetTicks64() };
+        app.problem_len = 0;
+    }
+
+    /// 書き出しの進み具合を読み、終わっていれば結果を出す。変化があれば true
+    fn pollExport(app: *App) bool {
+        const job = if (app.job) |*j| j else return false;
+        const io = app.io;
+        var buf: [64]u8 = undefined;
+        if (Io.Dir.cwd().readFile(io, job.paths.progress, &buf)) |text| {
+            if (export_job.parseProgress(text)) |p| job.last = p;
+        } else |_| {}
+        var status: c_int = 0;
+        const r = std.c.waitpid(job.pid, &status, std.c.W.NOHANG);
+        if (r == 0) return true; // まだ動いている
+        const ok = r == job.pid and std.c.W.IFEXITED(@bitCast(status)) and std.c.W.EXITSTATUS(@bitCast(status)) == 0;
+        Io.Dir.cwd().deleteFile(io, job.paths.progress) catch {};
+        if (ok) {
+            app.setProblem("saved {s}", .{job.paths.mp4});
+        } else {
+            // 書きかけの MP4 は再生できないので消す。理由はログに残っている
+            Io.Dir.cwd().deleteFile(io, job.paths.mp4) catch {};
+            app.setProblem("export failed; see {s}", .{job.paths.log});
+        }
+        job.arena.deinit();
+        app.job = null;
+        return true;
+    }
+
+    /// 書き出しを止め、書きかけの MP4 を消す
+    fn cancelExport(app: *App) void {
+        const job = if (app.job) |*j| j else return;
+        std.posix.kill(job.pid, .TERM) catch {};
+        var status: c_int = 0;
+        _ = std.c.waitpid(job.pid, &status, 0);
+        Io.Dir.cwd().deleteFile(app.io, job.paths.mp4) catch {};
+        Io.Dir.cwd().deleteFile(app.io, job.paths.progress) catch {};
+        app.setProblem("export stopped; removed {s}", .{job.paths.mp4});
+        job.arena.deinit();
+        app.job = null;
+    }
 
     fn clearRestored(app: *App) void {
         if (app.restored) |r| app.gpa.free(r);
@@ -405,6 +500,8 @@ pub fn main(init: std.process.Init) !u8 {
     var fill_method = restore_cmd.default_fill;
     var mask_mode = restore_cmd.default_mask;
     var screenshot: ?[]const u8 = null;
+    var export_out: ?[]const u8 = null;
+    var cli_path: ?[]const u8 = null;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const a = args[i];
@@ -437,6 +534,13 @@ pub fn main(init: std.process.Init) !u8 {
         } else if (std.mem.eql(u8, a, "--at") and i + 1 < args.len) {
             i += 1;
             at = std.fmt.parseFloat(f64, args[i]) catch return badArg(&err.interface, "--at needs seconds", args[i]);
+        } else if (std.mem.eql(u8, a, "--vrestore") and i + 1 < args.len) {
+            i += 1;
+            cli_path = args[i];
+        } else if (std.mem.eql(u8, a, "--export") and i + 1 < args.len) {
+            i += 1;
+            if (!std.mem.endsWith(u8, args[i], ".mp4")) return badArg(&err.interface, "--export needs a path ending in .mp4", args[i]);
+            export_out = args[i];
         } else if (std.mem.eql(u8, a, "--screenshot") and i + 1 < args.len) {
             i += 1;
             screenshot = args[i];
@@ -457,6 +561,7 @@ pub fn main(init: std.process.Init) !u8 {
         return 2;
     };
     if (detect_and_exit and select == null) return badArg(&err.interface, "--detect-and-exit needs --select", "--detect-and-exit");
+    if (export_out != null and !detect_and_exit) return badArg(&err.interface, "--export needs --detect-and-exit", "--export");
 
     const path_z = try arena.dupeZ(u8, p);
     var dec = video.Decoder.open(path_z) catch |e| {
@@ -478,7 +583,11 @@ pub fn main(init: std.process.Init) !u8 {
         .fps = fps,
         .video_name = std.fs.path.basename(p),
         .frame_dur = 1 / fps,
+        .io = io,
+        .cli_path = cli_path,
     };
+    // 書き出しの途中で閉じたら止める（書きかけの MP4 は再生できないので消す）
+    defer app.cancelExport();
     try app.showAt(if (frame_arg) |n| ps.frameToSec(n, fps) else at);
     if (select) |r| {
         if (r.w == 0 or r.h == 0 or @as(u64, r.x) + r.w > dec.info.width or @as(u64, r.y) + r.h > dec.info.height)
@@ -559,6 +668,26 @@ pub fn main(init: std.process.Init) !u8 {
         sdl.SDL_RenderPresent(ren);
         if (app.detection) |d| {
             try detect_roi.writeJson(&out.interface, d);
+            if (export_out) |mp4_path| {
+                // E を押したときと同じ経路。終わるまで待ち、restore の集計をそのまま出す
+                try app.startExport(mp4_path[0 .. mp4_path.len - ".mp4".len]);
+                if (app.job == null) {
+                    try err.interface.print("vrestore-gui: {s}\n", .{app.problem[0..app.problem_len]});
+                    return 1;
+                }
+                const summary_path = try arena.dupe(u8, app.job.?.paths.summary_json);
+                while (app.job != null) {
+                    sdl.SDL_Delay(100);
+                    _ = app.pollExport();
+                }
+                if (!std.mem.startsWith(u8, app.problem[0..app.problem_len], "saved ")) {
+                    try err.interface.print("vrestore-gui: {s}\n", .{app.problem[0..app.problem_len]});
+                    return 1;
+                }
+                const summary = try Io.Dir.cwd().readFileAlloc(io, summary_path, arena, .limited(1 << 16));
+                try out.interface.writeAll(summary);
+                return 0;
+            }
             if (restore_too) {
                 if (app.restored == null) {
                     try err.interface.print("vrestore-gui: {s}\n", .{app.problem[0..app.problem_len]});
@@ -582,6 +711,8 @@ pub fn main(init: std.process.Init) !u8 {
         // 再生中は、次のフレームの時刻までだけイベントを待つ
         const got = if (app.clock.playing)
             sdl.SDL_WaitEventTimeout(&ev, @intFromFloat(@max(1, app.frame_dur * 1000 / 2)))
+        else if (app.job != null)
+            sdl.SDL_WaitEventTimeout(&ev, 500) // 書き出しの進み具合を見に起きる
         else
             sdl.SDL_WaitEvent(&ev);
         var dirty = false;
@@ -665,6 +796,11 @@ pub fn main(init: std.process.Init) !u8 {
                             render(&app, win, ren, tex);
                             try app.restore();
                         },
+                        sdl.SDL_SCANCODE_E => {
+                            app.pause();
+                            try app.startExport(null);
+                        },
+                        sdl.SDL_SCANCODE_X => app.cancelExport(),
                         sdl.SDL_SCANCODE_B => {
                             if (app.restored != null) app.show_after = !app.show_after;
                         },
@@ -706,6 +842,7 @@ pub fn main(init: std.process.Init) !u8 {
             }
         }
         if (app.clock.playing and try app.tickTo(app.clock.target(sdl.SDL_GetTicks64()))) dirty = true;
+        if (app.pollExport()) dirty = true;
         if (dirty) render(&app, win, ren, tex);
     }
     return 0;
@@ -780,6 +917,18 @@ fn infoLen(app: *const App) usize {
 }
 
 fn info(w: *Io.Writer, app: *const App) !void {
+    if (app.job) |j| {
+        try w.writeAll("exporting");
+        if (j.last) |p| {
+            if (p.fraction()) |f| try w.print(" {d:.0}%", .{f * 100}) else try w.print(" {d} frames", .{p.done});
+            const elapsed = @as(f64, @floatFromInt(sdl.SDL_GetTicks64() - j.started_ms)) / 1000;
+            if (p.etaSec(elapsed)) |eta| {
+                var tb: [16]u8 = undefined;
+                try w.print("  {s} left", .{export_job.formatDuration(&tb, eta)});
+            }
+        }
+        return w.writeAll("  X: stop");
+    }
     if (app.problem_len > 0) return w.writeAll(app.problem[0..app.problem_len]);
     if (app.restored != null) {
         try w.print("{s}  restored {d:.1}%", .{ if (app.show_after) "AFTER" else "BEFORE", app.recovered.coverage() * 100 });
