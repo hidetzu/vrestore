@@ -19,6 +19,28 @@ pub const MaskMode = enum { none, auto };
 pub const default_mask: MaskMode = .none;
 /// マスクを推定するときに動画全体から取るフレーム数
 pub const mask_frames = 60;
+/// マスクを推定して埋める範囲は、ROI を上下左右にこれだけ広げたもの（動画の端で止める）。指定した範囲が
+/// ウォーターマークより少し狭くても、はみ出した文字の端を隠せる。ウォーターマークでない画素は入力のまま残る。
+/// Temporal は広げない: 広げると、背景がより遠くまで動かないと見えないので戻せる画素が減る
+/// （合成の遅いパンで、同じ範囲の temporal_real が 430049 → 307902 画素）
+pub const mask_margin = 8;
+
+/// マスクを推定して埋める範囲。マスクを使うときだけ `mask_margin` 広げる
+pub fn maskArea(mask: MaskMode, r: temporal.Rect, frame_w: u32, frame_h: u32) temporal.Rect {
+    if (mask == .none) return r;
+    const x0 = r.x -| mask_margin;
+    const y0 = r.y -| mask_margin;
+    const x1 = @min(frame_w, r.x + r.w + mask_margin);
+    const y1 = @min(frame_h, r.y + r.h + mask_margin);
+    return .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
+}
+
+test "maskArea: widens only with the mask, and stops at the frame edge" {
+    const r: temporal.Rect = .{ .x = 500, .y = 7, .w = 113, .h = 69 };
+    try std.testing.expectEqual(r, maskArea(.none, r, 640, 360));
+    try std.testing.expectEqual(temporal.Rect{ .x = 492, .y = 0, .w = 129, .h = 84 }, maskArea(.auto, r, 640, 360));
+    try std.testing.expectEqual(temporal.Rect{ .x = 492, .y = 0, .w = 128, .h = 84 }, maskArea(.auto, r, 620, 360));
+}
 
 /// 戻せなかった画素を周囲から推測して埋めるか（spatial.zig）。埋めた画素の由来は spatial_inpainted。
 /// ⚠ 較正は docs/SPEC.md §4、決定は docs/adr/0008
@@ -67,7 +89,7 @@ pub const Args = struct {
 
 /// 手元にある連続したフレーム列から、`target` を戻す（動きの推定・鎖・復元をまとめて行う）。
 /// GUI のように窓を丸ごと持っている呼び出し側用。`run` は流しながら同じ部品（estimatePair）を使う
-pub fn recoverInWindow(gpa: std.mem.Allocator, model: MotionModel, fill: spatial.Method, frames: []const temporal.Image, target: usize, roi: temporal.Rect, hidden: ?[]const bool, min_peak: f64, max_ring_diff: ?f64, out: []u8, prov: []provenance.Provenance) !temporal.Recovered {
+pub fn recoverInWindow(gpa: std.mem.Allocator, model: MotionModel, fill: spatial.Method, frames: []const temporal.Image, target: usize, roi: temporal.Rect, hidden: ?Hidden, min_peak: f64, max_ring_diff: ?f64, out: []u8, prov: []provenance.Provenance) !temporal.Recovered {
     const lumas = try gpa.alloc(?motion.Luma, frames.len);
     defer gpa.free(lumas);
     @memset(lumas, null);
@@ -111,16 +133,55 @@ pub fn estimateMask(gpa: std.mem.Allocator, d: *video.Decoder, roi: temporal.Rec
 /// （original）にし、ウォーターマークの画素だけを埋める。Temporal は ROI 全体に対して行う: ウォーターマークの
 /// すぐ隣の画素は圧縮でウォーターマークの色がにじんでいるので、別フレームの実画素で戻せるならそちらの方が近い
 /// （合成のパンで、Temporal もマスクで絞ると SSIM 0.942 → 0.804 に下がった）
-fn fillAndTally(gpa: std.mem.Allocator, fill: spatial.Method, hidden: ?[]const bool, t: temporal.Recovered, out: []u8, w: u32, h: u32, prov: []provenance.Provenance, roi: temporal.Rect) !temporal.Recovered {
-    if (hidden) |m| for (0..roi.h) |yy| for (0..roi.w) |xx| {
-        const i = (roi.y + yy) * w + roi.x + xx;
-        if (prov[i] == .unrecovered and !m[yy * roi.w + xx]) prov[i] = .original;
+///
+/// マスクの範囲（`Hidden.area`）は ROI より広いことがある（`mask_margin`）。ROI の外でマスクの内側の画素は
+/// Temporal が触っていないので、戻せなかった画素として埋める。数えるのはマスクの範囲全体
+fn fillAndTally(gpa: std.mem.Allocator, fill: spatial.Method, hidden: ?Hidden, t: temporal.Recovered, out: []u8, w: u32, h: u32, prov: []provenance.Provenance, roi: temporal.Rect) !temporal.Recovered {
+    const area = if (hidden) |m| m.area else roi;
+    if (hidden) |m| for (0..area.h) |yy| for (0..area.w) |xx| {
+        const i = (area.y + yy) * w + area.x + xx;
+        const hd = m.mask[yy * area.w + xx];
+        if (prov[i] == .unrecovered and !hd) prov[i] = .original;
+        if (prov[i] == .original and hd) prov[i] = .unrecovered;
     };
     if (fill == .none and hidden == null) return t;
-    _ = try spatial.fill(gpa, fill, out, w, h, prov, .{ .x = roi.x, .y = roi.y, .w = roi.w, .h = roi.h });
+    _ = try spatial.fill(gpa, fill, out, w, h, prov, .{ .x = area.x, .y = area.y, .w = area.w, .h = area.h });
     var tally: temporal.Recovered = .{};
-    for (roi.y..roi.y + roi.h) |y| for (roi.x..roi.x + roi.w) |x| tally.add(prov[y * w + x]);
+    for (area.y..area.y + area.h) |y| for (area.x..area.x + area.w) |x| tally.add(prov[y * w + x]);
     return tally;
+}
+
+/// マスク（wmask.zig）と、それが覆う範囲（ROI を `mask_margin` 広げたもの）
+pub const Hidden = struct { mask: []const bool, area: temporal.Rect };
+
+test "fillAndTally: fills the watermark pixels outside the ROI too, and keeps the rest as input" {
+    // 8 x 6 の画像、ROI は (2,2) 3 x 2、マスクの範囲は (1,1) 5 x 4。
+    // マスクは ROI の中の (2,2) と、ROI の外の (1,1) と (5,4) だけ
+    const gpa = std.testing.allocator;
+    const w = 8;
+    const h = 6;
+    var rgb: [w * h * 3]u8 = undefined;
+    for (0..w * h) |i| rgb[i * 3 ..][0..3].* = .{ 100, 100, 100 };
+    var prov: [w * h]provenance.Provenance = undefined;
+    @memset(&prov, .original);
+    const roi: temporal.Rect = .{ .x = 2, .y = 2, .w = 3, .h = 2 };
+    for (2..4) |y| for (2..5) |x| {
+        prov[y * w + x] = .unrecovered; // Temporal で戻せなかった
+    };
+    const area: temporal.Rect = .{ .x = 1, .y = 1, .w = 5, .h = 4 };
+    var mask = [_]bool{false} ** (5 * 4);
+    mask[(2 - 1) * 5 + (2 - 1)] = true; // ROI の中 (2,2)
+    mask[0] = true; // ROI の外 (1,1)
+    mask[(4 - 1) * 5 + (5 - 1)] = true; // ROI の外 (5,4)
+    const t = try fillAndTally(gpa, .harmonic, .{ .mask = &mask, .area = area }, .{}, &rgb, w, h, &prov, roi);
+    try std.testing.expectEqual(provenance.Provenance.spatial_inpainted, prov[2 * w + 2]);
+    try std.testing.expectEqual(provenance.Provenance.spatial_inpainted, prov[1 * w + 1]);
+    try std.testing.expectEqual(provenance.Provenance.spatial_inpainted, prov[4 * w + 5]);
+    try std.testing.expectEqual(provenance.Provenance.original, prov[2 * w + 3]); // ROI の中でマスクの外
+    try std.testing.expectEqual(provenance.Provenance.original, prov[0]); // マスクの範囲の外
+    // 数えるのはマスクの範囲全体（入力のまま残した画素は original として数える）
+    try std.testing.expectEqual(@as(usize, 3), t.counts.get(.spatial_inpainted));
+    try std.testing.expectEqual(@as(usize, 5 * 4 - 3), t.counts.get(.original));
 }
 
 const Slot = struct {
@@ -155,7 +216,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
     const arena = arena_state.allocator();
     const cwd = Io.Dir.cwd();
 
-    const rect: temporal.Rect = args.rect orelse blk: {
+    const given: temporal.Rect = args.rect orelse blk: {
         const path = args.roi_json.?;
         const data = cwd.readFileAlloc(io, path, arena, .limited(1 << 16)) catch |e| {
             try err.print("vrestore: could not read '{s}': {s}\n", .{ path, @errorName(e) });
@@ -176,10 +237,11 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
     defer d.close();
     const w = d.info.width;
     const h = d.info.height;
-    if (rect.w == 0 or rect.h == 0 or @as(u64, rect.x) + rect.w > w or @as(u64, rect.y) + rect.h > h) {
-        try err.print("vrestore: the ROI {d},{d} {d}x{d} goes outside the video ({d}x{d})\n", .{ rect.x, rect.y, rect.w, rect.h, w, h });
+    if (given.w == 0 or given.h == 0 or @as(u64, given.x) + given.w > w or @as(u64, given.y) + given.h > h) {
+        try err.print("vrestore: the ROI {d},{d} {d}x{d} goes outside the video ({d}x{d})\n", .{ given.x, given.y, given.w, given.h, w, h });
         return 1;
     }
+    const rect = given;
 
     // 出力先
     var raw_buf: [64 * 1024]u8 = undefined;
@@ -213,9 +275,10 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
     if (args.mask == .auto) {
         var d2 = try video.Decoder.open(try arena.dupeZ(u8, args.video));
         defer d2.close();
-        mask_est = try estimateMask(gpa, &d2, rect);
+        mask_est = try estimateMask(gpa, &d2, maskArea(args.mask, rect, w, h));
     }
-    const hidden: ?[]const bool = if (mask_est) |m| (if (m.accepted) m.hidden else null) else null;
+    // 見分けられなかったときは ROI 全体を隠す（広げた範囲は使わない）
+    const hidden: ?Hidden = if (mask_est) |m| (if (m.accepted) .{ .mask = m.hidden, .area = maskArea(args.mask, rect, w, h) } else null) else null;
 
     const frame_bytes = d.frameBytes();
     const out_rgb = try arena.alloc(u8, frame_bytes);

@@ -4,6 +4,10 @@
 //! フレームで画素ごとの「色の変わりやすさ」（中央値からの差の中央値、R/G/B の大きい方）を出し、
 //! 変わりにくい画素をウォーターマークとする。閾値は大津の二値化で ROI ごとに決める。
 //!
+//! 半透明のウォーターマークは背景と一緒に色が変わるので、変わりやすさだけでは見落とす。ウォーターマークの縁は
+//! どのフレームでも同じ向きの明るさの変化（勾配）を持ち、背景の縁は時間で打ち消し合うので、
+//! 勾配の時間方向の中央値が大きい画素も縁として加える（Dekel et al. 2017 と同じ手がかり）。
+//!
 //! ⚠ 見落とした画素は「隠れていない」と扱われ、ウォーターマークがそのまま残る。迷ったら広く隠す側に倒す:
 //! - 縁のにじみを含めるため、見分けた画素を `dilate` px 広げる
 //! - ウォーターマークと背景の変わりやすさが分かれていない（背景も動かない等）ときは、マスクを使わず ROI 全体を隠す
@@ -13,13 +17,17 @@
 const std = @import("std");
 
 pub const Params = struct {
-    /// 見分けた画素を広げる幅（px）
-    dilate: u32 = 1,
+    /// 見分けた画素を広げる幅（px）。ウォーターマークの縁取りの外側の圧縮のにじみまで隠す（ADR 0011）
+    dilate: u32 = 2,
+    /// 勾配の時間方向の中央値の大きさが、背景（変わりにくくない画素）の中央値の何倍を超えたら縁とみなすか。0 なら縁を使わない
+    edge_ratio: f32 = 5,
+    /// 縁とみなす大きさの下限（8 bit の明るさ / px）。背景が平らで中央値が 0 に近いときに、圧縮の雑音を拾わない
+    min_edge: f32 = 8,
     /// 背景の変わりやすさ（中央値）が、ウォーターマークの何倍以上なら見分けられたとみなすか
     min_separation: f32 = 1.5,
     /// 背景の変わりやすさの下限。これ未満なら背景もほぼ動いていない（固定カメラ）とみなす
     min_background_mad: f32 = 8,
-    /// 隠す画素の割合がこの範囲の外なら、見分けられていないとみなす
+    /// 変わりにくいとした画素の割合（縁を足す前・広げる前）がこの範囲の外なら、見分けられていないとみなす
     min_fraction: f32 = 0.02,
     max_fraction: f32 = 0.95,
 };
@@ -67,17 +75,23 @@ pub fn estimate(gpa: std.mem.Allocator, crops: []const []const u8, w: u32, h: u3
     errdefer gpa.free(hidden);
     for (mad, hidden) |v, *hd| hd.* = v < th;
 
-    // 閾値の内側と外側の変わりやすさ（広げる前の判定で測る）
+    // 閾値の内側と外側の変わりやすさ（広げる前、縁を足す前の判定で測る）
     const inside_mad, const outside_mad = try splitMedians(gpa, mad, hidden);
+    const still_fraction = fractionOf(hidden);
+
+    if (p.edge_ratio > 0) {
+        const edge = try edges(gpa, crops, w, h, hidden, p.edge_ratio, p.min_edge);
+        defer gpa.free(edge);
+        // 縁は広げない: 中心差分は両隣を見るので、縁はウォーターマークの外側 1 px まで既に付いている
+        for (hidden, edge) |*hd, e| hd.* = hd.* or e;
+    }
 
     try dilate(gpa, hidden, w, h, p.dilate);
-    var cnt: usize = 0;
-    for (hidden) |hd| cnt += @intFromBool(hd);
-    const fraction = @as(f32, @floatFromInt(cnt)) / @as(f32, @floatFromInt(n));
+    const fraction = fractionOf(hidden);
 
     const accepted = outside_mad >= p.min_background_mad and
         outside_mad >= p.min_separation * inside_mad and
-        fraction >= p.min_fraction and fraction <= p.max_fraction;
+        still_fraction >= p.min_fraction and still_fraction <= p.max_fraction;
     if (!accepted) @memset(hidden, true);
     return .{
         .hidden = hidden,
@@ -87,6 +101,12 @@ pub fn estimate(gpa: std.mem.Allocator, crops: []const []const u8, w: u32, h: u3
         .inside_mad = inside_mad,
         .outside_mad = outside_mad,
     };
+}
+
+fn fractionOf(m: []const bool) f32 {
+    var cnt: usize = 0;
+    for (m) |b| cnt += @intFromBool(b);
+    return @as(f32, @floatFromInt(cnt)) / @as(f32, @floatFromInt(m.len));
 }
 
 /// その場で並べ替えて中央値を返す
@@ -133,6 +153,43 @@ fn otsu(v: []const f32) f32 {
         }
     }
     return lo + @as(f32, @floatFromInt(best_i)) / scale;
+}
+
+/// 勾配（明るさ = R/G/B の平均の中心差分）の時間方向の中央値の大きさが、しきい値を超える画素。
+/// しきい値は `still`（変わりにくい画素）の外の中央値から決める。ROI 全体の中央値にすると、ROI のうちウォーターマークが
+/// 占める割合（= 指定した範囲の広さ）でしきい値が大きく動く
+fn edges(gpa: std.mem.Allocator, crops: []const []const u8, w: u32, h: u32, still: []const bool, ratio: f32, min_edge: f32) ![]bool {
+    const n: usize = @as(usize, w) * h;
+    const mag = try gpa.alloc(f32, n);
+    defer gpa.free(mag);
+    const gx = try gpa.alloc(f32, crops.len);
+    defer gpa.free(gx);
+    const gy = try gpa.alloc(f32, crops.len);
+    defer gpa.free(gy);
+    for (0..h) |y| for (0..w) |x| {
+        const i = y * w + x;
+        if (x == 0 or y == 0 or x + 1 == w or y + 1 == h) {
+            mag[i] = 0;
+            continue;
+        }
+        for (crops, gx, gy) |cr, *ax, *ay| {
+            ax.* = (luma(cr, i + 1) - luma(cr, i - 1)) / 2;
+            ay.* = (luma(cr, i + w) - luma(cr, i - w)) / 2;
+        }
+        mag[i] = std.math.hypot(median(gx), median(gy));
+    };
+    var bg: std.ArrayList(f32) = .empty;
+    defer bg.deinit(gpa);
+    for (mag, still) |m, s| if (!s) try bg.append(gpa, m);
+    const th = @max(min_edge, if (bg.items.len > 0) ratio * median(bg.items) else min_edge);
+    const out = try gpa.alloc(bool, n);
+    for (mag, out) |m, *o| o.* = m > th;
+    return out;
+}
+
+fn luma(cr: []const u8, i: usize) f32 {
+    const px = cr[i * 3 ..][0..3];
+    return (@as(f32, @floatFromInt(px[0])) + @as(f32, @floatFromInt(px[1])) + @as(f32, @floatFromInt(px[2]))) / 3;
 }
 
 fn splitMedians(gpa: std.mem.Allocator, mad: []const f32, hidden: []const bool) !struct { f32, f32 } {
@@ -198,7 +255,7 @@ test "wmask: finds the pixels that stay the same while the background changes" {
         for (crops) |c| gpa.free(c);
         gpa.free(crops);
     }
-    const e = try estimate(gpa, crops, w, h, .{ .dilate = 0 });
+    const e = try estimate(gpa, crops, w, h, .{ .dilate = 0, .edge_ratio = 0 });
     defer e.deinit(gpa);
     try std.testing.expect(e.accepted);
     for (0..h) |y| for (0..w) |x| {
@@ -207,7 +264,7 @@ test "wmask: finds the pixels that stay the same while the background changes" {
     };
 
     // 1 px 広げると、ウォーターマークの周り 1 px も隠す
-    const e1 = try estimate(gpa, crops, w, h, .{ .dilate = 1 });
+    const e1 = try estimate(gpa, crops, w, h, .{ .dilate = 1, .edge_ratio = 0 });
     defer e1.deinit(gpa);
     try std.testing.expect(e1.hidden[2 * w + 3]); // 左上の斜め隣
     try std.testing.expect(!e1.hidden[1 * w + 3]); // 2 px 離れた所は隠さない
@@ -225,6 +282,74 @@ test "wmask: falls back to hiding the whole ROI when the background does not mov
     try std.testing.expect(!e.accepted);
     try std.testing.expectEqual(@as(f32, 1), e.fraction);
     for (e.hidden) |hd| try std.testing.expect(hd);
+}
+
+/// 背景は平らで、左半分は明るさがフレームごとに大きく変わり、右半分はほぼ変わらない（どちらも ±2 の雑音）。
+/// そこに不透明度 30% の白い細い棒 (6..26, 5..8) を重ねた crop を n 枚。
+/// 左半分の棒は背景と一緒に色が変わるので、変わりやすさだけでは背景と見分けにくい
+fn makeTranslucentCrops(gpa: std.mem.Allocator, n: usize, w: u32, h: u32) ![][]u8 {
+    var prng: std.Random.DefaultPrng = .init(9);
+    const r = prng.random();
+    const crops = try gpa.alloc([]u8, n);
+    for (crops) |*cr| {
+        cr.* = try gpa.alloc(u8, @as(usize, w) * h * 3);
+        const left = r.intRangeAtMost(i32, 8, 248);
+        const right = 128 + r.intRangeAtMost(i32, -3, 3);
+        for (0..h) |y| for (0..w) |x| {
+            var v: f32 = @floatFromInt((if (x < w / 2) left else right) + r.intRangeAtMost(i32, -2, 2));
+            if (x >= 6 and x < 26 and y >= 5 and y < 8) v = 0.7 * v + 0.3 * 250;
+            @memset(cr.*[(y * w + x) * 3 ..][0..3], @intFromFloat(@round(v)));
+        };
+    }
+    return crops;
+}
+
+test "wmask: the edges catch a translucent watermark that the stillness alone misses" {
+    const gpa = std.testing.allocator;
+    const w = 32;
+    const h = 14;
+    const crops = try makeTranslucentCrops(gpa, 31, w, h);
+    defer {
+        for (crops) |c| gpa.free(c);
+        gpa.free(crops);
+    }
+    const recall = struct {
+        fn f(e: Estimate) f32 {
+            var tp: u32 = 0;
+            for (5..8) |y| for (6..26) |x| {
+                tp += @intFromBool(e.hidden[y * w + x]);
+            };
+            return @as(f32, @floatFromInt(tp)) / (20 * 3);
+        }
+    }.f;
+    const still = try estimate(gpa, crops, w, h, .{ .edge_ratio = 0 });
+    defer still.deinit(gpa);
+    const both = try estimate(gpa, crops, w, h, .{});
+    defer both.deinit(gpa);
+    try std.testing.expect(both.accepted);
+    try std.testing.expect(recall(still) < 0.9);
+    try std.testing.expectEqual(@as(f32, 1), recall(both));
+}
+
+test "wmask: whether the mask is used is judged before the edges and the dilation widen it" {
+    // 40 x 20 の上 18 行（90%）が動かないウォーターマーク、下 2 行が毎回乱数の背景。
+    // 縁と広げた分で隠す割合は 100% になるが、変わりにくい画素は 90% なので見分けられている
+    const gpa = std.testing.allocator;
+    const w = 40;
+    const h = 20;
+    var prng: std.Random.DefaultPrng = .init(3);
+    const crops = try gpa.alloc([]u8, 21);
+    defer gpa.free(crops);
+    for (crops) |*cr| {
+        cr.* = try gpa.alloc(u8, w * h * 3);
+        prng.random().bytes(cr.*);
+        @memset(cr.*[0 .. w * 18 * 3], 250);
+    }
+    defer for (crops) |c| gpa.free(c);
+    const e = try estimate(gpa, crops, w, h, .{});
+    defer e.deinit(gpa);
+    try std.testing.expect(e.accepted);
+    try std.testing.expectEqual(@as(f32, 1), e.fraction);
 }
 
 test "wmask: otsu splits two clusters" {
