@@ -67,8 +67,11 @@
 | 復元（明るさ） | 借りた画素に、ROI の周りの帯で測った明るさの差（表示中 − 借りたフレーム、R/G/B の平均）を足す。露出がフレームごとに 1 ずつ変わる動画でも、戻した画素は表示中のフレームの正解と一致する | test `"temporal: recoverFrame matches the brightness of the borrowed pixels to the frame shown"` |
 | 由来 | 各画素の由来（provenance）を 1 バイトで表す: 0 `original`（ROI の外）、1 `unrecovered`、2 `temporal_real`、4 `spatial_inpainted`。3 は予約（`alpha_recovered`）。知らない値は読まない | `src/provenance.zig` の test `"provenance: byte values are part of the file format"` |
 | 由来 | coverage は ROI の中の画素のうち、証拠から戻した由来（今は `temporal_real` だけ）の割合。ROI の外と、推測で埋めた `spatial_inpainted` は数えない | test `"provenance: coverage counts recovered pixels over the ROI, not pixels outside it"` |
+| CLI | `--window` は 1〜255（窓のフレーム数が temporal.max_window_frames = 511 に収まる範囲） | `src/main.zig` の test `"parseArgs: restore"` |
 | CLI | `vrestore restore (--roi <detection.json> \| --rect) (--out <out.mp4> \| --raw <out.rgb>) [--crf <n>] [--audio copy\|none] [--provenance <out>] [--motion affine\|translation] [--fill none\|directional\|harmonic] [--mask none\|auto] <video>` が全フレームを H.264 の MP4 と / または RGB24 の生フレームに書き、由来を書き、coverage と由来ごとの画素数を JSON で出す | `zig build restore-e2e`（`restore-pan15` で `temporal_real` の割合 ≥ 0.99、`restore-cut` で `unrecovered` の割合 = 1） |
 | 書き出し | `--out` の MP4 は、入力と同じ数のフレームを元の時刻で持ち、`--raw` で同時に書いた RGB との差は H.264 の符号化の分だけ（合成のパンで PSNR 42.2 dB・SSIM 0.984、判定 ≥ 38 / ≥ 0.97）。元の音声（AAC）のパケットは数も中身も同じ（再符号化しない） | `zig build restore-e2e` の `restore-export`（`check-restore` と `roi_fixture check-audio`） |
+| 書き出し（色） | デコードと書き出しで、同じ色の範囲・行列（ストリームの記述、無ければ BT.601・limited）を使う。フルレンジの入力（yuv420p + color_range=pc）の暗部・明部を潰さない。出力には入力と同じ範囲を付ける | `zig build test` の `cli_full_range check`（明るさ 0〜255 の傾斜、VP9 の劣化なし → `--crf 0`、ffmpeg に範囲の記述どおり RGB にさせて PSNR ≥ 40） |
+| 書き出し（回転・大きさ） | 回転の情報（display matrix）を写す。幅か高さが奇数なら、理由を言って書き始める前に止める | `zig build test` の `cli_rotation check`（rotation = 90）、`cli_odd_out`（321x181） |
 | 書き出し（音声） | 元に音声が無ければ音声なし（JSON は `"audio":"absent"`）、`--audio none` なら入れない。MP4 に入らない音声（ADPCM・μ-law・WMA などで手元で確認）なら書き始める前に止める | 手元で確認（自動の検査なし） |
 | CLI | `vrestore compare --provenance` が、由来ごとに画素数・割合・PSNR・外れた画素（どれかの色で 32 より大きい差）の割合を出す。`masked_*` は coverage に数える由来の画素をまとめたもの。由来によらない矩形全体の外れた画素の割合（`bad_fraction`）はいつも出す。`--roi` で detect-roi の JSON を矩形にする | test `"metrics: mseWhere counts only pixels with the label inside the rect"`、`"metrics: badPixels counts pixels off by more than bad_pixel_error in any color"`、`zig build restore-e2e` |
 | 復元（合成 E2E） | パンする背景で、ウォーターマークの ROI をほぼすべて戻し、正解に近い（パン 15 px: coverage ≥ 0.99・SSIM ≥ 0.9・戻した画素の PSNR ≥ 35。パン 7,3: ≥ 0.95・≥ 0.88・≥ 34。遅いパン × crf 35: coverage ≥ 0.6・戻した画素の PSNR ≥ 30） | `zig build restore-e2e` の `restore-pan15` `restore-pan7` `restore-pan3-crf35` |
@@ -429,6 +432,27 @@ SSIM が下がったのは 15 / 96（最大 −0.0026）、上がったのは 0�
 
 解釈: 正解との近さはほぼ変えずに、平らな背景で目に付くちらつきを減らす。評価の 96 ケースは模様のある背景が多く、
 埋めた面のちらつきは正解より小さいので、効果は小さい。
+
+### YUV と RGB の往復（デコード → 書き出し）
+
+2026-09-28、同じ環境。手持ちの実写 A の先頭 30 秒の 60 フレームを、何も変えずに `--crf 0`（劣化なし）で書き出し、YUV の平面で入力と比べた
+（差の平均 / 絶対値の平均）:
+
+| swscale の設定（デコードと書き出しの両方） | Y | U | V |
+|---|---|---|---|
+| bilinear + accurate_rnd（hidetzu/vrestore#15 まで） | −1.382 / 1.404 | −0.008 / 0.481 | −0.123 / 0.209 |
+| bilinear + accurate_rnd + full_chroma_int / inp | −0.062 / 0.079 | −0.083 / 0.789 | −0.016 / 0.228 |
+| **bicubic + accurate_rnd + full_chroma_int / inp（今）** | −0.063 / 0.086 | −0.071 / 0.511 | −0.018 / 0.119 |
+
+前の設定では、色差を横に補間しない経路を通り、画面全体が約 1.4 暗くなっていた（書き出した MP4 の ROI の外で R/G/B −1.84 / −1.62 / −1.57）。
+デコードの変換なので、検出・マスク・復元・比較の画素値にも同じ偏りが乗っていた。
+
+フルレンジの入力（明るさ 0〜255 の横の傾斜、色差 128、`--crf 0`、ffmpeg に範囲の記述どおり RGB にさせて比べる）:
+
+| 入力 | 範囲を渡す前 | 渡した後 |
+|---|---|---|
+| VP9 劣化なし、yuv420p + color_range=pc | 17 → 0、241 → 255、差の平均 8.22 | 一致（差 0.00） |
+| x264 劣化なし、yuvj420p | 差の平均 0.45 | 一致（差 0.00） |
 
 ### 書き出しの時間（`restore --out`）
 
