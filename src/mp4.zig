@@ -113,6 +113,11 @@ pub const Writer = struct {
         if (c.avcodec_parameters_from_context(vst.codecpar, enc) < 0) return error.EncodeFailed;
         vst.time_base = enc.time_base;
         vst.avg_frame_rate = d.stream.avg_frame_rate;
+        // 回転の情報（display matrix）を写す。フレームは回さずに書くので、再生側が同じ向きに回せるように
+        if (c.av_packet_side_data_get(in_par.*.coded_side_data, in_par.*.nb_coded_side_data, c.AV_PKT_DATA_DISPLAYMATRIX)) |sd| {
+            const dst = c.av_packet_side_data_new(&vst.codecpar.*.coded_side_data, &vst.codecpar.*.nb_coded_side_data, c.AV_PKT_DATA_DISPLAYMATRIX, sd.*.size, 0) orelse return error.OutOfMemory;
+            @memcpy(dst.*.data[0..sd.*.size], sd.*.data[0..sd.*.size]);
+        }
 
         var audio: ?Audio = null;
         errdefer if (audio) |*a| closeAudio(a);
