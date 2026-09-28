@@ -151,6 +151,7 @@ const usage =
     \\  --motion <m>            translation or affine (as pressing M)
     \\  --fill <f>              none, directional or harmonic (F toggles none / harmonic)
     \\  --mask <m>              none or auto (K toggles): hide only the watermark's own pixels
+    \\  --temporal <t>          auto, on or off (T cycles): take pixels from other frames (see vrestore --help)
     \\  --screenshot <png>      with --detect-and-exit, also save what the window shows
     \\  --export <out.mp4>      with --detect-and-exit, export every frame as E does (the same child
     \\                          process) and print its summary JSON
@@ -186,6 +187,8 @@ const App = struct {
     fill: spatial.Method = restore_cmd.default_fill,
     /// ROI の中のウォーターマークの画素だけを隠すか（K で切り替え）と、検出のたびに推定したマスク
     mask_mode: restore_cmd.MaskMode = restore_cmd.default_mask,
+    /// 別のフレームから借りるか（T で auto → on → off と切り替え）
+    temporal_mode: temporal.Mode = restore_cmd.default_temporal,
     mask: ?wmask.Estimate = null,
     /// 表示用の画素（処理後で、戻せなかった画素をマゼンタにしたもの）
     display: []u8,
@@ -244,7 +247,7 @@ const App = struct {
         defer summary.close(io);
         const log = cwd.createFile(io, paths.log, .{}) catch |e| return app.setProblem("could not write {s}: {s}", .{ paths.log, @errorName(e) });
         defer log.close(io);
-        const argv = try export_job.restoreArgs(arena, vrestore, paths, app.path, .{ .motion = @tagName(app.motion_model), .fill = @tagName(app.fill), .mask = @tagName(app.mask_mode) });
+        const argv = try export_job.restoreArgs(arena, vrestore, paths, app.path, .{ .motion = @tagName(app.motion_model), .fill = @tagName(app.fill), .mask = @tagName(app.mask_mode), .temporal = @tagName(app.temporal_mode) });
         const child = std.process.spawn(io, .{ .argv = argv, .stdin = .ignore, .stdout = .{ .file = summary }, .stderr = .{ .file = log } }) catch |e| return app.setProblem("could not start vrestore: {s}", .{@errorName(e)});
         app.job = .{ .arena = arena_state, .pid = child.id.?, .paths = paths, .started_ms = sdl.SDL_GetTicks64() };
         app.problem_len = 0;
@@ -339,7 +342,7 @@ const App = struct {
         errdefer app.gpa.free(out);
         const prov = try app.gpa.alloc(Provenance, @as(usize, d.info.width) * d.info.height);
         errdefer app.gpa.free(prov);
-        app.recovered = try restore_cmd.recoverInWindow(app.gpa, app.motion_model, app.fill, images, t, roi_rect, try app.hiddenMask(roi_rect), restore_cmd.default_min_peak, restore_cmd.default_max_ring_diff, out, prov);
+        app.recovered = try restore_cmd.recoverInWindow(app.gpa, app.motion_model, app.fill, images, t, roi_rect, try app.hiddenMask(roi_rect), restore_cmd.default_min_peak, .{ .mode = app.temporal_mode, .max_ring_diff = restore_cmd.default_max_ring_diff }, out, prov);
         app.restored = out;
         app.restored_prov = prov;
         app.show_after = true;
@@ -499,6 +502,7 @@ pub fn main(init: std.process.Init) !u8 {
     var motion_model = restore_cmd.default_motion;
     var fill_method = restore_cmd.default_fill;
     var mask_mode = restore_cmd.default_mask;
+    var temporal_mode = restore_cmd.default_temporal;
     var screenshot: ?[]const u8 = null;
     var export_out: ?[]const u8 = null;
     var cli_path: ?[]const u8 = null;
@@ -522,6 +526,9 @@ pub fn main(init: std.process.Init) !u8 {
             restore_too = true;
         } else if (std.mem.eql(u8, a, "--show-provenance")) {
             show_prov = true;
+        } else if (std.mem.eql(u8, a, "--temporal") and i + 1 < args.len) {
+            i += 1;
+            temporal_mode = std.meta.stringToEnum(temporal.Mode, args[i]) orelse return badArg(&err.interface, "--temporal needs off, on or auto", args[i]);
         } else if (std.mem.eql(u8, a, "--mask") and i + 1 < args.len) {
             i += 1;
             mask_mode = std.meta.stringToEnum(restore_cmd.MaskMode, args[i]) orelse return badArg(&err.interface, "--mask needs none or auto", args[i]);
@@ -580,6 +587,7 @@ pub fn main(init: std.process.Init) !u8 {
         .motion_model = motion_model,
         .fill = fill_method,
         .mask_mode = mask_mode,
+        .temporal_mode = temporal_mode,
         .fps = fps,
         .video_name = std.fs.path.basename(p),
         .frame_dur = 1 / fps,
@@ -808,6 +816,14 @@ pub fn main(init: std.process.Init) !u8 {
                             app.clearRestored();
                             app.motion_model = if (app.motion_model == .translation) .affine else .translation;
                         },
+                        sdl.SDL_SCANCODE_T => {
+                            app.clearRestored();
+                            app.temporal_mode = switch (app.temporal_mode) {
+                                .auto => .on,
+                                .on => .off,
+                                .off => .auto,
+                            };
+                        },
                         sdl.SDL_SCANCODE_K => {
                             app.clearRestored();
                             app.mask_mode = if (app.mask_mode == .none) .auto else .none;
@@ -933,7 +949,7 @@ fn info(w: *Io.Writer, app: *const App) !void {
     if (app.restored != null) {
         try w.print("{s}  restored {d:.1}%", .{ if (app.show_after) "AFTER" else "BEFORE", app.recovered.coverage() * 100 });
         if (app.recovered.counts.get(.spatial_inpainted) > 0) try w.print("  inpainted {d:.1}%", .{app.recovered.fraction(.spatial_inpainted) * 100});
-        try w.print("  unrecovered {d:.1}%  {s}/{s}", .{ app.recovered.fraction(.unrecovered) * 100, @tagName(app.motion_model), @tagName(app.fill) });
+        try w.print("  unrecovered {d:.1}%  {s}/{s}/temporal {s}", .{ app.recovered.fraction(.unrecovered) * 100, @tagName(app.motion_model), @tagName(app.fill), @tagName(app.temporal_mode) });
         if (app.mask) |m| {
             if (m.accepted) try w.print("  mask {d:.0}%", .{m.fraction * 100}) else try w.writeAll("  mask: whole ROI");
         }

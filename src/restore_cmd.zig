@@ -14,6 +14,7 @@ const spatial = @import("spatial.zig");
 const wmask = @import("wmask.zig");
 const mp4 = @import("mp4.zig");
 const stabilize = @import("stabilize.zig");
+const debug_view = @import("debug_view.zig");
 
 /// ROI の中でウォーターマークの画素だけを隠れている扱いにするか（wmask.zig）。none なら ROI 全体を隠す。
 /// ⚠ 較正は docs/SPEC.md §4、決定は docs/adr/0010
@@ -88,6 +89,8 @@ pub const default_min_peak = 0.5;
 /// 手持ちの実写（72 ケース）で、確かめないと戻した画素の 29.8% が外れ、6 で 1.8%（圧縮だけで外れるのは最大 1.1%）。
 /// 合成のパン（中央）の coverage は変わらない。⚠ 較正は docs/SPEC.md §4
 pub const default_max_ring_diff: ?f64 = 6;
+/// 別のフレームから借りるか（temporal.Mode、ADR 0017）
+pub const default_temporal: temporal.Mode = .auto;
 
 pub const Args = struct {
     video: []const u8 = "",
@@ -100,6 +103,9 @@ pub const Args = struct {
     fill: spatial.Method = default_fill,
     mask: MaskMode = default_mask,
     max_ring_diff: ?f64 = default_max_ring_diff,
+    temporal: temporal.Mode = default_temporal,
+    /// Temporal の debug の可視化の出力先（debug_view.zig）。.mp4 なら動画、それ以外はディレクトリに連番の PNG
+    debug_out: ?[]const u8 = null,
     /// RGB24 の生フレームの出力先。"-" なら標準出力（そのとき集計は標準エラーへ）。空なら書かない
     raw_out: []const u8 = "",
     /// 全フレームを H.264 の MP4 に書き出す先（mp4.zig）
@@ -121,7 +127,7 @@ pub const Args = struct {
 
 /// 手元にある連続したフレーム列から、`target` を戻す（動きの推定・鎖・復元をまとめて行う）。
 /// GUI のように窓を丸ごと持っている呼び出し側用。`run` は流しながら同じ部品（estimatePair）を使う
-pub fn recoverInWindow(gpa: std.mem.Allocator, model: MotionModel, fill: spatial.Method, frames: []const temporal.Image, target: usize, roi: temporal.Rect, hidden: ?Hidden, min_peak: f64, max_ring_diff: ?f64, out: []u8, prov: []provenance.Provenance) !temporal.Recovered {
+pub fn recoverInWindow(gpa: std.mem.Allocator, model: MotionModel, fill: spatial.Method, frames: []const temporal.Image, target: usize, roi: temporal.Rect, hidden: ?Hidden, min_peak: f64, topts: temporal.Options, out: []u8, prov: []provenance.Provenance) !temporal.Recovered {
     const lumas = try gpa.alloc(?motion.Luma, frames.len);
     defer gpa.free(lumas);
     @memset(lumas, null);
@@ -134,7 +140,7 @@ pub fn recoverInWindow(gpa: std.mem.Allocator, model: MotionModel, fill: spatial
     for (motions, 0..) |*m, i| m.* = (try estimatePair(gpa, model, frames[i], frames[i + 1], lumas[i], lumas[i + 1], roi, min_peak)).motion;
     const track = try temporal.Track.buildAffine(gpa, motions);
     defer track.deinit(gpa);
-    const t = temporal.recoverFrame(frames, track, target, roi, temporalGuard(hidden, roi, default_temporal_guard, frames[target].width, frames[target].height), max_ring_diff, out, prov);
+    const t = temporal.recoverFrame(frames, track, target, roi, temporalGuard(hidden, roi, default_temporal_guard, frames[target].width, frames[target].height), topts, out, prov, null);
     return fillAndTally(gpa, fill, hidden, t, out, frames[target].width, frames[target].height, prov, roi);
 }
 
@@ -329,6 +335,24 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
     // 見分けられなかったときは ROI 全体を隠す（広げた範囲は使わない）
     const hidden: ?Hidden = if (mask_est) |m| (if (m.accepted) .{ .mask = m.hidden, .area = maskArea(args.mask, rect, w, h) } else null) else null;
 
+    // 画素ごとの借りた / 借りなかった理由（JSON の集計と debug の可視化）
+    const detail = try arena.alloc(temporal.Detail, @as(usize, rect.w) * rect.h);
+    var n_accepted: u64 = 0;
+    var n_rejected: u64 = 0;
+    const debug_buf: ?[]u8 = if (args.debug_out != null) try arena.alloc(u8, @as(usize, w) * 2 * h * 3) else null;
+    var debug_mp4: ?mp4.Writer = null;
+    defer if (debug_mp4) |*m| m.close();
+    if (args.debug_out) |p| {
+        if (std.mem.endsWith(u8, p, ".mp4")) {
+            debug_mp4 = mp4.Writer.open(try arena.dupeZ(u8, p), try arena.dupeZ(u8, args.video), &d, .{ .crf = 18, .audio = false, .width = w * 2, .rotation = false }) catch |e| {
+                try err.print("vrestore: could not write '{s}': {s}\n", .{ p, mp4.describe(e) });
+                return 1;
+            };
+        } else cwd.createDirPath(io, p) catch |e| {
+            try err.print("vrestore: could not create '{s}': {s}\n", .{ p, @errorName(e) });
+            return 1;
+        };
+    }
     var stable: ?stabilize.State = null;
     defer if (stable) |st| st.deinit(gpa);
     const frame_bytes = d.frameBytes();
@@ -393,7 +417,13 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
         }
         const track = try temporal.Track.buildAffine(gpa, motions);
         defer track.deinit(gpa);
-        const r = try fillAndTally(gpa, args.fill, hidden, temporal.recoverFrame(images, track, next_target - lo, rect, temporalGuard(hidden, rect, args.temporal_guard, w, h), args.max_ring_diff, out_rgb, prov), out_rgb, w, h, prov, rect);
+        const t_r = temporal.recoverFrame(images, track, next_target - lo, rect, temporalGuard(hidden, rect, args.temporal_guard, w, h), .{ .mode = args.temporal, .max_ring_diff = args.max_ring_diff }, out_rgb, prov, detail);
+        for (detail) |dd| switch (dd.class) {
+            .accepted => n_accepted += 1,
+            .rejected => n_rejected += 1,
+            .none => {},
+        };
+        const r = try fillAndTally(gpa, args.fill, hidden, t_r, out_rgb, w, h, prov, rect);
         if (args.stable_fill and args.fill != .none) {
             const area = if (hidden) |m| m.area else rect;
             if (stable == null) stable = try stabilize.State.init(gpa, .{ .x = area.x, .y = area.y, .w = area.w, .h = area.h }, w, h);
@@ -409,6 +439,21 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
             return 1;
         };
         if (prov_w) |*pw| try pw.interface.writeAll(std.mem.sliceAsBytes(prov));
+        if (debug_buf) |db| {
+            debug_view.render(db, w, h, images[next_target - lo].rgb, out_rgb, prov, rect, if (hidden) |m| m.area else rect, detail, args.window);
+            if (debug_mp4) |*m| m.write(db, slots.items[next_target - lo].pts) catch |e| {
+                try err.print("vrestore: could not write '{s}': {s}\n", .{ args.debug_out.?, mp4.describe(e) });
+                return 1;
+            } else {
+                const png = try video.encodePng(gpa, w * 2, h, db);
+                defer gpa.free(png);
+                var name_buf: [32]u8 = undefined;
+                const name = try std.fmt.bufPrint(&name_buf, "frame-{d:0>6}.png", .{next_target});
+                const path = try std.fs.path.join(gpa, &.{ args.debug_out.?, name });
+                defer gpa.free(path);
+                try cwd.writeFile(io, .{ .sub_path = path, .data = png });
+            }
+        }
         next_target += 1;
 
         // 次の target の窓から外れたフレームを捨てる
@@ -421,6 +466,10 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
     }
     if (want_raw) try raw_w.interface.flush();
     if (args.progress_out) |pp| try writeProgress(io, pp, next_target, next_target);
+    if (debug_mp4) |*m| m.finish() catch |e| {
+        try err.print("vrestore: could not write '{s}': {s}\n", .{ args.debug_out.?, mp4.describe(e) });
+        return 1;
+    };
     if (mp4_w) |*m| m.finish() catch |e| {
         try err.print("vrestore: could not write '{s}': {s}\n", .{ args.mp4_out.?, mp4.describe(e) });
         return 1;
@@ -436,6 +485,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
         next_target, rect.x, rect.y, rect.w, rect.h, @tagName(args.motion), @tagName(args.fill), args.window, args.min_peak, total.recovered(), total.roiPixels(), total.coverage(), coverage_min, cuts, peak_min, peak_max,
     });
     try total.writeJson(summary);
+    try summary.print(",\"temporal\":\"{s}\",\"temporal_pixels\":{{\"accepted\":{d},\"rejected\":{d}}}", .{ @tagName(args.temporal), n_accepted, n_rejected });
     try summary.print(",\"mask\":\"{s}\"", .{@tagName(args.mask)});
     if (stable) |st| try summary.print(",\"stable_fill\":{{\"blended\":{d},\"reset\":{d}}}", .{ st.blended, st.reset });
     if (mask_est) |m| try summary.print(",\"mask_accepted\":{},\"mask_fraction\":{d:.4},\"mask_inside_mad\":{d:.2},\"mask_outside_mad\":{d:.2}", .{ m.accepted, m.fraction, m.inside_mad, m.outside_mad });
