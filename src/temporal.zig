@@ -295,11 +295,50 @@ pub const Recovered = provenance.Tally;
 /// 戻せなかった ROI の画素は unrecovered。戻せなかった画素は target の画素のまま残す（推測で埋めない）。
 ///
 /// 候補は時間の近いフレームから順に見る。背景の同じ点がそのフレームで ROI の外かつ画面内にあれば採る。
-pub fn recoverFrame(frames: []const Image, track: Track, target: usize, roi: Rect, guard: Guard, max_ring_diff: ?f64, out: []u8, prov: []Provenance) Recovered {
+/// 別のフレームから借りるかどうか（ADR 0017）
+/// - off: 借りない（ROI の画素はすべて戻せなかった扱い）
+/// - on: 周りの帯が合うフレームのうち、時間の近いものから借りる（ADR 0005 / 0007 / 0016）
+/// - auto: on の候補のうち、下の条件（AutoParams）をすべて通った画素だけを戻したと数える
+pub const Mode = enum { off, on, auto };
+
+/// auto で採用する条件
+pub const AutoParams = struct {
+    /// 周りの帯の差の絶対値の平均の上限（on の既定 6 より厳しく）
+    max_ring_diff: f64 = 4,
+    /// 隣り合うフレームの ROI の中心の動きが、窓の中の中央値からこれ以上ずれたペアを通る鎖は使わない（px）
+    max_motion_jump: f64 = 2,
+    /// 前のフレームと後のフレームから取った値の差（R/G/B の最大）の上限
+    max_disagree: f64 = 10,
+};
+
+pub const Options = struct {
+    mode: Mode = .on,
+    /// on の帯の閾値（null なら確かめない）
+    max_ring_diff: ?f64 = 6,
+    auto: AutoParams = .{},
+};
+
+/// ROI の画素ごとの、借りた / 借りなかった理由（debug の可視化と集計に使う。provenance の形式は変えない）
+pub const Detail = struct {
+    pub const Class = enum(u8) {
+        /// 借りる候補が無かった
+        none,
+        /// 戻したと数えた（temporal_real）
+        accepted,
+        /// 候補はあったが auto の条件を通らなかった（戻せなかった扱い）
+        rejected,
+    };
+    class: Class = .none,
+    /// 借りた（不採用なら最初の候補の）フレームの、表示中からの差。0 は無し
+    src: i16 = 0,
+};
+
+pub fn recoverFrame(frames: []const Image, track: Track, target: usize, roi: Rect, guard: Guard, opts: Options, out: []u8, prov: []Provenance, detail: ?[]Detail) Recovered {
     const t = frames[target];
     const w = t.width;
     @memcpy(out, t.rgb);
     @memset(prov, .original);
+    if (detail) |d| @memset(d, .{});
     var tally: Recovered = .{};
 
     // 使ってよいフレーム: 鎖がつながっていて、ROI の周りの帯が表示中のフレームと合うもの
@@ -309,39 +348,135 @@ pub fn recoverFrame(frames: []const Image, track: Track, target: usize, roi: Rec
     // 借りる画素に足す明るさの差（帯での平均、表示中 − s、R/G/B）。フレームごとの露出や圧縮の差で、
     // 借りた画素だけ少し明るい / 暗いと、ROI の縁に沿って線に見える（実写で +2 程度の段差を観測）
     var offset: [max_window_frames][3]f64 = undefined;
+    const ring_limit: ?f64 = switch (opts.mode) {
+        .auto => if (opts.max_ring_diff) |l| @min(l, opts.auto.max_ring_diff) else opts.auto.max_ring_diff,
+        else => opts.max_ring_diff,
+    };
+    // auto: 隣り合うフレーム k → k+1 の ROI の中心の動きが、窓の中の中央値から大きくずれていないか
+    var steady: [max_window_frames]bool = undefined;
+    if (opts.mode == .auto) motionSteady(frames.len, track, target, roi, opts.auto.max_motion_jump, &steady);
     for (0..frames.len) |s| {
-        usable[s] = s != target and track.segment[s] == track.segment[target];
+        usable[s] = opts.mode != .off and s != target and track.segment[s] == track.segment[target];
         offset[s] = .{ 0, 0, 0 };
         if (!usable[s]) continue;
         to_s[s] = track.transform(target, s);
         const r = ringDiff(t, frames[s], roi, guard, to_s[s]);
-        if (max_ring_diff) |limit| usable[s] = if (r) |v| v.mad <= limit else false;
+        if (ring_limit) |limit| usable[s] = if (r) |v| v.mad <= limit else false;
         if (r) |v| offset[s] = v.offset;
+        if (opts.mode == .auto and usable[s]) {
+            // 表示中から s までの間のペアがすべて落ち着いていること
+            const lo = @min(s, target);
+            const hi = @max(s, target);
+            for (lo..hi) |k| if (!steady[k]) {
+                usable[s] = false;
+                break;
+            };
+        }
     }
     for (roi.y..roi.y + roi.h) |y| {
         for (roi.x..roi.x + roi.w) |x| {
+            const k = (y - roi.y) * roi.w + (x - roi.x);
             prov[y * w + x] = .unrecovered;
-            var dist: usize = 1;
-            search: while (dist < frames.len) : (dist += 1) {
-                for ([_]i64{ -1, 1 }) |sign| {
-                    const si = @as(i64, @intCast(target)) + sign * @as(i64, @intCast(dist));
-                    if (si < 0 or si >= frames.len) continue;
-                    const s: usize = @intCast(si);
-                    if (!usable[s]) continue;
-                    // 背景の同じ点は、フレーム s では to_s[s](x, y) にある
-                    const q = to_s[s].apply(@floatFromInt(x), @floatFromInt(y));
-                    var px = sample(frames[s], roi, guard, q[0], q[1]) orelse continue;
-                    for (&px, offset[s]) |*v, o| v.* = @intFromFloat(std.math.clamp(@round(@as(f64, @floatFromInt(v.*)) + o), 0, 255));
-                    out[(y * w + x) * 3 ..][0..3].* = px;
-                    prov[y * w + x] = .temporal_real;
-                    break :search;
+            if (opts.mode == .auto) {
+                // 前と後で、それぞれ時間の近いものから候補を 1 つずつ取る
+                const past = nearest(frames, usable, to_s, offset, target, roi, guard, x, y, -1);
+                const future = nearest(frames, usable, to_s, offset, target, roi, guard, x, y, 1);
+                if (past != null and future != null) {
+                    const a = past.?;
+                    const b = future.?;
+                    var diff: f64 = 0;
+                    for (a.px, b.px) |u, v| diff = @max(diff, @abs(@as(f64, @floatFromInt(u)) - @as(f64, @floatFromInt(v))));
+                    if (diff <= opts.auto.max_disagree) {
+                        var px: [3]u8 = undefined;
+                        for (&px, a.px, b.px) |*o, u, v| o.* = @intCast((@as(u16, u) + v + 1) / 2);
+                        out[(y * w + x) * 3 ..][0..3].* = px;
+                        prov[y * w + x] = .temporal_real;
+                        if (detail) |d| d[k] = .{ .class = .accepted, .src = if (@abs(a.dt) <= @abs(b.dt)) a.dt else b.dt };
+                    } else if (detail) |d| d[k] = .{ .class = .rejected, .src = if (@abs(a.dt) <= @abs(b.dt)) a.dt else b.dt };
+                } else if (past orelse future) |one| {
+                    if (detail) |d| d[k] = .{ .class = .rejected, .src = one.dt };
                 }
+            } else if (nearestAny(frames, usable, to_s, offset, target, roi, guard, x, y)) |c| {
+                out[(y * w + x) * 3 ..][0..3].* = c.px;
+                prov[y * w + x] = .temporal_real;
+                if (detail) |d| d[k] = .{ .class = .accepted, .src = c.dt };
             }
             tally.add(prov[y * w + x]);
         }
     }
     // ROI の外は数えない（Tally.roiPixels は ROI の中だけ）
     return tally;
+}
+
+const Candidate = struct { px: [3]u8, dt: i16 };
+
+fn take(frames: []const Image, to_s: []const Affine, offset: []const [3]f64, s: usize, roi: Rect, guard: Guard, x: usize, y: usize) ?[3]u8 {
+    // 背景の同じ点は、フレーム s では to_s[s](x, y) にある
+    const q = to_s[s].apply(@floatFromInt(x), @floatFromInt(y));
+    var px = sample(frames[s], roi, guard, q[0], q[1]) orelse return null;
+    for (&px, offset[s]) |*v, o| v.* = @intFromFloat(std.math.clamp(@round(@as(f64, @floatFromInt(v.*)) + o), 0, 255));
+    return px;
+}
+
+/// `sign` の向き（-1 = 前、1 = 後）で、時間の近いものから最初に取れた候補
+fn nearest(frames: []const Image, usable: [max_window_frames]bool, to_s: [max_window_frames]Affine, offset: [max_window_frames][3]f64, target: usize, roi: Rect, guard: Guard, x: usize, y: usize, sign: i64) ?Candidate {
+    var dist: usize = 1;
+    while (dist < frames.len) : (dist += 1) {
+        const si = @as(i64, @intCast(target)) + sign * @as(i64, @intCast(dist));
+        if (si < 0 or si >= frames.len) return null;
+        const s: usize = @intCast(si);
+        if (!usable[s]) continue;
+        if (take(frames, &to_s, &offset, s, roi, guard, x, y)) |px| return .{ .px = px, .dt = @intCast(si - @as(i64, @intCast(target))) };
+    }
+    return null;
+}
+
+/// 前後を交互に、時間の近いものから最初に取れた候補（on）
+fn nearestAny(frames: []const Image, usable: [max_window_frames]bool, to_s: [max_window_frames]Affine, offset: [max_window_frames][3]f64, target: usize, roi: Rect, guard: Guard, x: usize, y: usize) ?Candidate {
+    var dist: usize = 1;
+    while (dist < frames.len) : (dist += 1) {
+        for ([_]i64{ -1, 1 }) |sign| {
+            const si = @as(i64, @intCast(target)) + sign * @as(i64, @intCast(dist));
+            if (si < 0 or si >= frames.len) continue;
+            const s: usize = @intCast(si);
+            if (!usable[s]) continue;
+            if (take(frames, &to_s, &offset, s, roi, guard, x, y)) |px| return .{ .px = px, .dt = @intCast(si - @as(i64, @intCast(target))) };
+        }
+    }
+    return null;
+}
+
+/// 隣り合うフレーム k → k+1 について、表示中のフレームでの ROI の中心がどれだけ動いたかを出し、
+/// 同じ区間のペアの中央値から `max_jump` px 以内なら steady[k] = true
+fn motionSteady(n: usize, track: Track, target: usize, roi: Rect, max_jump: f64, steady: *[max_window_frames]bool) void {
+    const cx = @as(f64, @floatFromInt(roi.x)) + @as(f64, @floatFromInt(roi.w)) / 2;
+    const cy = @as(f64, @floatFromInt(roi.y)) + @as(f64, @floatFromInt(roi.h)) / 2;
+    var dx: [max_window_frames]f64 = undefined;
+    var dy: [max_window_frames]f64 = undefined;
+    var sx: [max_window_frames]f64 = undefined;
+    var sy: [max_window_frames]f64 = undefined;
+    var m: usize = 0;
+    for (0..n) |k| steady[k] = false;
+    if (n < 2) return;
+    for (0..n - 1) |k| {
+        if (track.segment[k] != track.segment[target] or track.segment[k + 1] != track.segment[target]) continue;
+        const a = track.transform(target, k).apply(cx, cy);
+        const b = track.transform(target, k + 1).apply(cx, cy);
+        dx[k] = b[0] - a[0];
+        dy[k] = b[1] - a[1];
+        sx[m] = dx[k];
+        sy[m] = dy[k];
+        m += 1;
+    }
+    if (m == 0) return;
+    std.mem.sort(f64, sx[0..m], {}, std.sort.asc(f64));
+    std.mem.sort(f64, sy[0..m], {}, std.sort.asc(f64));
+    const mx = sx[m / 2];
+    const my = sy[m / 2];
+    for (0..n - 1) |k| {
+        if (track.segment[k] != track.segment[target] or track.segment[k + 1] != track.segment[target]) continue;
+        steady[k] = @abs(dx[k] - mx) <= max_jump and @abs(dy[k] - my) <= max_jump;
+    }
 }
 
 /// 窓の最大フレーム数（前後 255 枚まで）
@@ -441,13 +576,144 @@ test "temporal: recoverFrame matches the brightness of the borrowed pixels to th
     defer gpa.free(out);
     const prov = try gpa.alloc(Provenance, w * h);
     defer gpa.free(prov);
-    const r = recoverFrame(&frames, track, 4, roi, .{ .area = roi }, 6, out, prov);
+    const r = recoverFrame(&frames, track, 4, roi, .{ .area = roi }, .{ .max_ring_diff = 6 }, out, prov, null);
     try std.testing.expectEqual(r.roiPixels(), r.recovered());
     // 戻した画素は、表示中のフレーム（ずれ 0）の正解と一致する
     for (roi.y..roi.y + roi.h) |y| for (roi.x..roi.x + roi.w) |x| {
         const i = (y * w + x) * 3;
         try std.testing.expectEqualSlices(u8, bufs[4][i..][0..3], out[i..][0..3]);
     };
+}
+
+/// テスト用: 背景が 1 フレームに `step` px 右へ動く 9 フレーム（ROI は塗りつぶす）と、その鎖
+const PanFixture = struct {
+    bufs: [9][]u8,
+    frames: [9]Image,
+    truth: []u8,
+    s: []u8,
+    const sw = 400;
+    const w = 120;
+    const h = 64;
+    const roi: Rect = .{ .x = 40, .y = 20, .w = 30, .h = 16 };
+
+    fn init(gpa: Allocator, steps: [8]u32) !PanFixture {
+        var f: PanFixture = undefined;
+        f.s = try scene(gpa, sw, 200, 3);
+        var ox: u32 = 200;
+        for (0..9) |k| {
+            if (k > 0) ox -= steps[k - 1];
+            f.bufs[k] = try view(gpa, f.s, sw, ox, 60, w, h);
+            if (k == 4) f.truth = try gpa.dupe(u8, f.bufs[k]);
+            for (roi.y..roi.y + roi.h) |y| for (roi.x..roi.x + roi.w) |x| {
+                f.bufs[k][(y * w + x) * 3 ..][0..3].* = .{ 255, 0, 255 };
+            };
+            f.frames[k] = .{ .width = w, .height = h, .rgb = f.bufs[k] };
+        }
+        return f;
+    }
+
+    fn deinit(f: PanFixture, gpa: Allocator) void {
+        for (f.bufs) |b| gpa.free(b);
+        gpa.free(f.truth);
+        gpa.free(f.s);
+    }
+};
+
+fn countClass(d: []const Detail, c: Detail.Class) usize {
+    var n: usize = 0;
+    for (d) |x| n += @intFromBool(x.class == c);
+    return n;
+}
+
+test "temporal: auto takes a pixel only when the frames before and after agree, and it is exact" {
+    const gpa = std.testing.allocator;
+    const f = try PanFixture.init(gpa, .{6} ** 8);
+    defer f.deinit(gpa);
+    var shifts: [8]Shift = undefined;
+    for (&shifts) |*sh| sh.* = .{ .dx = 6, .dy = 0, .peak = 1 };
+    const track = try Track.build(gpa, &shifts, 0.1);
+    defer track.deinit(gpa);
+    const w = PanFixture.w;
+    const out = try gpa.alloc(u8, w * PanFixture.h * 3);
+    defer gpa.free(out);
+    const prov = try gpa.alloc(Provenance, w * PanFixture.h);
+    defer gpa.free(prov);
+    const roi = PanFixture.roi;
+    var detail: [30 * 16]Detail = undefined;
+    const r = recoverFrame(&f.frames, track, 4, roi, .{ .area = roi }, .{ .mode = .auto }, out, prov, &detail);
+    try std.testing.expect(r.recovered() > 0);
+    try std.testing.expectEqual(r.recovered(), countClass(&detail, .accepted));
+    for (roi.y..roi.y + roi.h) |y| for (roi.x..roi.x + roi.w) |x| {
+        const i = y * w + x;
+        if (prov[i] == .temporal_real) try std.testing.expectEqualSlices(u8, f.truth[i * 3 ..][0..3], out[i * 3 ..][0..3]);
+    };
+
+    // 最後のフレームには後ろが無いので、auto は 1 画素も採らない（on なら前だけから戻す）
+    const last = recoverFrame(&f.frames, track, 8, roi, .{ .area = roi }, .{ .mode = .auto }, out, prov, &detail);
+    try std.testing.expectEqual(@as(usize, 0), last.recovered());
+    try std.testing.expect(countClass(&detail, .rejected) > 0);
+    try std.testing.expect(recoverFrame(&f.frames, track, 8, roi, .{ .area = roi }, .{ .mode = .on }, out, prov, null).recovered() > 0);
+
+    // off は何も借りない
+    const off = recoverFrame(&f.frames, track, 4, roi, .{ .area = roi }, .{ .mode = .off }, out, prov, &detail);
+    try std.testing.expectEqual(@as(usize, 0), off.recovered());
+    try std.testing.expectEqual(@as(usize, 0), countClass(&detail, .accepted) + countClass(&detail, .rejected));
+}
+
+test "temporal: auto rejects a pixel whose frames before and after disagree (something moved there)" {
+    const gpa = std.testing.allocator;
+    var f = try PanFixture.init(gpa, .{6} ** 8);
+    defer f.deinit(gpa);
+    // 後のフレームだけ、ROI のすぐ右（借りる元になる所）に小さな別の色の物体がある。
+    // 小さいので周りの帯の差の平均は閾値に収まり、前後の値の比べ方だけで弾く必要がある
+    for (5..9) |k| for (26..29) |y| for (70..73) |x| {
+        f.bufs[k][(y * PanFixture.w + x) * 3 ..][0..3].* = .{ 0, 200, 0 };
+    };
+    var shifts: [8]Shift = undefined;
+    for (&shifts) |*sh| sh.* = .{ .dx = 6, .dy = 0, .peak = 1 };
+    const track = try Track.build(gpa, &shifts, 0.1);
+    defer track.deinit(gpa);
+    const out = try gpa.alloc(u8, PanFixture.w * PanFixture.h * 3);
+    defer gpa.free(out);
+    const prov = try gpa.alloc(Provenance, PanFixture.w * PanFixture.h);
+    defer gpa.free(prov);
+    const roi = PanFixture.roi;
+    var detail: [30 * 16]Detail = undefined;
+    _ = recoverFrame(&f.frames, track, 4, roi, .{ .area = roi }, .{ .mode = .auto }, out, prov, &detail);
+    // 物体の写った画素は採らない。採った画素はすべて正解と一致する
+    try std.testing.expect(countClass(&detail, .rejected) > 0);
+    for (roi.y..roi.y + roi.h) |y| for (roi.x..roi.x + roi.w) |x| {
+        const i = y * PanFixture.w + x;
+        if (prov[i] == .temporal_real) try std.testing.expectEqualSlices(u8, f.truth[i * 3 ..][0..3], out[i * 3 ..][0..3]);
+    };
+    // on は時間の近い方から 1 枚で借りるので、物体の色を戻したと言う画素がある
+    _ = recoverFrame(&f.frames, track, 4, roi, .{ .area = roi }, .{ .mode = .on, .max_ring_diff = null }, out, prov, null);
+    var wrong: usize = 0;
+    for (roi.y..roi.y + roi.h) |y| for (roi.x..roi.x + roi.w) |x| {
+        const i = y * PanFixture.w + x;
+        if (prov[i] == .temporal_real and !std.mem.eql(u8, f.truth[i * 3 ..][0..3], out[i * 3 ..][0..3])) wrong += 1;
+    };
+    try std.testing.expect(wrong > 0);
+}
+
+test "temporal: auto does not borrow across a pair whose motion jumps" {
+    const gpa = std.testing.allocator;
+    // 3 → 4 のペアだけ 20 px 動く（他は 6 px）
+    const f = try PanFixture.init(gpa, .{ 6, 6, 6, 20, 6, 6, 6, 6 });
+    defer f.deinit(gpa);
+    var shifts: [8]Shift = undefined;
+    for (&shifts, [_]i32{ 6, 6, 6, 20, 6, 6, 6, 6 }) |*sh, d| sh.* = .{ .dx = d, .dy = 0, .peak = 1 };
+    const track = try Track.build(gpa, &shifts, 0.1);
+    defer track.deinit(gpa);
+    const out = try gpa.alloc(u8, PanFixture.w * PanFixture.h * 3);
+    defer gpa.free(out);
+    const prov = try gpa.alloc(Provenance, PanFixture.w * PanFixture.h);
+    defer gpa.free(prov);
+    const roi = PanFixture.roi;
+    var detail: [30 * 16]Detail = undefined;
+    _ = recoverFrame(&f.frames, track, 4, roi, .{ .area = roi }, .{ .mode = .auto }, out, prov, &detail);
+    // 前のフレーム（0〜3）は跳ねたペアを通るので使わない。採った画素は無く、候補は後ろだけなので不採用
+    for (detail) |d| try std.testing.expect(d.class != .accepted and d.src >= 0);
 }
 
 test "temporal: fft round-trips" {
@@ -563,7 +829,7 @@ test "temporal: recoverFrame restores the exact background under a pan, refuses 
     defer gpa.free(truth);
 
     // 中央のフレームは前後 4 フレームずつ（±24 px）使える。ROI の幅 30 のうち、左右どちらかに出る画素だけ戻る
-    const r = recoverFrame(&frames, track, 4, roi, .{ .area = roi }, null, out, prov);
+    const r = recoverFrame(&frames, track, 4, roi, .{ .area = roi }, .{ .max_ring_diff = null }, out, prov, null);
     try std.testing.expectEqual(@as(usize, 30 * 16), r.roiPixels());
     // ROI の外は original（入力のまま）
     try std.testing.expectEqual(Provenance.original, prov[0]);
@@ -589,7 +855,7 @@ test "temporal: recoverFrame restores the exact background under a pan, refuses 
     for (&shifts) |*sh| sh.* = .{ .dx = 9, .dy = 0, .peak = 1 };
     const wrong = try Track.build(gpa, &shifts, 0.1);
     defer wrong.deinit(gpa);
-    const r_wrong = recoverFrame(&frames, wrong, 4, roi, .{ .area = roi }, null, out, prov);
+    const r_wrong = recoverFrame(&frames, wrong, 4, roi, .{ .area = roi }, .{ .max_ring_diff = null }, out, prov, null);
     try std.testing.expect(r_wrong.recovered() > 0);
     var mismatched: usize = 0;
     for (roi.y..roi.y + roi.h) |y| for (roi.x..roi.x + roi.w) |x| {
@@ -597,16 +863,16 @@ test "temporal: recoverFrame restores the exact background under a pan, refuses 
         if (prov[i] == .temporal_real and !std.mem.eql(u8, truth[i * 3 ..][0..3], out[i * 3 ..][0..3])) mismatched += 1;
     };
     try std.testing.expect(mismatched > 0);
-    const r_checked = recoverFrame(&frames, wrong, 4, roi, .{ .area = roi }, 6, out, prov);
+    const r_checked = recoverFrame(&frames, wrong, 4, roi, .{ .area = roi }, .{ .max_ring_diff = 6 }, out, prov, null);
     try std.testing.expectEqual(@as(usize, 0), r_checked.recovered());
     try std.testing.expectEqual(r_checked.roiPixels(), r_checked.counts.get(.unrecovered));
     // 正しい移動量なら、帯の確認をしても全部戻る
-    try std.testing.expectEqual(r.roiPixels(), recoverFrame(&frames, track, 4, roi, .{ .area = roi }, 6, out, prov).recovered());
+    try std.testing.expectEqual(r.roiPixels(), recoverFrame(&frames, track, 4, roi, .{ .area = roi }, .{ .max_ring_diff = 6 }, out, prov, null).recovered());
 
     // 動いていなければ何も戻らない（同じ場所が隠れたまま）
     for (&shifts) |*sh| sh.* = .{ .dx = 0, .dy = 0, .peak = 1 };
     const still = try Track.build(gpa, &shifts, 0.1);
     defer still.deinit(gpa);
-    const r0 = recoverFrame(&frames, still, 4, roi, .{ .area = roi }, null, out, prov);
+    const r0 = recoverFrame(&frames, still, 4, roi, .{ .area = roi }, .{ .max_ring_diff = null }, out, prov, null);
     try std.testing.expectEqual(@as(usize, 0), r0.recovered());
 }
