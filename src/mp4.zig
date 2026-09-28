@@ -13,6 +13,8 @@ const c = video.c;
 pub const Error = error{
     /// 出力ファイルを作れない
     CreateFailed,
+    /// 幅か高さが奇数（H.264 の 4:2:0 は偶数しか持てない）
+    OddSize,
     /// この FFmpeg に H.264 のエンコーダが無い
     NoEncoder,
     EncodeFailed,
@@ -27,6 +29,7 @@ pub const Error = error{
 pub fn describe(e: Error) []const u8 {
     return switch (e) {
         error.CreateFailed => "could not create the output file",
+        error.OddSize => "H.264 (4:2:0) needs an even width and height; this video's is odd (use --raw instead)",
         error.NoEncoder => "this FFmpeg has no H.264 encoder (libx264)",
         error.EncodeFailed => "encoding failed",
         error.WriteFailed => "writing the output failed",
@@ -73,6 +76,7 @@ pub const Writer = struct {
     /// `out_path` に MP4 を作る。映像の大きさ・time_base・色の情報は `d`（入力のデコーダ）から取る。
     /// 音声は `src_path` をもう一度開いて写す
     pub fn open(out_path: [:0]const u8, src_path: [:0]const u8, d: *const video.Decoder, opts: Options) Error!Writer {
+        if (d.info.width % 2 != 0 or d.info.height % 2 != 0) return error.OddSize;
         var oc_opt: ?*c.AVFormatContext = null;
         if (c.avformat_alloc_output_context2(&oc_opt, null, "mp4", out_path.ptr) < 0 or oc_opt == null) return error.CreateFailed;
         const oc = oc_opt.?;
@@ -92,7 +96,9 @@ pub const Writer = struct {
         enc.color_primaries = in_par.*.color_primaries;
         enc.color_trc = in_par.*.color_trc;
         enc.colorspace = in_par.*.color_space;
-        enc.color_range = c.AVCOL_RANGE_MPEG; // swscale の既定の出力は limited
+        // 範囲と行列は、デコードで RGB にしたときと同じ（video.ColorSpec）。記述が無い入力は limited・BT.601 のまま
+        const color = video.ColorSpec.of(in_par);
+        enc.color_range = if (color.full) c.AVCOL_RANGE_JPEG else c.AVCOL_RANGE_MPEG;
         if (oc.oformat.*.flags & c.AVFMT_GLOBALHEADER != 0) enc.flags |= c.AV_CODEC_FLAG_GLOBAL_HEADER;
 
         var dict: ?*c.AVDictionary = null;
@@ -107,6 +113,11 @@ pub const Writer = struct {
         if (c.avcodec_parameters_from_context(vst.codecpar, enc) < 0) return error.EncodeFailed;
         vst.time_base = enc.time_base;
         vst.avg_frame_rate = d.stream.avg_frame_rate;
+        // 回転の情報（display matrix）を写す。フレームは回さずに書くので、再生側が同じ向きに回せるように
+        if (c.av_packet_side_data_get(in_par.*.coded_side_data, in_par.*.nb_coded_side_data, c.AV_PKT_DATA_DISPLAYMATRIX)) |sd| {
+            const dst = c.av_packet_side_data_new(&vst.codecpar.*.coded_side_data, &vst.codecpar.*.nb_coded_side_data, c.AV_PKT_DATA_DISPLAYMATRIX, sd.*.size, 0) orelse return error.OutOfMemory;
+            @memcpy(dst.*.data[0..sd.*.size], sd.*.data[0..sd.*.size]);
+        }
 
         var audio: ?Audio = null;
         errdefer if (audio) |*a| closeAudio(a);
@@ -118,8 +129,9 @@ pub const Writer = struct {
         errdefer _ = c.avio_closep(&oc.pb);
         if (c.avformat_write_header(oc, null) < 0) return error.WriteFailed;
 
-        const sws = c.sws_getContext(enc.width, enc.height, c.AV_PIX_FMT_RGB24, enc.width, enc.height, c.AV_PIX_FMT_YUV420P, c.SWS_BILINEAR | c.SWS_ACCURATE_RND, null, null, null) orelse return error.OutOfMemory;
+        const sws = c.sws_getContext(enc.width, enc.height, c.AV_PIX_FMT_RGB24, enc.width, enc.height, c.AV_PIX_FMT_YUV420P, c.SWS_BICUBIC | c.SWS_ACCURATE_RND | c.SWS_FULL_CHR_H_INT | c.SWS_FULL_CHR_H_INP, null, null, null) orelse return error.OutOfMemory;
         errdefer c.sws_freeContext(sws);
+        color.apply(sws, false);
         var frame_opt: ?*c.AVFrame = c.av_frame_alloc() orelse return error.OutOfMemory;
         errdefer c.av_frame_free(&frame_opt);
         const frame = frame_opt.?;

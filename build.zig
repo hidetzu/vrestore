@@ -95,7 +95,65 @@ pub fn build(b: *std.Build) void {
     cli_detect_flat_ref.addFileArg(steps_mp4);
     cli_detect_flat_ref.expectStdErrMatch("has no edges to match");
     cli_detect_flat_ref.expectExitCode(1);
+    // 幅・高さが奇数の動画は H.264（4:2:0）に書き出せない。理由を言って、書き始める前に止まること
+    const gen_odd = b.addSystemCommand(&.{ "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=320x180:r=10:d=0.5", "-vf", "scale=321:181,format=gbrp", "-c:v", "ffv1" });
+    gen_odd.setName("generate odd.mkv");
+    const odd_mkv = gen_odd.addOutputFileArg("odd.mkv");
+    const cli_odd_out = b.addRunArtifact(exe);
+    cli_odd_out.setName("cli_odd_out");
+    cli_odd_out.addArgs(&.{ "restore", "--rect", "10,10,20,20", "--out" });
+    _ = cli_odd_out.addOutputFileArg("odd-out.mp4");
+    cli_odd_out.addFileArg(odd_mkv);
+    cli_odd_out.expectStdErrMatch("needs an even width and height");
+    cli_odd_out.expectExitCode(1);
+    // フルレンジ（yuv420p + color_range=pc）の入力を書き出しても、暗部・明部を潰さない。
+    // 明るさだけ 0〜255 の横の傾斜を VP9 の劣化なしで作り、--crf 0 で書き出し、ffmpeg に範囲の記述どおり RGB にさせて比べる。
+    // 実測: 直す前は 17 → 0、241 → 255（差の平均 8.22）、直した後は差 0
+    const gen_ramp = b.addSystemCommand(&.{ "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "color=gray:s=320x180:r=10:d=1,format=yuv420p,geq=lum='X*255/319':cb=128:cr=128", "-c:v", "libvpx-vp9", "-lossless", "1", "-pix_fmt", "yuv420p", "-color_range", "pc" });
+    gen_ramp.setName("generate full-range ramp");
+    const ramp = gen_ramp.addOutputFileArg("ramp.webm");
+    const ramp_out = b.addRunArtifact(exe);
+    ramp_out.setName("cli_full_range restore");
+    ramp_out.addArgs(&.{ "restore", "--rect", "10,10,20,20", "--crf", "0", "--out" });
+    const ramp_mp4 = ramp_out.addOutputFileArg("ramp-out.mp4");
+    ramp_out.addFileArg(ramp);
+    _ = ramp_out.captureStdOut(.{});
+    const ramp_chk = b.addSystemCommand(&.{
+        "sh", "-c",
+        \\p=$(ffmpeg -i "$0" -i "$1" -lavfi "[0:v]crop=280:140:40:40,scale=in_range=auto:out_range=full,format=gbrp[a];[1:v]crop=280:140:40:40,scale=in_range=auto:out_range=full,format=gbrp[b];[a][b]psnr" -f null - 2>&1 | grep -o "average:[^ ]*" | cut -d: -f2)
+        \\echo "full-range psnr=$p (>= 40)"
+        \\[ "$p" = inf ] || awk -v p="$p" 'BEGIN { exit !(p >= 40) }'
+    });
+    ramp_chk.setName("cli_full_range check");
+    ramp_chk.addFileArg(ramp);
+    ramp_chk.addFileArg(ramp_mp4);
+    ramp_chk.expectExitCode(0);
+    // 回転の情報（display matrix）を書き出しに写す。フレームは回さないので、写さないと縦持ちの動画が横倒しになる
+    const gen_rot = b.addSystemCommand(&.{
+        "sh", "-c",
+        \\ffmpeg -hide_banner -loglevel error -y -f lavfi -i testsrc2=s=320x180:r=10:d=0.5 -c:v libx264 -pix_fmt yuv420p "$0.tmp.mp4" &&
+        \\ffmpeg -hide_banner -loglevel error -y -display_rotation 90 -i "$0.tmp.mp4" -c copy "$0" && rm -f "$0.tmp.mp4"
+    });
+    gen_rot.setName("generate rotated.mp4");
+    const rot_mp4 = gen_rot.addOutputFileArg("rotated.mp4");
+    const rot_out = b.addRunArtifact(exe);
+    rot_out.setName("cli_rotation restore");
+    rot_out.addArgs(&.{ "restore", "--rect", "10,10,20,20", "--out" });
+    const rot_out_mp4 = rot_out.addOutputFileArg("rotated-out.mp4");
+    rot_out.addFileArg(rot_mp4);
+    _ = rot_out.captureStdOut(.{});
+    const rot_chk = b.addSystemCommand(&.{
+        "sh", "-c",
+        \\r=$(ffprobe -v error -select_streams v -show_entries stream_side_data=rotation -of csv=p=0 "$0")
+        \\echo "rotation=$r (want 90)"; [ "$r" = 90 ]
+    });
+    rot_chk.setName("cli_rotation check");
+    rot_chk.addFileArg(rot_out_mp4);
+    rot_chk.expectExitCode(0);
     if (test_filters.len == 0) {
+        test_step.dependOn(&ramp_chk.step);
+        test_step.dependOn(&rot_chk.step);
+        test_step.dependOn(&cli_odd_out.step);
         test_step.dependOn(&cli_detect_bad_ref.step);
         test_step.dependOn(&cli_detect_flat_ref.step);
         test_step.dependOn(&cli_stdout_file.step);

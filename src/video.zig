@@ -72,6 +72,42 @@ pub const Frame = struct {
     }
 };
 
+/// YUV と RGB の変換に使う、色の範囲と行列。デコード（video.zig）と書き出し（mp4.zig）で同じものを使い、往復を対称にする
+pub const ColorSpec = struct {
+    /// true = フルレンジ（0〜255）、false = limited（16〜235）
+    full: bool,
+    /// SWS_CS_*（BT.601 / BT.709 / BT.2020 など）
+    sws_cs: c_int,
+
+    /// ストリームの記述から決める。記述が無ければ limited・BT.601（swscale の既定）
+    pub fn of(par: *const c.AVCodecParameters) ColorSpec {
+        const fmt = par.format;
+        const jfmt = fmt == c.AV_PIX_FMT_YUVJ420P or fmt == c.AV_PIX_FMT_YUVJ422P or fmt == c.AV_PIX_FMT_YUVJ444P or fmt == c.AV_PIX_FMT_YUVJ440P or fmt == c.AV_PIX_FMT_YUVJ411P;
+        return .{ .full = jfmt or par.color_range == c.AVCOL_RANGE_JPEG, .sws_cs = swsColorspace(par.color_space) };
+    }
+
+    fn swsColorspace(cs: c.enum_AVColorSpace) c_int {
+        return switch (cs) {
+            c.AVCOL_SPC_BT709 => c.SWS_CS_ITU709,
+            c.AVCOL_SPC_FCC => c.SWS_CS_FCC,
+            c.AVCOL_SPC_SMPTE240M => c.SWS_CS_SMPTE240M,
+            c.AVCOL_SPC_BT2020_NCL, c.AVCOL_SPC_BT2020_CL => c.SWS_CS_BT2020,
+            else => c.SWS_CS_DEFAULT,
+        };
+    }
+
+    /// `sws` の YUV 側（`yuv_is_src` なら入力、でなければ出力）の範囲と行列を設定する。RGB 側はフルレンジ
+    pub fn apply(spec: ColorSpec, sws: *c.SwsContext, yuv_is_src: bool) void {
+        const coef = c.sws_getCoefficients(spec.sws_cs);
+        const yuv_range: c_int = @intFromBool(spec.full);
+        if (yuv_is_src) {
+            _ = c.sws_setColorspaceDetails(sws, coef, yuv_range, coef, 1, 0, 1 << 16, 1 << 16);
+        } else {
+            _ = c.sws_setColorspaceDetails(sws, coef, 1, coef, yuv_range, 0, 1 << 16, 1 << 16);
+        }
+    }
+};
+
 pub const Decoder = struct {
     fmt: *c.AVFormatContext,
     codec: *c.AVCodecContext,
@@ -79,6 +115,8 @@ pub const Decoder = struct {
     packet: *c.AVPacket,
     frame: *c.AVFrame,
     sws: ?*c.SwsContext = null,
+    /// `sws` に範囲と行列を設定済みか（sws_getCachedContext が作り直したら設定し直す）
+    sws_colored: ?*c.SwsContext = null,
     /// seek 後、この pts より前のフレームは読み捨てる（キーフレームからデコードし直すため）
     skip_before_pts: ?i64 = null,
     /// demux が終わってデコーダに flush を送った
@@ -220,11 +258,15 @@ pub const Decoder = struct {
             f.width,
             f.height,
             c.AV_PIX_FMT_RGB24,
-            c.SWS_BILINEAR | c.SWS_ACCURATE_RND,
+            c.SWS_BICUBIC | c.SWS_ACCURATE_RND | c.SWS_FULL_CHR_H_INT | c.SWS_FULL_CHR_H_INP,
             null,
             null,
             null,
         ) orelse return error.DecodeFailed;
+        if (d.sws_colored != d.sws) {
+            ColorSpec.of(d.stream.codecpar).apply(d.sws.?, true);
+            d.sws_colored = d.sws;
+        }
         var dst = [4][*c]u8{ rgb.ptr, null, null, null };
         const stride = [4]c_int{ f.width * 3, 0, 0, 0 };
         if (c.sws_scale(d.sws, &f.data, &f.linesize, 0, f.height, &dst, &stride) != f.height)
