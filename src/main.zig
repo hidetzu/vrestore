@@ -6,6 +6,7 @@ const roi = @import("roi.zig");
 const detect_roi = @import("detect_roi.zig");
 const compare = @import("compare.zig");
 const restore_cmd = @import("restore_cmd.zig");
+const temporal = @import("temporal.zig");
 
 const usage =
     \\usage: vrestore <command> [args]
@@ -35,7 +36,7 @@ const usage =
     \\      --stable-fill <s>   on (default) or off: blend the guessed pixels with the previous frame's where
     \\                          the visible background only changed in brightness (steadies the fill)
     \\      --progress <file>   rewrite <file> every 15 frames with "frames <done> <expected total>"
-    \\      --window <n>        frames to look at on each side (default 15)
+    \\      --window <n>        frames to look at on each side, 1-255 (default 15)
     \\      --motion <m>        translation (whole-frame shift) or affine (shift + rotation + zoom)
     \\      --mask <m>          none (hide the whole ROI) or auto (hide only the watermark's own pixels,
     \\                          found as those that stay the same across the video)
@@ -200,7 +201,8 @@ fn parseRestore(args: []const []const u8) Command {
             out.shifts_out = v;
         } else if (std.mem.eql(u8, a, "--window")) {
             out.window = std.fmt.parseInt(usize, v, 10) catch 0;
-            if (out.window == 0) return .{ .bad_arg = .{ .why = "--window needs a positive integer", .arg = v } };
+            // 前後 window 枚と表示中の 1 枚が temporal.max_window_frames に収まること（超えると固定長の配列の外に書く）
+            if (out.window == 0 or 2 * out.window + 1 > temporal.max_window_frames) return .{ .bad_arg = .{ .why = "--window needs an integer from 1 to 255", .arg = v } };
         } else if (std.mem.eql(u8, a, "--mask")) {
             out.mask = std.meta.stringToEnum(restore_cmd.MaskMode, v) orelse return .{ .bad_arg = .{ .why = "--mask needs none or auto", .arg = v } };
         } else if (std.mem.eql(u8, a, "--fill")) {
@@ -365,6 +367,8 @@ test "parseArgs: restore" {
     try std.testing.expectEqual(restore_cmd.AudioMode.none, mp.audio);
     try std.testing.expectEqualStrings("", mp.raw_out);
     try std.testing.expectEqualStrings("52", parseArgs(&.{ "restore", "--rect", "1,2,3,4", "--out", "o", "--crf", "52", "v" }).bad_arg.arg);
+    try std.testing.expectEqual(@as(usize, 255), parseArgs(&.{ "restore", "--rect", "1,2,3,4", "--out", "o", "--window", "255", "v" }).restore.window);
+    try std.testing.expectEqualStrings("256", parseArgs(&.{ "restore", "--rect", "1,2,3,4", "--out", "o", "--window", "256", "v" }).bad_arg.arg);
     try std.testing.expectEqualStrings("mp3", parseArgs(&.{ "restore", "--rect", "1,2,3,4", "--out", "o", "--audio", "mp3", "v" }).bad_arg.arg);
 }
 
