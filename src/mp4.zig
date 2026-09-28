@@ -118,7 +118,7 @@ pub const Writer = struct {
         errdefer _ = c.avio_closep(&oc.pb);
         if (c.avformat_write_header(oc, null) < 0) return error.WriteFailed;
 
-        const sws = c.sws_getContext(enc.width, enc.height, c.AV_PIX_FMT_RGB24, enc.width, enc.height, c.AV_PIX_FMT_YUV420P, c.SWS_BILINEAR | c.SWS_ACCURATE_RND, null, null, null) orelse return error.OutOfMemory;
+        const sws = c.sws_getContext(enc.width, enc.height, c.AV_PIX_FMT_RGB24, enc.width, enc.height, c.AV_PIX_FMT_YUV420P, c.SWS_BICUBIC | c.SWS_ACCURATE_RND | c.SWS_FULL_CHR_H_INT | c.SWS_FULL_CHR_H_INP, null, null, null) orelse return error.OutOfMemory;
         errdefer c.sws_freeContext(sws);
         var frame_opt: ?*c.AVFrame = c.av_frame_alloc() orelse return error.OutOfMemory;
         errdefer c.av_frame_free(&frame_opt);

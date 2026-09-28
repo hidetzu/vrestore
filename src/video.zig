@@ -220,7 +220,7 @@ pub const Decoder = struct {
             f.width,
             f.height,
             c.AV_PIX_FMT_RGB24,
-            c.SWS_BILINEAR | c.SWS_ACCURATE_RND,
+            c.SWS_BICUBIC | c.SWS_ACCURATE_RND | c.SWS_FULL_CHR_H_INT | c.SWS_FULL_CHR_H_INP,
             null,
             null,
             null,
