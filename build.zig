@@ -118,7 +118,8 @@ pub fn build(b: *std.Build) void {
     const ramp_mp4 = ramp_out.addOutputFileArg("ramp-out.mp4");
     ramp_out.addFileArg(ramp);
     _ = ramp_out.captureStdOut(.{});
-    const ramp_chk = b.addSystemCommand(&.{ "sh", "-c",
+    const ramp_chk = b.addSystemCommand(&.{
+        "sh", "-c",
         \\p=$(ffmpeg -i "$0" -i "$1" -lavfi "[0:v]crop=280:140:40:40,scale=in_range=auto:out_range=full,format=gbrp[a];[1:v]crop=280:140:40:40,scale=in_range=auto:out_range=full,format=gbrp[b];[a][b]psnr" -f null - 2>&1 | grep -o "average:[^ ]*" | cut -d: -f2)
         \\echo "full-range psnr=$p (>= 40)"
         \\[ "$p" = inf ] || awk -v p="$p" 'BEGIN { exit !(p >= 40) }'
@@ -128,7 +129,8 @@ pub fn build(b: *std.Build) void {
     ramp_chk.addFileArg(ramp_mp4);
     ramp_chk.expectExitCode(0);
     // 回転の情報（display matrix）を書き出しに写す。フレームは回さないので、写さないと縦持ちの動画が横倒しになる
-    const gen_rot = b.addSystemCommand(&.{ "sh", "-c",
+    const gen_rot = b.addSystemCommand(&.{
+        "sh", "-c",
         \\ffmpeg -hide_banner -loglevel error -y -f lavfi -i testsrc2=s=320x180:r=10:d=0.5 -c:v libx264 -pix_fmt yuv420p "$0.tmp.mp4" &&
         \\ffmpeg -hide_banner -loglevel error -y -display_rotation 90 -i "$0.tmp.mp4" -c copy "$0" && rm -f "$0.tmp.mp4"
     });
@@ -140,7 +142,8 @@ pub fn build(b: *std.Build) void {
     const rot_out_mp4 = rot_out.addOutputFileArg("rotated-out.mp4");
     rot_out.addFileArg(rot_mp4);
     _ = rot_out.captureStdOut(.{});
-    const rot_chk = b.addSystemCommand(&.{ "sh", "-c",
+    const rot_chk = b.addSystemCommand(&.{
+        "sh", "-c",
         \\r=$(ffprobe -v error -select_streams v -show_entries stream_side_data=rotation -of csv=p=0 "$0")
         \\echo "rotation=$r (want 90)"; [ "$r" = 90 ]
     });
