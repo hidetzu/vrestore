@@ -437,6 +437,8 @@ const RestoreCase = struct {
     fill: ?[]const u8 = null,
     /// restore --mask。"auto" なら、本物のウォーターマークの画素を取りこぼしていないかも判定する（再現率 >= 0.99）
     mask: ?[]const u8 = null,
+    /// restore --rect（"x,y,w,h"）。あれば検出の結果の代わりにこの矩形を使い、compare もこの矩形で測る
+    rect: ?[]const u8 = null,
     /// tools/roi_fixture check-restore の条件
     expect: []const u8,
 };
@@ -449,14 +451,16 @@ const restore_cases = [_]RestoreCase{
     // 同じ素材を平行移動のモデルで（--motion translation の経路を回し続ける）
     .{ .roi = .{ .spec = "name=restore-pan7-translation,bg=pan,pan_x=7,pan_y=3,x=240,y=150,frames=60", .crf = 23 }, .motion = "translation", .expect = "coverage>=0.95,ssim>=0.88,masked_psnr>=34" },
     // 遅いパン × 強い圧縮。全帯域の位相相関だと x264 のブロックの格子が (0,0) のピークを作り、動いていないと
-    // 推定した（CLAUDE.md §7）。実測（低い周波数だけ）: coverage 0.680、戻した画素の PSNR 32.2
-    .{ .roi = .{ .spec = "name=restore-pan3-crf35,bg=pan,pan_x=3,pan_y=1,x=240,y=150,frames=60", .crf = 35 }, .expect = "coverage>=0.6,masked_psnr>=30" },
+    // 推定した（CLAUDE.md §7）。実測（低い周波数だけ）: coverage 0.680、戻した画素の PSNR 32.2。
+    // ROI の周り 8 px から借りなくなって（temporal.Guard）coverage 0.475、PSNR 33.7。全帯域に戻すと 0
+    .{ .roi = .{ .spec = "name=restore-pan3-crf35,bg=pan,pan_x=3,pan_y=1,x=240,y=150,frames=60", .crf = 35 }, .expect = "coverage>=0.4,masked_psnr>=30" },
     // ズームする背景（画面全体の平行移動ではない動き）。平行移動で近似して借りると外れた画素を貼る。
     // ROI の周りの帯が合わないフレームからは借りないので、戻した画素のほとんどは正しいこと
     .{ .roi = .{ .spec = "name=restore-zoom,bg=zoom,x=240,y=150,frames=60", .crf = 23 }, .expect = "masked_bad_fraction<=0.02" },
     // 回転 + パン（画面全体の平行移動ではない動き）。affine で動きを追えば戻せる。
-    // 較正（crf 23 を含む 12 ケースの平均）: 平行移動 SSIM 0.464・coverage 0.573、affine 0.813・0.908
-    .{ .roi = .{ .spec = "name=restore-rotpan,bg=warp,rot=0.2,pan_x=5,pan_y=2,x=240,y=150,frames=60", .crf = 23 }, .expect = "coverage>=0.8,ssim>=0.75,masked_bad_fraction<=0.01" },
+    // 較正（crf 23 を含む 12 ケースの平均）: 平行移動 SSIM 0.464・coverage 0.573、affine 0.813・0.908。
+    // ROI の周り 8 px から借りなくなって（temporal.Guard）このケースは coverage 0.824、SSIM 0.739
+    .{ .roi = .{ .spec = "name=restore-rotpan,bg=warp,rot=0.2,pan_x=5,pan_y=2,x=240,y=150,frames=60", .crf = 23 }, .expect = "coverage>=0.8,ssim>=0.72,masked_bad_fraction<=0.01" },
     // 毎フレーム別の模様: 動きで説明できないので、1 画素も貼らない
     // 由来はすべて unrecovered（戻さなかった画素を戻したと数えない）
     .{ .roi = .{ .spec = "name=restore-cut,bg=cut,x=240,y=150,frames=60", .crf = 23 }, .expect = "coverage<=0,provenance.unrecovered.fraction>=1" },
@@ -470,6 +474,10 @@ const restore_cases = [_]RestoreCase{
     // 毎フレーム別の模様を、ウォーターマークの画素だけ埋める（--mask auto）。本物の背景が見えている画素は残す。
     // 実測（crf 23）: ROI 全体を埋めると SSIM 0.649、マスクで 0.758。再現率 1.0000
     .{ .roi = .{ .spec = "name=restore-cut-mask,bg=cut,x=240,y=150,frames=60", .crf = 23 }, .fill = "harmonic", .mask = "auto", .expect = "coverage<=0,ssim>=0.67,mask_accepted>=1" },
+    // ROI がウォーターマークより 4 px 小さい（文字の外接矩形 241..383 x 151..201 を 4 px 縮めた）。はみ出した縁を借りず、
+    // 周りの帯もその外で確かめる（temporal.Guard、ROI + 8 px）。実測（crf 23）: coverage 0.995、外れ 0.0001。
+    // 守る範囲が無いと帯で全フレームが拒否されて coverage 0、ROI + 4 px だと外れ 0.0157
+    .{ .roi = .{ .spec = "name=restore-overhang,bg=pan,pan_x=7,pan_y=3,x=240,y=150,frames=60", .crf = 23 }, .rect = "245,155,135,43", .expect = "coverage>=0.9,masked_bad_fraction<=0.001" },
     // 動かない背景: 隠れた画素はどのフレームにも写っていないので、1 画素も戻らない
     .{ .roi = .{ .spec = "name=restore-flat,bg=flat,x=240,y=150,frames=60", .crf = 23 }, .expect = "coverage<=0" },
 };
@@ -507,8 +515,12 @@ fn restoreCase(b: *std.Build, tool: *std.Build.Step.Compile, exe: *std.Build.Ste
     if (c.motion) |m| restore.addArgs(&.{ "--motion", m });
     if (c.fill) |f| restore.addArgs(&.{ "--fill", f });
     if (c.mask) |m| restore.addArgs(&.{ "--mask", m });
-    restore.addArg("--roi");
-    restore.addFileArg(roi_json);
+    if (c.rect) |r| {
+        restore.addArgs(&.{ "--rect", r });
+    } else {
+        restore.addArg("--roi");
+        restore.addFileArg(roi_json);
+    }
     restore.addArg("--raw");
     const out_rgb = restore.addOutputFileArg("restored.rgb");
     restore.addArg("--provenance");
@@ -519,8 +531,12 @@ fn restoreCase(b: *std.Build, tool: *std.Build.Step.Compile, exe: *std.Build.Ste
 
     const cmp = b.addRunArtifact(exe);
     cmp.setName(b.fmt("{s} compare", .{name}));
-    cmp.addArgs(&.{ "compare", "--roi" });
-    cmp.addFileArg(roi_json);
+    if (c.rect) |r| {
+        cmp.addArgs(&.{ "compare", "--rect", r });
+    } else {
+        cmp.addArgs(&.{ "compare", "--roi" });
+        cmp.addFileArg(roi_json);
+    }
     cmp.addArg("--provenance");
     cmp.addFileArg(prov);
     cmp.addFileArg(clean_mkv);
