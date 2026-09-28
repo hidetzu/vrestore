@@ -247,9 +247,25 @@ fn inRoi(roi: Rect, x: i64, y: i64) bool {
     return x >= roi.x and x < @as(i64, roi.x) + roi.w and y >= roi.y and y < @as(i64, roi.y) + roi.h;
 }
 
+/// 借りる元から除く範囲。ROI の外にウォーターマークがはみ出していると、その縁を「本物の背景」として借りてしまう
+/// （合成で、はみ出し 1 px の縁で戻した画素の 30%、2 px で 63% が外れた）。
+/// `area`（ROI を含む）の中は、`hidden` が無ければすべて、あれば true の画素だけを除く。
+/// 移動の確かめ（ringDiff）は `area` のすぐ外の帯で行う
+pub const Guard = struct {
+    area: Rect,
+    /// `area` の画素ごと（行優先）。true = ウォーターマーク（wmask.zig）
+    hidden: ?[]const bool = null,
+
+    fn blocks(g: Guard, x: i64, y: i64) bool {
+        if (!inRoi(g.area, x, y)) return false;
+        const m = g.hidden orelse return true;
+        return m[@as(usize, @intCast(y - g.area.y)) * g.area.w + @as(usize, @intCast(x - g.area.x))];
+    }
+};
+
 /// フレーム `img` の (fx, fy) の画素を取る。整数の位置ならその画素をそのまま、そうでなければ周りの 4 画素の
 /// 双線形補間。使う画素（重みが 0 でないもの）が画面の外か ROI の中にあれば null（ウォーターマークを混ぜない）
-fn sample(img: Image, roi: Rect, fx: f64, fy: f64) ?[3]u8 {
+fn sample(img: Image, roi: Rect, guard: Guard, fx: f64, fy: f64) ?[3]u8 {
     const x0f = @floor(fx);
     const y0f = @floor(fy);
     const tx = fx - x0f;
@@ -264,7 +280,7 @@ fn sample(img: Image, roi: Rect, fx: f64, fy: f64) ?[3]u8 {
         if (wt == 0) continue;
         const x = x0 + o[0];
         const y = y0 + o[1];
-        if (x < 0 or y < 0 or x >= img.width or y >= img.height or inRoi(roi, x, y)) return null;
+        if (x < 0 or y < 0 or x >= img.width or y >= img.height or inRoi(roi, x, y) or guard.blocks(x, y)) return null;
         const i = (@as(usize, @intCast(y)) * img.width + @as(usize, @intCast(x))) * 3;
         for (0..3) |c| acc[c] += wt * @as(f64, @floatFromInt(img.rgb[i + c]));
     }
@@ -279,7 +295,7 @@ pub const Recovered = provenance.Tally;
 /// 戻せなかった ROI の画素は unrecovered。戻せなかった画素は target の画素のまま残す（推測で埋めない）。
 ///
 /// 候補は時間の近いフレームから順に見る。背景の同じ点がそのフレームで ROI の外かつ画面内にあれば採る。
-pub fn recoverFrame(frames: []const Image, track: Track, target: usize, roi: Rect, max_ring_diff: ?f64, out: []u8, prov: []Provenance) Recovered {
+pub fn recoverFrame(frames: []const Image, track: Track, target: usize, roi: Rect, guard: Guard, max_ring_diff: ?f64, out: []u8, prov: []Provenance) Recovered {
     const t = frames[target];
     const w = t.width;
     @memcpy(out, t.rgb);
@@ -298,7 +314,7 @@ pub fn recoverFrame(frames: []const Image, track: Track, target: usize, roi: Rec
         offset[s] = .{ 0, 0, 0 };
         if (!usable[s]) continue;
         to_s[s] = track.transform(target, s);
-        const r = ringDiff(t, frames[s], roi, to_s[s]);
+        const r = ringDiff(t, frames[s], roi, guard, to_s[s]);
         if (max_ring_diff) |limit| usable[s] = if (r) |v| v.mad <= limit else false;
         if (r) |v| offset[s] = v.offset;
     }
@@ -314,7 +330,7 @@ pub fn recoverFrame(frames: []const Image, track: Track, target: usize, roi: Rec
                     if (!usable[s]) continue;
                     // 背景の同じ点は、フレーム s では to_s[s](x, y) にある
                     const q = to_s[s].apply(@floatFromInt(x), @floatFromInt(y));
-                    var px = sample(frames[s], roi, q[0], q[1]) orelse continue;
+                    var px = sample(frames[s], roi, guard, q[0], q[1]) orelse continue;
                     for (&px, offset[s]) |*v, o| v.* = @intFromFloat(std.math.clamp(@round(@as(f64, @floatFromInt(v.*)) + o), 0, 255));
                     out[(y * w + x) * 3 ..][0..3].* = px;
                     prov[y * w + x] = .temporal_real;
@@ -341,13 +357,15 @@ const ring_band = 6;
 /// 動きが画面全体の平行移動でない（手持ちの揺れ・被写体の動き・ズーム）と、累積した移動量は ROI の近くで
 /// 合わない。そのフレームから画素を借りると、正しくない画素を「戻した」と言ってしまう（手持ちの実写で観測）。
 /// 比べられる画素が帯の 1/4 未満なら確かめられないとして null
-fn ringDiff(t: Image, s: Image, roi: Rect, to_s: Affine) ?struct { mad: f64, offset: [3]f64 } {
+fn ringDiff(t: Image, s: Image, roi: Rect, guard: Guard, to_s: Affine) ?struct { mad: f64, offset: [3]f64 } {
     const w: i64 = t.width;
     const h: i64 = t.height;
-    const x0: i64 = @as(i64, roi.x) - ring_band;
-    const y0: i64 = @as(i64, roi.y) - ring_band;
-    const x1: i64 = @as(i64, roi.x) + roi.w + ring_band;
-    const y1: i64 = @as(i64, roi.y) + roi.h + ring_band;
+    // 帯は守る範囲（guard.area、ROI を含む）のすぐ外。はみ出したウォーターマークは帯に入れない
+    const a = guard.area;
+    const x0: i64 = @as(i64, a.x) - ring_band;
+    const y0: i64 = @as(i64, a.y) - ring_band;
+    const x1: i64 = @as(i64, a.x) + a.w + ring_band;
+    const y1: i64 = @as(i64, a.y) + a.h + ring_band;
     var sum: f64 = 0;
     var signed = [3]f64{ 0, 0, 0 };
     var n: u64 = 0;
@@ -356,11 +374,11 @@ fn ringDiff(t: Image, s: Image, roi: Rect, to_s: Affine) ?struct { mad: f64, off
     while (y < y1) : (y += 1) {
         var x = x0;
         while (x < x1) : (x += 1) {
-            if (inRoi(roi, x, y)) continue;
+            if (inRoi(a, x, y)) continue;
             total += 1;
             if (x < 0 or y < 0 or x >= w or y >= h) continue;
             const q = to_s.apply(@floatFromInt(x), @floatFromInt(y));
-            const sp = sample(s, roi, q[0], q[1]) orelse continue;
+            const sp = sample(s, roi, guard, q[0], q[1]) orelse continue;
             const it = (@as(usize, @intCast(y)) * t.width + @as(usize, @intCast(x))) * 3;
             for (0..3) |c| {
                 const d = @as(f64, @floatFromInt(t.rgb[it + c])) - @as(f64, @floatFromInt(sp[c]));
@@ -423,7 +441,7 @@ test "temporal: recoverFrame matches the brightness of the borrowed pixels to th
     defer gpa.free(out);
     const prov = try gpa.alloc(Provenance, w * h);
     defer gpa.free(prov);
-    const r = recoverFrame(&frames, track, 4, roi, 6, out, prov);
+    const r = recoverFrame(&frames, track, 4, roi, .{ .area = roi }, 6, out, prov);
     try std.testing.expectEqual(r.roiPixels(), r.recovered());
     // 戻した画素は、表示中のフレーム（ずれ 0）の正解と一致する
     for (roi.y..roi.y + roi.h) |y| for (roi.x..roi.x + roi.w) |x| {
@@ -545,7 +563,7 @@ test "temporal: recoverFrame restores the exact background under a pan, refuses 
     defer gpa.free(truth);
 
     // 中央のフレームは前後 4 フレームずつ（±24 px）使える。ROI の幅 30 のうち、左右どちらかに出る画素だけ戻る
-    const r = recoverFrame(&frames, track, 4, roi, null, out, prov);
+    const r = recoverFrame(&frames, track, 4, roi, .{ .area = roi }, null, out, prov);
     try std.testing.expectEqual(@as(usize, 30 * 16), r.roiPixels());
     // ROI の外は original（入力のまま）
     try std.testing.expectEqual(Provenance.original, prov[0]);
@@ -571,7 +589,7 @@ test "temporal: recoverFrame restores the exact background under a pan, refuses 
     for (&shifts) |*sh| sh.* = .{ .dx = 9, .dy = 0, .peak = 1 };
     const wrong = try Track.build(gpa, &shifts, 0.1);
     defer wrong.deinit(gpa);
-    const r_wrong = recoverFrame(&frames, wrong, 4, roi, null, out, prov);
+    const r_wrong = recoverFrame(&frames, wrong, 4, roi, .{ .area = roi }, null, out, prov);
     try std.testing.expect(r_wrong.recovered() > 0);
     var mismatched: usize = 0;
     for (roi.y..roi.y + roi.h) |y| for (roi.x..roi.x + roi.w) |x| {
@@ -579,16 +597,16 @@ test "temporal: recoverFrame restores the exact background under a pan, refuses 
         if (prov[i] == .temporal_real and !std.mem.eql(u8, truth[i * 3 ..][0..3], out[i * 3 ..][0..3])) mismatched += 1;
     };
     try std.testing.expect(mismatched > 0);
-    const r_checked = recoverFrame(&frames, wrong, 4, roi, 6, out, prov);
+    const r_checked = recoverFrame(&frames, wrong, 4, roi, .{ .area = roi }, 6, out, prov);
     try std.testing.expectEqual(@as(usize, 0), r_checked.recovered());
     try std.testing.expectEqual(r_checked.roiPixels(), r_checked.counts.get(.unrecovered));
     // 正しい移動量なら、帯の確認をしても全部戻る
-    try std.testing.expectEqual(r.roiPixels(), recoverFrame(&frames, track, 4, roi, 6, out, prov).recovered());
+    try std.testing.expectEqual(r.roiPixels(), recoverFrame(&frames, track, 4, roi, .{ .area = roi }, 6, out, prov).recovered());
 
     // 動いていなければ何も戻らない（同じ場所が隠れたまま）
     for (&shifts) |*sh| sh.* = .{ .dx = 0, .dy = 0, .peak = 1 };
     const still = try Track.build(gpa, &shifts, 0.1);
     defer still.deinit(gpa);
-    const r0 = recoverFrame(&frames, still, 4, roi, null, out, prov);
+    const r0 = recoverFrame(&frames, still, 4, roi, .{ .area = roi }, null, out, prov);
     try std.testing.expectEqual(@as(usize, 0), r0.recovered());
 }

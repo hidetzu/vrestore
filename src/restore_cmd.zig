@@ -34,11 +34,26 @@ pub const mask_margin = 8;
 /// マスクを推定して埋める範囲。マスクを使うときだけ `mask_margin` 広げる
 pub fn maskArea(mask: MaskMode, r: temporal.Rect, frame_w: u32, frame_h: u32) temporal.Rect {
     if (mask == .none) return r;
-    const x0 = r.x -| mask_margin;
-    const y0 = r.y -| mask_margin;
-    const x1 = @min(frame_w, r.x + r.w + mask_margin);
-    const y1 = @min(frame_h, r.y + r.h + mask_margin);
+    return expand(r, mask_margin, frame_w, frame_h);
+}
+
+/// `r` を上下左右に `m` px 広げる（動画の端で止める）
+pub fn expand(r: temporal.Rect, m: u32, frame_w: u32, frame_h: u32) temporal.Rect {
+    const x0 = r.x -| m;
+    const y0 = r.y -| m;
+    const x1 = @min(frame_w, r.x + r.w + m);
+    const y1 = @min(frame_h, r.y + r.h + m);
     return .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
+}
+
+/// マスクを使わないとき、別のフレームから借りない範囲（ROI をこれだけ広げたもの）。
+/// ROI の外にはみ出したウォーターマークの縁を借りないため（temporal.Guard）
+pub const default_temporal_guard = mask_margin;
+
+/// 別のフレームから借りない範囲: マスクを使えるならマスクで隠した画素、使えなければ ROI を `guard_px` 広げた範囲
+pub fn temporalGuard(hidden: ?Hidden, roi: temporal.Rect, guard_px: u32, frame_w: u32, frame_h: u32) temporal.Guard {
+    if (hidden) |m| return .{ .area = m.area, .hidden = m.mask };
+    return .{ .area = expand(roi, guard_px, frame_w, frame_h) };
 }
 
 test "maskArea: widens only with the mask, and stops at the frame edge" {
@@ -96,6 +111,8 @@ pub const Args = struct {
     progress_out: ?[]const u8 = null,
     /// 推測で埋めた画素を時間方向に落ち着かせる（stabilize.zig）
     stable_fill: bool = true,
+    /// マスクを使わないとき、別のフレームから借りない範囲の広げ幅（px）
+    temporal_guard: u32 = default_temporal_guard,
     /// 画素ごとの由来（provenance.zig の形式、1 画素 1 バイト）の出力先
     provenance_out: ?[]const u8 = null,
     /// 隣り合うフレームの移動量の推定を 1 行ずつ書く（診断用）: "<frame> <dx> <dy> <peak>"
@@ -117,7 +134,7 @@ pub fn recoverInWindow(gpa: std.mem.Allocator, model: MotionModel, fill: spatial
     for (motions, 0..) |*m, i| m.* = (try estimatePair(gpa, model, frames[i], frames[i + 1], lumas[i], lumas[i + 1], roi, min_peak)).motion;
     const track = try temporal.Track.buildAffine(gpa, motions);
     defer track.deinit(gpa);
-    const t = temporal.recoverFrame(frames, track, target, roi, max_ring_diff, out, prov);
+    const t = temporal.recoverFrame(frames, track, target, roi, temporalGuard(hidden, roi, default_temporal_guard, frames[target].width, frames[target].height), max_ring_diff, out, prov);
     return fillAndTally(gpa, fill, hidden, t, out, frames[target].width, frames[target].height, prov, roi);
 }
 
@@ -376,7 +393,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
         }
         const track = try temporal.Track.buildAffine(gpa, motions);
         defer track.deinit(gpa);
-        const r = try fillAndTally(gpa, args.fill, hidden, temporal.recoverFrame(images, track, next_target - lo, rect, args.max_ring_diff, out_rgb, prov), out_rgb, w, h, prov, rect);
+        const r = try fillAndTally(gpa, args.fill, hidden, temporal.recoverFrame(images, track, next_target - lo, rect, temporalGuard(hidden, rect, args.temporal_guard, w, h), args.max_ring_diff, out_rgb, prov), out_rgb, w, h, prov, rect);
         if (args.stable_fill and args.fill != .none) {
             const area = if (hidden) |m| m.area else rect;
             if (stable == null) stable = try stabilize.State.init(gpa, .{ .x = area.x, .y = area.y, .w = area.w, .h = area.h }, w, h);
