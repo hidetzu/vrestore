@@ -13,6 +13,8 @@ const c = video.c;
 pub const Error = error{
     /// 出力ファイルを作れない
     CreateFailed,
+    /// 幅か高さが奇数（H.264 の 4:2:0 は偶数しか持てない）
+    OddSize,
     /// この FFmpeg に H.264 のエンコーダが無い
     NoEncoder,
     EncodeFailed,
@@ -27,6 +29,7 @@ pub const Error = error{
 pub fn describe(e: Error) []const u8 {
     return switch (e) {
         error.CreateFailed => "could not create the output file",
+        error.OddSize => "H.264 (4:2:0) needs an even width and height; this video's is odd (use --raw instead)",
         error.NoEncoder => "this FFmpeg has no H.264 encoder (libx264)",
         error.EncodeFailed => "encoding failed",
         error.WriteFailed => "writing the output failed",
@@ -73,6 +76,7 @@ pub const Writer = struct {
     /// `out_path` に MP4 を作る。映像の大きさ・time_base・色の情報は `d`（入力のデコーダ）から取る。
     /// 音声は `src_path` をもう一度開いて写す
     pub fn open(out_path: [:0]const u8, src_path: [:0]const u8, d: *const video.Decoder, opts: Options) Error!Writer {
+        if (d.info.width % 2 != 0 or d.info.height % 2 != 0) return error.OddSize;
         var oc_opt: ?*c.AVFormatContext = null;
         if (c.avformat_alloc_output_context2(&oc_opt, null, "mp4", out_path.ptr) < 0 or oc_opt == null) return error.CreateFailed;
         const oc = oc_opt.?;

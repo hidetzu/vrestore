@@ -95,7 +95,19 @@ pub fn build(b: *std.Build) void {
     cli_detect_flat_ref.addFileArg(steps_mp4);
     cli_detect_flat_ref.expectStdErrMatch("has no edges to match");
     cli_detect_flat_ref.expectExitCode(1);
+    // 幅・高さが奇数の動画は H.264（4:2:0）に書き出せない。理由を言って、書き始める前に止まること
+    const gen_odd = b.addSystemCommand(&.{ "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=320x180:r=10:d=0.5", "-vf", "scale=321:181,format=gbrp", "-c:v", "ffv1" });
+    gen_odd.setName("generate odd.mkv");
+    const odd_mkv = gen_odd.addOutputFileArg("odd.mkv");
+    const cli_odd_out = b.addRunArtifact(exe);
+    cli_odd_out.setName("cli_odd_out");
+    cli_odd_out.addArgs(&.{ "restore", "--rect", "10,10,20,20", "--out" });
+    _ = cli_odd_out.addOutputFileArg("odd-out.mp4");
+    cli_odd_out.addFileArg(odd_mkv);
+    cli_odd_out.expectStdErrMatch("needs an even width and height");
+    cli_odd_out.expectExitCode(1);
     if (test_filters.len == 0) {
+        test_step.dependOn(&cli_odd_out.step);
         test_step.dependOn(&cli_detect_bad_ref.step);
         test_step.dependOn(&cli_detect_flat_ref.step);
         test_step.dependOn(&cli_stdout_file.step);
