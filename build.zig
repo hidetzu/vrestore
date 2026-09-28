@@ -264,7 +264,8 @@ pub fn build(b: *std.Build) void {
     const gui_restore = b.addRunArtifact(gui);
     gui_restore.setName("gui restore-and-exit");
     gui_restore.setEnvironmentVariable("SDL_VIDEODRIVER", "dummy");
-    gui_restore.addArgs(&.{ "--at", "3", "--select", "234,144,158,68", "--detect-and-exit", "--restore" });
+    // Temporal は on（GUI の R が CLI の on と同じ部品で動くか。auto は CLI の E2E で見る）
+    gui_restore.addArgs(&.{ "--at", "3", "--select", "234,144,158,68", "--detect-and-exit", "--restore", "--temporal", "on" });
     gui_restore.addFileArg(gui_restore_case.mp4);
     const gui_restore_out = gui_restore.captureStdOut(.{});
     gui_restore.expectExitCode(0);
@@ -313,6 +314,7 @@ pub fn build(b: *std.Build) void {
     const restore_step = b.step("restore-e2e", "Temporal Recovery on synthetic videos, compared with the clean original");
     for (restore_cases) |c| restore_step.dependOn(restoreCase(b, tool, exe, c));
     restore_step.dependOn(exportCase(b, tool, exe));
+    restore_step.dependOn(debugCase(b, tool, exe));
 
     // ---- 復元の指標を FFmpeg と突き合わせる ----------------------------------
     // SSIM / PSNR を自前の実装とだけ比べても何も示さないので、FFmpeg の ssim / psnr フィルタと
@@ -439,6 +441,8 @@ const RestoreCase = struct {
     mask: ?[]const u8 = null,
     /// restore --rect（"x,y,w,h"）。あれば検出の結果の代わりにこの矩形を使い、compare もこの矩形で測る
     rect: ?[]const u8 = null,
+    /// restore --temporal。既存のケースは on の仕組みを確かめる（auto は既定だが、専用のケースで確かめる）
+    temporal: []const u8 = "on",
     /// tools/roi_fixture check-restore の条件
     expect: []const u8,
 };
@@ -478,6 +482,14 @@ const restore_cases = [_]RestoreCase{
     // 周りの帯もその外で確かめる（temporal.Guard、ROI + 8 px）。実測（crf 23）: coverage 0.995、外れ 0.0001。
     // 守る範囲が無いと帯で全フレームが拒否されて coverage 0、ROI + 4 px だと外れ 0.0157
     .{ .roi = .{ .spec = "name=restore-overhang,bg=pan,pan_x=7,pan_y=3,x=240,y=150,frames=60", .crf = 23 }, .rect = "245,155,135,43", .expect = "coverage>=0.9,masked_bad_fraction<=0.001" },
+    // --temporal auto（既定、ADR 0017）: 前後のフレームが合い、動きが落ち着いた画素だけを採る。戻す量は on より少ないが、
+    // 採った画素は外れない。実測（crf 23）: パン coverage 0.450（on 0.968）、はみ出し 0.571（on 0.995）、外れはどちらも 0
+    .{ .roi = .{ .spec = "name=restore-pan7-auto,bg=pan,pan_x=7,pan_y=3,x=240,y=150,frames=60", .crf = 23 }, .temporal = "auto", .expect = "coverage>=0.3,masked_bad_fraction<=0.001,temporal_pixels.rejected>=1" },
+    .{ .roi = .{ .spec = "name=restore-overhang-auto,bg=pan,pan_x=7,pan_y=3,x=240,y=150,frames=60", .crf = 23 }, .rect = "245,155,135,43", .temporal = "auto", .expect = "coverage>=0.4,masked_bad_fraction<=0.001" },
+    // 毎フレーム別の模様: auto も 1 画素も採らない
+    .{ .roi = .{ .spec = "name=restore-cut-auto,bg=cut,x=240,y=150,frames=60", .crf = 23 }, .temporal = "auto", .expect = "coverage<=0,temporal_pixels.accepted<=0" },
+    // --temporal off: 背景が動いていても借りない
+    .{ .roi = .{ .spec = "name=restore-pan7-off,bg=pan,pan_x=7,pan_y=3,x=240,y=150,frames=60", .crf = 23 }, .temporal = "off", .expect = "coverage<=0,temporal_pixels.accepted<=0,temporal_pixels.rejected<=0" },
     // 動かない背景: 隠れた画素はどのフレームにも写っていないので、1 画素も戻らない
     .{ .roi = .{ .spec = "name=restore-flat,bg=flat,x=240,y=150,frames=60", .crf = 23 }, .expect = "coverage<=0" },
 };
@@ -512,6 +524,7 @@ fn restoreCase(b: *std.Build, tool: *std.Build.Step.Compile, exe: *std.Build.Ste
     const restore = b.addRunArtifact(exe);
     restore.setName(b.fmt("{s} restore", .{name}));
     restore.addArg("restore");
+    restore.addArgs(&.{ "--temporal", c.temporal });
     if (c.motion) |m| restore.addArgs(&.{ "--motion", m });
     if (c.fill) |f| restore.addArgs(&.{ "--fill", f });
     if (c.mask) |m| restore.addArgs(&.{ "--mask", m });
@@ -628,6 +641,41 @@ fn exportCase(b: *std.Build, tool: *std.Build.Step.Compile, exe: *std.Build.Step
     achk.expectExitCode(0);
     chk.step.dependOn(&achk.step);
     return &chk.step;
+}
+
+/// restore --debug（debug_view.zig）: 動画なら入力と同じフレーム数で幅が 2 倍、ディレクトリなら 1 フレーム 1 枚の PNG
+fn debugCase(b: *std.Build, tool: *std.Build.Step.Compile, exe: *std.Build.Step.Compile) *std.Build.Step {
+    const v = synthCase(b, tool, .{ .spec = "name=restore-debug,bg=pan,pan_x=7,pan_y=3,x=240,y=150,frames=20", .crf = 23 });
+    const run_mp4 = b.addRunArtifact(exe);
+    run_mp4.setName("restore-debug mp4");
+    run_mp4.addArgs(&.{ "restore", "--rect", "234,144,158,68", "--fill", "harmonic", "--raw", "/dev/null", "--debug" });
+    const dbg_mp4 = run_mp4.addOutputFileArg("debug.mp4");
+    run_mp4.addFileArg(v.mp4);
+    _ = run_mp4.captureStdOut(.{});
+    const chk_mp4 = b.addSystemCommand(&.{
+        "sh", "-c",
+        \\r=$(ffprobe -v error -count_frames -select_streams v -show_entries stream=width,height,nb_read_frames -of csv=p=0 "$0")
+        \\echo "debug.mp4: $r (want 1280,360,20)"; [ "$r" = "1280,360,20" ]
+    });
+    chk_mp4.setName("restore-debug mp4 check");
+    chk_mp4.addFileArg(dbg_mp4);
+    chk_mp4.expectExitCode(0);
+    const run_png = b.addRunArtifact(exe);
+    run_png.setName("restore-debug png");
+    run_png.addArgs(&.{ "restore", "--rect", "234,144,158,68", "--fill", "harmonic", "--raw", "/dev/null", "--debug" });
+    const dbg_dir = run_png.addOutputDirectoryArg("debug");
+    run_png.addFileArg(v.mp4);
+    _ = run_png.captureStdOut(.{});
+    const chk_png = b.addSystemCommand(&.{
+        "sh", "-c",
+        \\n=$(ls "$0" | grep -c '^frame-[0-9]\{6\}\.png$'); w=$(ffprobe -v error -show_entries stream=width -of csv=p=0 "$0/frame-000019.png")
+        \\echo "debug pngs: $n, width $w (want 20, 1280)"; [ "$n" = 20 ] && [ "$w" = 1280 ]
+    });
+    chk_png.setName("restore-debug png check");
+    chk_png.addDirectoryArg(dbg_dir);
+    chk_png.expectExitCode(0);
+    chk_png.step.dependOn(&chk_mp4.step);
+    return &chk_png.step;
 }
 
 /// 合成の動画（6 秒）に、440 Hz の正弦波の AAC を付ける（書き出しが音声を写すかを見るため）
