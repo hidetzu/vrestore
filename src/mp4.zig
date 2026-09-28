@@ -96,7 +96,9 @@ pub const Writer = struct {
         enc.color_primaries = in_par.*.color_primaries;
         enc.color_trc = in_par.*.color_trc;
         enc.colorspace = in_par.*.color_space;
-        enc.color_range = c.AVCOL_RANGE_MPEG; // swscale の既定の出力は limited
+        // 範囲と行列は、デコードで RGB にしたときと同じ（video.ColorSpec）。記述が無い入力は limited・BT.601 のまま
+        const color = video.ColorSpec.of(in_par);
+        enc.color_range = if (color.full) c.AVCOL_RANGE_JPEG else c.AVCOL_RANGE_MPEG;
         if (oc.oformat.*.flags & c.AVFMT_GLOBALHEADER != 0) enc.flags |= c.AV_CODEC_FLAG_GLOBAL_HEADER;
 
         var dict: ?*c.AVDictionary = null;
@@ -124,6 +126,7 @@ pub const Writer = struct {
 
         const sws = c.sws_getContext(enc.width, enc.height, c.AV_PIX_FMT_RGB24, enc.width, enc.height, c.AV_PIX_FMT_YUV420P, c.SWS_BICUBIC | c.SWS_ACCURATE_RND | c.SWS_FULL_CHR_H_INT | c.SWS_FULL_CHR_H_INP, null, null, null) orelse return error.OutOfMemory;
         errdefer c.sws_freeContext(sws);
+        color.apply(sws, false);
         var frame_opt: ?*c.AVFrame = c.av_frame_alloc() orelse return error.OutOfMemory;
         errdefer c.av_frame_free(&frame_opt);
         const frame = frame_opt.?;
