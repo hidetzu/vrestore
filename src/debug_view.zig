@@ -1,7 +1,8 @@
 //! Temporal Recovery の debug の可視化（`restore --debug`、docs/adr/0017）。
 //!
 //! 1 フレームを横に 2 つ並べた画像にする:
-//! - 左: 出力に、画素の扱いの色を 50% で重ねる。緑 = 別のフレームから戻した（temporal_real）、
+//! - 左: 出力に、画素の扱いの色を 50% で重ねる。緑 = 別のフレームから戻した（temporal_real、画面全体の動き）、
+//!   シアン = 局所の optical flow で戻した、
 //!   赤 = 候補はあったが auto の条件を通らず推測で埋めた、青 = 候補が無く推測で埋めた、マゼンタ = 埋めていない
 //! - 右: 入力を暗くし、戻した画素に「どの前後のフレームから借りたか」の色を塗る。過去 = 青系、未来 = 橙系で、
 //!   窓の端（遠くのフレーム）ほど明るい。灰色 = 不採用
@@ -15,6 +16,8 @@ const Provenance = provenance.Provenance;
 const temporal = @import("temporal.zig");
 
 pub const accepted_color = [3]u8{ 0, 220, 0 };
+/// 局所の optical flow で戻した画素（local_temporal.zig）
+pub const local_color = [3]u8{ 0, 200, 230 };
 pub const rejected_color = [3]u8{ 255, 40, 40 };
 pub const guessed_color = [3]u8{ 60, 120, 255 };
 pub const unrecovered_color = [3]u8{ 255, 0, 255 };
@@ -46,7 +49,7 @@ pub fn render(dst: []u8, w: u32, h: u32, input: []const u8, output: []const u8, 
         const in_roi = x >= roi.x and x < roi.x + roi.w and y >= roi.y and y < roi.y + roi.h;
         const d: temporal.Detail = if (in_roi) detail[(y - roi.y) * roi.w + (x - roi.x)] else .{};
         const tint: ?[3]u8 = switch (prov[i]) {
-            .temporal_real => accepted_color,
+            .temporal_real => if (d.kind == .local) local_color else accepted_color,
             .spatial_inpainted => if (d.class == .rejected) rejected_color else guessed_color,
             .unrecovered => unrecovered_color,
             else => null,

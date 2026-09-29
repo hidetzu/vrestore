@@ -37,6 +37,9 @@ const usage =
     \\                          the watermark, the surroundings match, the motion is steady and the frames
     \\                          before and after agree; otherwise guess it (--fill). on: take the nearest
     \\                          frame whose surroundings match. off: never take pixels from other frames
+    \\      --local-flow <s>    on (default) or off: with --temporal auto, also follow local optical flow
+    \\                          (moving people / objects) where the surroundings move a lot, and take a pixel
+    \\                          only when 3+ frames before and after agree and a decoy nearby passes the check
     \\      --debug <out>       also write what happened to each pixel, side by side with where it was taken
     \\                          from: an .mp4, or a directory of PNGs (one per frame). Left: green = from
     \\                          other frames, red = rejected by auto and guessed, blue = guessed, magenta =
@@ -202,6 +205,8 @@ fn parseRestore(args: []const []const u8) Command {
             if (out.crf > 51) return .{ .bad_arg = .{ .why = "--crf needs an integer from 0 to 51", .arg = v } };
         } else if (std.mem.eql(u8, a, "--temporal")) {
             out.temporal = std.meta.stringToEnum(temporal.Mode, v) orelse return .{ .bad_arg = .{ .why = "--temporal needs off, on or auto", .arg = v } };
+        } else if (std.mem.eql(u8, a, "--local-flow")) {
+            out.local_flow = if (std.mem.eql(u8, v, "on")) true else if (std.mem.eql(u8, v, "off")) false else return .{ .bad_arg = .{ .why = "--local-flow needs on or off", .arg = v } };
         } else if (std.mem.eql(u8, a, "--debug")) {
             out.debug_out = v;
         } else if (std.mem.eql(u8, a, "--temporal-guard")) {
@@ -326,6 +331,8 @@ test {
     _ = @import("export_job.zig");
     _ = @import("stabilize.zig");
     _ = @import("debug_view.zig");
+    _ = @import("flow.zig");
+    _ = @import("local_temporal.zig");
     _ = @import("temporal.zig");
     _ = @import("provenance.zig");
     _ = @import("motion.zig");
