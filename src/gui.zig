@@ -435,10 +435,10 @@ const App = struct {
         if (app.mask == null) {
             var d = try video.Decoder.open(app.path);
             defer d.close();
-            app.mask = try restore_cmd.estimateMask(app.gpa, &d, area);
+            app.mask = try restore_cmd.estimateMask(app.gpa, &d, area, roi_rect);
         }
         const m = app.mask.?;
-        return if (m.accepted) .{ .mask = m.hidden, .area = area } else null;
+        return .{ .mask = m.hidden, .area = area };
     }
 
     fn clearMask(app: *App) void {
@@ -951,7 +951,7 @@ fn info(w: *Io.Writer, app: *const App) !void {
         if (app.recovered.counts.get(.spatial_inpainted) > 0) try w.print("  inpainted {d:.1}%", .{app.recovered.fraction(.spatial_inpainted) * 100});
         try w.print("  unrecovered {d:.1}%  {s}/{s}/temporal {s}", .{ app.recovered.fraction(.unrecovered) * 100, @tagName(app.motion_model), @tagName(app.fill), @tagName(app.temporal_mode) });
         if (app.mask) |m| {
-            if (m.accepted) try w.print("  mask {d:.0}%", .{m.fraction * 100}) else try w.writeAll("  mask: whole ROI");
+            if (m.accepted) try w.print("  mask {d:.0}%", .{m.fraction * 100}) else try w.writeAll("  mask: whole ROI + edges");
         }
         return;
     }

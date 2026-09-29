@@ -145,7 +145,8 @@ pub fn recoverInWindow(gpa: std.mem.Allocator, model: MotionModel, fill: spatial
 }
 
 /// 動画全体から `mask_frames` 枚を取り、ROI の中のウォーターマークの画素を見分ける。`d` は読む位置が変わる
-pub fn estimateMask(gpa: std.mem.Allocator, d: *video.Decoder, roi: temporal.Rect) !wmask.Estimate {
+/// `roi` は推定する範囲（マスクの範囲）、`inner` はその中の本来の ROI（見分けられなかったときに使う）
+pub fn estimateMask(gpa: std.mem.Allocator, d: *video.Decoder, roi: temporal.Rect, inner: temporal.Rect) !wmask.Estimate {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -159,10 +160,11 @@ pub fn estimateMask(gpa: std.mem.Allocator, d: *video.Decoder, roi: temporal.Rec
     if (crops.len < 3) {
         // フレームが足りず見分けられない。ROI 全体を隠す
         const hidden = try gpa.alloc(bool, @as(usize, roi.w) * roi.h);
-        @memset(hidden, true);
+        @memset(hidden, false);
+        for (inner.y - roi.y..inner.y - roi.y + inner.h) |y| @memset(hidden[y * roi.w + inner.x - roi.x ..][0..inner.w], true);
         return .{ .hidden = hidden, .accepted = false, .fraction = 1, .threshold = 0, .inside_mad = 0, .outside_mad = 0 };
     }
-    return wmask.estimate(gpa, crops, roi.w, roi.h, .{});
+    return wmask.estimate(gpa, crops, roi.w, roi.h, .{ .inner = .{ .x = inner.x - roi.x, .y = inner.y - roi.y, .w = inner.w, .h = inner.h } });
 }
 
 /// Temporal の後に残った unrecovered を振り分けて埋め、由来を数え直す。
@@ -330,10 +332,11 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
     if (args.mask == .auto) {
         var d2 = try video.Decoder.open(try arena.dupeZ(u8, args.video));
         defer d2.close();
-        mask_est = try estimateMask(gpa, &d2, maskArea(args.mask, rect, w, h));
+        mask_est = try estimateMask(gpa, &d2, maskArea(args.mask, rect, w, h), rect);
     }
     // 見分けられなかったときは ROI 全体を隠す（広げた範囲は使わない）
-    const hidden: ?Hidden = if (mask_est) |m| (if (m.accepted) .{ .mask = m.hidden, .area = maskArea(args.mask, rect, w, h) } else null) else null;
+    // 見分けられなかったときも、ROI の中すべてと、周りの帯のはみ出した縁を隠すマスクになっている（wmask.Params.inner）
+    const hidden: ?Hidden = if (mask_est) |m| .{ .mask = m.hidden, .area = maskArea(args.mask, rect, w, h) } else null;
 
     // 画素ごとの借りた / 借りなかった理由（JSON の集計と debug の可視化）
     const detail = try arena.alloc(temporal.Detail, @as(usize, rect.w) * rect.h);
