@@ -96,6 +96,15 @@ SDL_VIDEODRIVER=dummy zig-out/bin/vrestore-gui --select x,y,w,h --detect-and-exi
 scripts/restore-real.sh -j 6 tmp/media/<動画>  # 5 分前後。結果は tmp/out/restore/
 ```
 
+Temporal Recovery が戻した画素の正しさを、正解の無い実素材で測る（疑似チェック）。ウォーターマーク・動かないロゴ・
+字幕・黒帯の無い場所に、本物の ROI と同じ大きさの矩形を置く（本物の ROI を左右反転した位置と、画面の中央など）:
+
+```sh
+scripts/temporal-pseudo-check.sh -n 20 tmp/media/<動画> x,y,w,h [x,y,w,h ...]  # 20 クリップ × 20 秒で 30 分前後
+```
+
+外れ（誤差 > 32）の割合を、同じ矩形で harmonic で埋めた場合や、変更の前（`-o "..."` で restore の引数を渡す）と比べる。
+
 `frame-overlay.png` と `roi-crop.png` を開いて、消したい場所を囲んでいるかを見る。実素材には正解が無いので、
 数値で言えるのは JSON の値まで。
 報告では「実素材では見ていない」を `Not verified` に書く。

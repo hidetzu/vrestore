@@ -56,6 +56,7 @@
 | マスク | 背景が変わる中で変わらない画素（ウォーターマーク）を見分け、2 px 広げる（縁取りの外側の圧縮のにじみまで隠す）。背景も変わらなければ見分けられないとして ROI 全体を隠す。大津の二値化で 2 つの塊を分ける | `src/wmask.zig` の test `"wmask: finds the pixels that stay the same while the background changes"`、`"wmask: falls back to hiding the whole ROI when the background does not move either"`、`"wmask: otsu splits two clusters"` |
 | マスク（縁） | 勾配の時間方向の中央値が大きい画素（どのフレームでも同じ縁）も隠す。背景と一緒に色が変わる不透明度 30% の棒を、変わりにくさだけでは 55% しか隠せないが、縁を足すとすべて隠す | `src/wmask.zig` の test `"wmask: the edges catch a translucent watermark that the stillness alone misses"` |
 | マスクの範囲 | マスクを使うときは、推定して埋める範囲を ROI の周り 8 px まで広げる（動画の端で止める）。ROI の外でもマスクの内側なら埋め、マスクの外は入力のまま。Temporal の範囲は広げない | test `"maskArea: widens only with the mask, and stops at the frame edge"`、`"fillAndTally: fills the watermark pixels outside the ROI too, and keeps the rest as input"` |
+| マスク（見分けられないとき） | 変わりやすさで見分けられないときも、ROI の中はすべて隠し、周りの帯（ROI + 8 px）では、どのフレームでも同じ縁（ROI からはみ出した文字）だけを 2 px 広げて隠す。縁の閾値は範囲全体の中央値から取り直す（背景が止まり文字の方が少し変わる場面で、「変わりにくくない画素」を基準にすると閾値が高すぎて、はみ出しを拾えなかった） | `src/wmask.zig` の test `"wmask: when it cannot tell, it hides the ROI and only the watermark's edges sticking out of it"` |
 | マスク（ROI 全体に戻す判定） | 隠す割合の判定（2%〜95%）は、縁を足す前・広げる前の変わりにくい画素で行う。縁と広げた分で 100% になっても、見分けられていればマスクを使う | `src/wmask.zig` の test `"wmask: whether the mask is used is judged before the edges and the dilation widen it"` |
 | マスク（合成 E2E） | `--mask auto` で、毎フレーム別の模様の背景を harmonic で埋めて SSIM ≥ 0.67（ROI 全体を埋めると 0.649）、本物のウォーターマークの画素の再現率 ≥ 0.99 | `zig build restore-e2e` の `restore-cut-mask`（check-mask を含む） |
 | 埋めの落ち着かせ | 前のフレームでも埋めた画素は、見えている背景の明るさの変化 Δ を足した前の値と混ぜる（λ = 0.3）。明るさが 1 フレームに +1 変わる背景で、埋めた値の乱れ（±6）が半分未満になり、フェードに遅れない（±3 以内）。範囲の中をすべて埋めていても周りの画素で Δ を測る。見えている画素がばらばらに変わる（動いた）ときは混ぜない | `src/stabilize.zig` の test `"stabilize: a static background averages the jitter of the fill, and a fade is followed without lag"`、`"stabilize: the brightness change is measured around the area when every pixel in it is guessed"`、`"stabilize: when the visible background changes (it moved), the fill is not blended"` |
@@ -64,6 +65,10 @@
 | 復元 | 位相相関の窓をウォーターマークの ROI と重ならない所から取る | test `"temporal: chooseWindow keeps the window off the ROI and takes the largest"` |
 | 復元 | 相関のピークが閾値未満のペアで鎖を切り、動いていないとは見なさない | test `"temporal: Track cuts the chain at an unestimated pair instead of assuming no motion"` |
 | 復元 | 戻したと言った画素（由来 `temporal_real`）は正解と一致し、戻せなかった画素は焼かれたまま残って由来が `unrecovered` になる。ROI の外は `original`。推定した移動量が間違っていれば、ROI の周りの帯が合わないのでそのフレームからは借りない。動かない背景では何も戻らない | test `"temporal: recoverFrame restores the exact background under a pan, refuses frames whose surroundings do not match, and reports what it could not"` |
+| 復元（借りない範囲） | 別のフレームから、マスクで隠した画素（マスクが無ければ ROI + 8 px）の中は借りず、移動の確かめはその外の帯で行う。ROI がウォーターマークより 4 px 小さくても、はみ出した縁を借りない | `zig build restore-e2e` の `restore-overhang`（coverage ≥ 0.9、外れ ≤ 0.001。守る範囲が無いと coverage 0、ROI + 4 px だと外れ 0.0157） |
+| 復元（auto） | `--temporal auto`（既定）は、前後のフレームの両方から取れて値が近く（≤ 10）、帯の差 ≤ 4、動きが落ち着いた（跳ね ≤ 2 px）画素だけを戻したと数える。前後で違う物体が写っていれば採らず、跳ねたペアを越えて借りない。動画の最後のフレームでは採らない。off は借りない | `src/temporal.zig` の test `"temporal: auto takes a pixel only when the frames before and after agree, and it is exact"`、`"temporal: auto rejects a pixel whose frames before and after disagree (something moved there)"`、`"temporal: auto does not borrow across a pair whose motion jumps"` |
+| 復元（auto、合成 E2E） | auto で採った画素は外れない。毎フレーム別の模様では採らない。off は借りない | `zig build restore-e2e` の `restore-pan7-auto`、`restore-overhang-auto`（外れ ≤ 0.001）、`restore-cut-auto`、`restore-pan7-off` |
+| debug の可視化 | `--debug` で、画素の扱い（緑 = 別のフレームから戻した、赤 = auto の条件を通らず推測で埋めた、青 = 候補なしで推測で埋めた、マゼンタ = 埋めていない）と、借りたフレーム（過去 = 青系、未来 = 橙系、遠いほど明るい、灰色 = 不採用）を横並びに描く。.mp4 なら入力と同じフレーム数・幅 2 倍の動画、ディレクトリなら 1 フレーム 1 枚の PNG | `src/debug_view.zig` の test、`zig build restore-e2e` の `restore-debug mp4 check`・`restore-debug png check` |
 | 復元（明るさ） | 借りた画素に、ROI の周りの帯で測った明るさの差（表示中 − 借りたフレーム、R/G/B の平均）を足す。露出がフレームごとに 1 ずつ変わる動画でも、戻した画素は表示中のフレームの正解と一致する | test `"temporal: recoverFrame matches the brightness of the borrowed pixels to the frame shown"` |
 | 由来 | 各画素の由来（provenance）を 1 バイトで表す: 0 `original`（ROI の外）、1 `unrecovered`、2 `temporal_real`、4 `spatial_inpainted`。3 は予約（`alpha_recovered`）。知らない値は読まない | `src/provenance.zig` の test `"provenance: byte values are part of the file format"` |
 | 由来 | coverage は ROI の中の画素のうち、証拠から戻した由来（今は `temporal_real` だけ）の割合。ROI の外と、推測で埋めた `spatial_inpainted` は数えない | test `"provenance: coverage counts recovered pixels over the ROI, not pixels outside it"` |
@@ -79,7 +84,7 @@
 | 復元（合成 E2E） | 画面全体の平行移動ではない動き（ズーム）で、戻した画素のうち外れた画素が 2% 以下 | `zig build restore-e2e` の `restore-zoom` |
 | 復元（合成 E2E） | 回転 + パンで、affine（既定）が ROI の 8 割以上を戻し、SSIM ≥ 0.75、外れた画素 ≤ 1% | `zig build restore-e2e` の `restore-rotpan`（平行移動では coverage 0.57・SSIM 0.44 で FAIL） |
 | 復元（合成 E2E） | `--motion translation` でもパン 7,3 を戻す | `zig build restore-e2e` の `restore-pan7-translation` |
-| GUI | K でマスク（auto / none）を切り替え、Space で再生 / 一時停止、H で操作パネルを隠す、C で場面（動画名・時刻・フレーム番号）をクリップボードと標準出力へ。B で処理前 / 処理後。F で戻せなかった画素を埋めるか（none / harmonic）を切り替え、M で動きのモデル（affine / translation）を切り替え、窓のタイトルに出す。R で表示中のフレームを戻し（CLI と同じ部品・閾値）、戻せなかった画素はマゼンタで見せる。P で各画素の由来の色（`temporal_real` 緑、`unrecovered` マゼンタ）を重ね、窓のタイトルに由来ごとの割合を出す | `zig build gui` の `gui restore check`（coverage のみ）。表示は `--screenshot` で目視。キー操作は自動の検査なし |
+| GUI | T で Temporal（auto / on / off）を切り替え、K でマスク（auto / none）を切り替え、Space で再生 / 一時停止、H で操作パネルを隠す、C で場面（動画名・時刻・フレーム番号）をクリップボードと標準出力へ。B で処理前 / 処理後。F で戻せなかった画素を埋めるか（none / harmonic）を切り替え、M で動きのモデル（affine / translation）を切り替え、窓のタイトルに出す。R で表示中のフレームを戻し（CLI と同じ部品・閾値）、戻せなかった画素はマゼンタで見せる。P で各画素の由来の色（`temporal_real` 緑、`unrecovered` マゼンタ）を重ね、窓のタイトルに由来ごとの割合を出す | `zig build gui` の `gui restore check`（coverage のみ）。表示は `--screenshot` で目視。キー操作は自動の検査なし |
 | リポジトリ衛生 | 動画・巨大ファイルが git の管理下に無い | `scripts/check-no-media.sh` |
 
 ## 2. ROI 検出の契約
@@ -117,6 +122,7 @@ yuv420p の動画を `ffmpeg -vf crop` で切ると座標と大きさが偶数�
 
 | 実装しない | 理由 |
 |---|---|
+| 実写での Temporal Recovery の既定での使用（on） | 画面全体の動きで借りた画素は、実写では外れがある（疑似チェックで画面の端 8.0%、中央 1.5%）。既定は auto で、確かめを通った画素だけを採る（ADR 0017） |
 | 背景復元の Alpha Inversion / 生成 | Temporal と Spatial（推測、既定では行わない）だけ（[ADR 0005](adr/0005-temporal-recovery-copies-real-pixels-and-leaves-the-rest-unrecovered.md)、[ADR 0008](adr/0008-spatial-inpainting-is-opt-in-and-never-counted-as-recovered.md)） |
 | マスクの既定での使用 | `--mask auto` で使える（ADR 0010、0011）。既定は ROI 全体を隠す。実写で取りこぼしはほぼ無くなったが、背景の動かない縁も隠すので適合率は 0.30〜0.40 |
 | Temporal の被写体ごとの動き（ROI 周辺の block motion / optical flow） | 動きは画面全体の affine（ADR 0007）。手持ちの実写で戻らないのは、背景が窓の中で露出していないためで、局所的な動きを追っても戻らない（SPEC §4） |
@@ -432,6 +438,46 @@ SSIM が下がったのは 15 / 96（最大 −0.0026）、上がったのは 0�
 
 解釈: 正解との近さはほぼ変えずに、平らな背景で目に付くちらつきを減らす。評価の 96 ケースは模様のある背景が多く、
 埋めた面のちらつきは正解より小さいので、効果は小さい。
+
+### マスクを見分けられないときの、はみ出しの扱い
+
+2026-09-29、同じ環境。手持ちの実写 A の先頭 30 秒（白い背景のフェード。マスクは見分けられない）、本物の ROI 505,5 120x72、
+`--mask auto --fill harmonic`。ROI の左に 2 px はみ出した文字の縁（x = 503〜504）が、前は ROI の外として残り、それを手がかりに
+埋めて紫のにじみが中へ広がった（目視）。直した後は、マスクの範囲（ROI + 8 px）のうち隠す割合が 72.2%（ROI だけ）→ 76.5% になり、
+にじみは消えた（目視）。
+
+### Temporal Recovery: 借りない範囲と auto（ADR 0016 / 0017）
+
+2026-09-29、同じ環境。
+
+合成（640x360 / 10 fps / 60 フレーム / crf 23、`--fill none`、正解と比べる）。「縮め」は ROI をウォーターマークの外接矩形から縮めた幅（はみ出しの幅）。
+coverage / 外れ（誤差 > 32 の割合、戻した画素のうち）:
+
+| 背景・縮め | on・借りない範囲なし（hidetzu/vrestore#16 まで） | on・ROI + 4 px | on・ROI + 8 px（今の on） | on・マスク | auto |
+|---|---|---|---|---|---|
+| パン 7,3・0 | 0.965 / 1.31% | 0.994 / 0.01% | 0.987 / 0.00% | 0.995 / 0.01% | 0.450 / 0.00%（ROI = 検出） |
+| パン 7,3・2 | 0 / — | 0.997 / 0.02% | 0.991 / 0.00% | 0.996 / 0.01% | — |
+| パン 7,3・4 | 0 / — | 0.970 / 1.57% | 0.995 / 0.01% | 0.997 / 0.01% | 0.571 / 0.00% |
+| 遅いパン 3,1・0 | 0.565 / 2.36% | 0.649 / 0.00% | 0.539 / 0.00% | 0.681 / 0.00% | 0.028 / 0.00%（ROI = 検出） |
+| 回転 + パン・0 | 0.775 / 0.59% | 0.926 / 0.00% | 0.890 / 0.00% | 0.932 / 0.00% | 0.116 / 0.00%（ROI = 検出） |
+
+手持ちの実写 A の疑似チェック（`scripts/temporal-pseudo-check.sh`、20 クリップ × 20 秒、ウォーターマークの無い場所に 120x72 の矩形。
+左上 = 本物の ROI を左右反転した位置、中央。`--mask none --fill none`）。coverage / 外れ / 戻した画素の PSNR:
+
+| 設定 | 左上 | 中央 |
+|---|---|---|
+| on・借りない範囲なし | 0.0099 / 8.0% / 20.7 dB | 0.0172 / 1.5% / 30.1 dB |
+| on・ROI + 3 px | 0.0047 / 9.4% / 19.6 dB | 0.0036 / 2.6% / 28.6 dB |
+| on・ROI + 8 px | 0.0025 / 11.3% / 18.6 dB | 0.0007 / 7.0% / 25.2 dB |
+| **auto（既定）** | 0（1 画素も採らない） | 0 |
+
+参考（別の調査、40 クリップ・左右反転の位置）: 同じ画素を harmonic で埋めると外れ 8.65%・20.1 dB。
+
+同じ実写の 60 秒（本物の ROI、`--mask auto --fill harmonic`、既定の auto）: 採用 11,570 画素・不採用 251,532 画素（ROI の画素の 0.07% を採用）。
+先頭 30 秒（フェード）: 採用 0・不採用 1,554。
+
+解釈: 実写では画面全体の動きで借りた画素は当てにならず、auto はほぼ採らない。借りない範囲は、はみ出しのある合成では外れを消すが、
+はみ出しの無い実写では戻す量を減らし外れを増やす（大きく動くフレームほど、画面全体の動きの近似が合わない、と考える。未検証）。
 
 ### YUV と RGB の往復（デコード → 書き出し）
 

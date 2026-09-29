@@ -71,13 +71,13 @@ pub fn pathsFor(gpa: std.mem.Allocator, prefix: []const u8) !Paths {
     };
 }
 
-pub const Settings = struct { motion: []const u8, fill: []const u8, mask: []const u8 };
+pub const Settings = struct { motion: []const u8, fill: []const u8, mask: []const u8, temporal: []const u8 = "auto" };
 
 /// 子プロセスの引数（argv[0] は vrestore の実行ファイル）
 pub fn restoreArgs(gpa: std.mem.Allocator, vrestore: []const u8, p: Paths, video: []const u8, s: Settings) ![]const []const u8 {
     return gpa.dupe([]const u8, &.{
-        vrestore, "restore", "--roi",      p.roi_json, "--motion", s.motion, "--fill", s.fill, "--mask", s.mask,
-        "--out",  p.mp4,     "--progress", p.progress, video,
+        vrestore,     "restore",  "--roi", p.roi_json, "--motion",   s.motion,   "--fill", s.fill, "--mask", s.mask,
+        "--temporal", s.temporal, "--out", p.mp4,      "--progress", p.progress, video,
     });
 }
 
@@ -126,7 +126,8 @@ test "export_job: output goes next to the video and never overwrites" {
     try std.testing.expectEqualStrings("v-restored.mp4", (try paths(arena, "v", Set{ .have = &.{} }, f)).mp4);
     const args = try restoreArgs(arena, "bin/vrestore", p1, "media/a.b.mp4", .{ .motion = "affine", .fill = "harmonic", .mask = "auto" });
     try std.testing.expectEqualStrings("bin/vrestore", args[0]);
-    try std.testing.expectEqualStrings("media/a.b-restored.mp4", args[11]);
+    try std.testing.expectEqualStrings("auto", args[11]);
+    try std.testing.expectEqualStrings("media/a.b-restored.mp4", args[13]);
     try std.testing.expectEqualStrings("media/a.b.mp4", args[args.len - 1]);
 }
 

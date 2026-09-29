@@ -16,7 +16,12 @@
 
 const std = @import("std");
 
+pub const Rect = struct { x: u32, y: u32, w: u32, h: u32 };
+
 pub const Params = struct {
+    /// 推定する範囲（crop）の中の ROI。見分けられなかったとき、ROI の中はすべて隠し、ROI の外（周りの帯）は
+    /// どのフレームでも同じ縁（ROI からはみ出したウォーターマーク）だけを隠す。null なら範囲全体を隠す
+    inner: ?Rect = null,
     /// 見分けた画素を広げる幅（px）。ウォーターマークの縁取りの外側の圧縮のにじみまで隠す（ADR 0011）
     dilate: u32 = 2,
     /// 勾配の時間方向の中央値の大きさが、背景（変わりにくくない画素）の中央値の何倍を超えたら縁とみなすか。0 なら縁を使わない
@@ -79,24 +84,38 @@ pub fn estimate(gpa: std.mem.Allocator, crops: []const []const u8, w: u32, h: u3
     const inside_mad, const outside_mad = try splitMedians(gpa, mad, hidden);
     const still_fraction = fractionOf(hidden);
 
-    if (p.edge_ratio > 0) {
-        const edge = try edges(gpa, crops, w, h, hidden, p.edge_ratio, p.min_edge);
-        defer gpa.free(edge);
-        // 縁は広げない: 中心差分は両隣を見るので、縁はウォーターマークの外側 1 px まで既に付いている
-        for (hidden, edge) |*hd, e| hd.* = hd.* or e;
-    }
+    const edge_map: ?[]bool = if (p.edge_ratio > 0) try edges(gpa, crops, w, h, hidden, p.edge_ratio, p.min_edge) else null;
+    defer if (edge_map) |em| gpa.free(em);
+    // 縁は広げない: 中心差分は両隣を見るので、縁はウォーターマークの外側 1 px まで既に付いている
+    if (edge_map) |em| for (hidden, em) |*hd, e| {
+        hd.* = hd.* or e;
+    };
 
     try dilate(gpa, hidden, w, h, p.dilate);
-    const fraction = fractionOf(hidden);
 
     const accepted = outside_mad >= p.min_background_mad and
         outside_mad >= p.min_separation * inside_mad and
         still_fraction >= p.min_fraction and still_fraction <= p.max_fraction;
-    if (!accepted) @memset(hidden, true);
+    if (!accepted) {
+        if (p.inner) |r| {
+            // 背景も動かず変わりにくさでは見分けられない。ROI の中はすべて隠し、周りの帯は縁だけを広げて隠す
+            // （手で選んだ ROI からはみ出した文字の端が残り、それを手がかりに埋めて周りへにじんだ）
+            // 縁の閾値は範囲全体の中央値から取り直す。背景が止まっていると「変わりにくくない画素」はむしろ文字の方で、
+            // それを基準にすると閾値が高すぎて、はみ出した文字の縁を拾えなかった（フェードの 30 秒で観測）
+            @memset(hidden, false);
+            if (p.edge_ratio > 0) {
+                const em = try edges(gpa, crops, w, h, null, p.edge_ratio, p.min_edge);
+                defer gpa.free(em);
+                @memcpy(hidden, em);
+                try dilate(gpa, hidden, w, h, p.dilate);
+            }
+            for (r.y..r.y + r.h) |y| @memset(hidden[y * w + r.x ..][0..r.w], true);
+        } else @memset(hidden, true);
+    }
     return .{
         .hidden = hidden,
         .accepted = accepted,
-        .fraction = if (accepted) fraction else 1,
+        .fraction = fractionOf(hidden),
         .threshold = th,
         .inside_mad = inside_mad,
         .outside_mad = outside_mad,
@@ -158,7 +177,8 @@ fn otsu(v: []const f32) f32 {
 /// 勾配（明るさ = R/G/B の平均の中心差分）の時間方向の中央値の大きさが、しきい値を超える画素。
 /// しきい値は `still`（変わりにくい画素）の外の中央値から決める。ROI 全体の中央値にすると、ROI のうちウォーターマークが
 /// 占める割合（= 指定した範囲の広さ）でしきい値が大きく動く
-fn edges(gpa: std.mem.Allocator, crops: []const []const u8, w: u32, h: u32, still: []const bool, ratio: f32, min_edge: f32) ![]bool {
+/// `still` が null なら、範囲の全画素の中央値から決める（変わりやすさで背景を見分けられなかったとき）
+fn edges(gpa: std.mem.Allocator, crops: []const []const u8, w: u32, h: u32, still: ?[]const bool, ratio: f32, min_edge: f32) ![]bool {
     const n: usize = @as(usize, w) * h;
     const mag = try gpa.alloc(f32, n);
     defer gpa.free(mag);
@@ -180,7 +200,9 @@ fn edges(gpa: std.mem.Allocator, crops: []const []const u8, w: u32, h: u32, stil
     };
     var bg: std.ArrayList(f32) = .empty;
     defer bg.deinit(gpa);
-    for (mag, still) |m, s| if (!s) try bg.append(gpa, m);
+    if (still) |st| {
+        for (mag, st) |m, s| if (!s) try bg.append(gpa, m);
+    } else try bg.appendSlice(gpa, mag);
     const th = @max(min_edge, if (bg.items.len > 0) ratio * median(bg.items) else min_edge);
     const out = try gpa.alloc(bool, n);
     for (mag, out) |m, *o| o.* = m > th;
@@ -350,6 +372,36 @@ test "wmask: whether the mask is used is judged before the edges and the dilatio
     defer e.deinit(gpa);
     try std.testing.expect(e.accepted);
     try std.testing.expectEqual(@as(f32, 1), e.fraction);
+}
+
+test "wmask: when it cannot tell, it hides the ROI and only the watermark's edges sticking out of it" {
+    // 背景は白で張り付いて動かない（フェードでも 255 のまま）。ウォーターマーク (4..11, 3..6) だけがフェードで明るさを変え、
+    // ROI (6..14, 2..8) から左に 2 px はみ出している。変わりやすさでは見分けられず、「変わりにくくない画素」はむしろ文字の方
+    const gpa = std.testing.allocator;
+    const w = 20;
+    const h = 10;
+    const crops = try gpa.alloc([]u8, 21);
+    defer gpa.free(crops);
+    for (crops, 0..) |*cr, k| {
+        cr.* = try gpa.alloc(u8, w * h * 3);
+        @memset(cr.*, 255);
+        const level: u8 = @intCast(120 + k % 5); // 変わり方は小さい（変わりやすさの下限 8 未満）
+        for (3..6) |y| for (4..11) |x| {
+            cr.*[(y * w + x) * 3 ..][0..3].* = .{ level, level, 0 };
+        };
+    }
+    defer for (crops) |c| gpa.free(c);
+    const e = try estimate(gpa, crops, w, h, .{ .inner = .{ .x = 6, .y = 2, .w = 8, .h = 6 }, .dilate = 1 });
+    defer e.deinit(gpa);
+    try std.testing.expect(!e.accepted);
+    // ROI の中はすべて隠す
+    for (2..8) |y| for (6..14) |x| try std.testing.expect(e.hidden[y * w + x]);
+    // ROI の外にはみ出した文字（x = 4, 5）は隠す
+    for (3..6) |y| for (4..6) |x| try std.testing.expect(e.hidden[y * w + x]);
+    // 文字から離れた背景は隠さない
+    try std.testing.expect(!e.hidden[9 * w + 0]);
+    try std.testing.expect(!e.hidden[0 * w + 18]);
+    try std.testing.expect(e.fraction < 1);
 }
 
 test "wmask: otsu splits two clusters" {
