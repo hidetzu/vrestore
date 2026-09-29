@@ -443,6 +443,8 @@ const RestoreCase = struct {
     rect: ?[]const u8 = null,
     /// restore --temporal。既存のケースは on の仕組みを確かめる（auto は既定だが、専用のケースで確かめる）
     temporal: []const u8 = "on",
+    /// restore に足す引数
+    extra: []const []const u8 = &.{},
     /// tools/roi_fixture check-restore の条件
     expect: []const u8,
 };
@@ -488,6 +490,11 @@ const restore_cases = [_]RestoreCase{
     .{ .roi = .{ .spec = "name=restore-overhang-auto,bg=pan,pan_x=7,pan_y=3,x=240,y=150,frames=60", .crf = 23 }, .rect = "245,155,135,43", .temporal = "auto", .expect = "coverage>=0.4,masked_bad_fraction<=0.001" },
     // 毎フレーム別の模様: auto も 1 画素も採らない
     .{ .roi = .{ .spec = "name=restore-cut-auto,bg=cut,x=240,y=150,frames=60", .crf = 23 }, .temporal = "auto", .expect = "coverage<=0,temporal_pixels.accepted<=0" },
+    // 止まった背景の上を、模様の付いた大きな円板が縦に 3 px/フレームで横切る（ROI と周りの帯を覆う）。画面全体の動きは 0 なので
+    // 画面全体の方式は何も戻せない。局所の optical flow（ADR 0018）は、前後それぞれ 3 枚以上がそろい、おとりの疑似チェックに
+    // 通った画素だけを戻す。実測（crf 23、--fill none）: 局所あり coverage 0.514・外れ 0、局所なし 0
+    .{ .roi = .{ .spec = "name=restore-blob-local,bg=blob,pan_x=0,pan_y=3,x=240,y=150,frames=60", .crf = 23 }, .rect = "234,144,158,68", .temporal = "auto", .expect = "coverage>=0.4,masked_bad_fraction<=0.001,local_flow.accepted>=1,local_flow.decoy_wrong<=0" },
+    .{ .roi = .{ .spec = "name=restore-blob-global,bg=blob,pan_x=0,pan_y=3,x=240,y=150,frames=60", .crf = 23 }, .rect = "234,144,158,68", .temporal = "auto", .extra = &.{ "--local-flow", "off" }, .expect = "coverage<=0" },
     // --temporal off: 背景が動いていても借りない
     .{ .roi = .{ .spec = "name=restore-pan7-off,bg=pan,pan_x=7,pan_y=3,x=240,y=150,frames=60", .crf = 23 }, .temporal = "off", .expect = "coverage<=0,temporal_pixels.accepted<=0,temporal_pixels.rejected<=0" },
     // 動かない背景: 隠れた画素はどのフレームにも写っていないので、1 画素も戻らない
@@ -525,6 +532,7 @@ fn restoreCase(b: *std.Build, tool: *std.Build.Step.Compile, exe: *std.Build.Ste
     restore.setName(b.fmt("{s} restore", .{name}));
     restore.addArg("restore");
     restore.addArgs(&.{ "--temporal", c.temporal });
+    restore.addArgs(c.extra);
     if (c.motion) |m| restore.addArgs(&.{ "--motion", m });
     if (c.fill) |f| restore.addArgs(&.{ "--fill", f });
     if (c.mask) |m| restore.addArgs(&.{ "--mask", m });
