@@ -56,6 +56,7 @@
 | マスク | 背景が変わる中で変わらない画素（ウォーターマーク）を見分け、2 px 広げる（縁取りの外側の圧縮のにじみまで隠す）。背景も変わらなければ見分けられないとして ROI 全体を隠す。大津の二値化で 2 つの塊を分ける | `src/wmask.zig` の test `"wmask: finds the pixels that stay the same while the background changes"`、`"wmask: falls back to hiding the whole ROI when the background does not move either"`、`"wmask: otsu splits two clusters"` |
 | マスク（縁） | 勾配の時間方向の中央値が大きい画素（どのフレームでも同じ縁）も隠す。背景と一緒に色が変わる不透明度 30% の棒を、変わりにくさだけでは 55% しか隠せないが、縁を足すとすべて隠す | `src/wmask.zig` の test `"wmask: the edges catch a translucent watermark that the stillness alone misses"` |
 | マスクの範囲 | マスクを使うときは、推定して埋める範囲を ROI の周り 8 px まで広げる（動画の端で止める）。ROI の外でもマスクの内側なら埋め、マスクの外は入力のまま。Temporal の範囲は広げない | test `"maskArea: widens only with the mask, and stops at the frame edge"`、`"fillAndTally: fills the watermark pixels outside the ROI too, and keeps the rest as input"` |
+| マスク（見分けられないとき） | 変わりやすさで見分けられないときも、ROI の中はすべて隠し、周りの帯（ROI + 8 px）では、どのフレームでも同じ縁（ROI からはみ出した文字）だけを 2 px 広げて隠す。縁の閾値は範囲全体の中央値から取り直す（背景が止まり文字の方が少し変わる場面で、「変わりにくくない画素」を基準にすると閾値が高すぎて、はみ出しを拾えなかった） | `src/wmask.zig` の test `"wmask: when it cannot tell, it hides the ROI and only the watermark's edges sticking out of it"` |
 | マスク（ROI 全体に戻す判定） | 隠す割合の判定（2%〜95%）は、縁を足す前・広げる前の変わりにくい画素で行う。縁と広げた分で 100% になっても、見分けられていればマスクを使う | `src/wmask.zig` の test `"wmask: whether the mask is used is judged before the edges and the dilation widen it"` |
 | マスク（合成 E2E） | `--mask auto` で、毎フレーム別の模様の背景を harmonic で埋めて SSIM ≥ 0.67（ROI 全体を埋めると 0.649）、本物のウォーターマークの画素の再現率 ≥ 0.99 | `zig build restore-e2e` の `restore-cut-mask`（check-mask を含む） |
 | 埋めの落ち着かせ | 前のフレームでも埋めた画素は、見えている背景の明るさの変化 Δ を足した前の値と混ぜる（λ = 0.3）。明るさが 1 フレームに +1 変わる背景で、埋めた値の乱れ（±6）が半分未満になり、フェードに遅れない（±3 以内）。範囲の中をすべて埋めていても周りの画素で Δ を測る。見えている画素がばらばらに変わる（動いた）ときは混ぜない | `src/stabilize.zig` の test `"stabilize: a static background averages the jitter of the fill, and a fade is followed without lag"`、`"stabilize: the brightness change is measured around the area when every pixel in it is guessed"`、`"stabilize: when the visible background changes (it moved), the fill is not blended"` |
@@ -437,6 +438,13 @@ SSIM が下がったのは 15 / 96（最大 −0.0026）、上がったのは 0�
 
 解釈: 正解との近さはほぼ変えずに、平らな背景で目に付くちらつきを減らす。評価の 96 ケースは模様のある背景が多く、
 埋めた面のちらつきは正解より小さいので、効果は小さい。
+
+### マスクを見分けられないときの、はみ出しの扱い
+
+2026-09-29、同じ環境。手持ちの実写 A の先頭 30 秒（白い背景のフェード。マスクは見分けられない）、本物の ROI 505,5 120x72、
+`--mask auto --fill harmonic`。ROI の左に 2 px はみ出した文字の縁（x = 503〜504）が、前は ROI の外として残り、それを手がかりに
+埋めて紫のにじみが中へ広がった（目視）。直した後は、マスクの範囲（ROI + 8 px）のうち隠す割合が 72.2%（ROI だけ）→ 76.5% になり、
+にじみは消えた（目視）。
 
 ### Temporal Recovery: 借りない範囲と auto（ADR 0016 / 0017）
 
