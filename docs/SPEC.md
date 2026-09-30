@@ -61,6 +61,9 @@
 | マスク（見分けられないとき） | 変わりやすさで見分けられないときも、ROI の中はすべて隠し、周りの帯（ROI + 8 px）では、どのフレームでも同じ縁（ROI からはみ出した文字）だけを 2 px 広げて隠す。縁の閾値は範囲全体の中央値から取り直す（背景が止まり文字の方が少し変わる場面で、「変わりにくくない画素」を基準にすると閾値が高すぎて、はみ出しを拾えなかった） | `src/wmask.zig` の test `"wmask: when it cannot tell, it hides the ROI and only the watermark's edges sticking out of it"` |
 | マスク（ROI 全体に戻す判定） | 隠す割合の判定（2%〜95%）は、縁を足す前・広げる前の変わりにくい画素で行う。縁と広げた分で 100% になっても、見分けられていればマスクを使う | `src/wmask.zig` の test `"wmask: whether the mask is used is judged before the edges and the dilation widen it"` |
 | マスク（合成 E2E） | `--mask auto` で、毎フレーム別の模様の背景を harmonic で埋めて SSIM ≥ 0.67（ROI 全体を埋めると 0.649）、本物のウォーターマークの画素の再現率 ≥ 0.99 | `zig build restore-e2e` の `restore-cut-mask`（check-mask を含む） |
+| マスク（勾配、ADR 0019） | `--mask gradient`: 勾配の時間方向の中央値をポアソン方程式で積分し直し（定数の差を除いて元の像に戻る）、背景の水準との差が 24 を超えた画素を 1 px 広げて隠す。筆の中まで取り、枠の中の空いた背景は取らない（不透明度 1 / 0.5）。何も際立たなければ ROI 全体を隠す | `src/wgrad.zig` の test `"wgrad: poisson integrates a gradient field back to the image (up to a constant)"`、`"wgrad: finds the watermark's shape, including the inside of the strokes, but not the background inside the frame"`、`"wgrad: when nothing stands out, it hides the whole ROI instead of nothing"` |
+| マスク（勾配、合成 E2E） | 毎フレーム別の模様の背景で、`--mask gradient` + harmonic が SSIM ≥ 0.73（実測 0.755、`--mask auto` は 0.689）、再現率 ≥ 0.99 | `zig build restore-e2e` の `restore-cut-gradient`（check-mask を含む。3 px 広げると 0.685 で落ちる） |
+| マスク（外から与える / 書き出す） | `--mask-out` で使ったマスクを動画と同じ大きさの画像に書き、`--mask-image` でそのまま読み戻せる（値が alpha。0〜255 の途中は元のフレームと混ぜる）。大きさが違えば理由を言って止まる。`--frames n` で先頭 n フレームだけ復元する（マスクは動画全体から推定） | `zig build test` の `cli_mask_out`、`cli_mask_image`、`cli_mask_image_size`。混ぜ方は `src/restore_cmd.zig` の test `"blendWithOriginal: mixes only the guessed pixels, by alpha, and leaves real and original pixels alone"` |
 | 埋めの落ち着かせ | 前のフレームでも埋めた画素は、見えている背景の明るさの変化 Δ を足した前の値と混ぜる（λ = 0.3）。明るさが 1 フレームに +1 変わる背景で、埋めた値の乱れ（±6）が半分未満になり、フェードに遅れない（±3 以内）。範囲の中をすべて埋めていても周りの画素で Δ を測る。見えている画素がばらばらに変わる（動いた）ときは混ぜない | `src/stabilize.zig` の test `"stabilize: a static background averages the jitter of the fill, and a fade is followed without lag"`、`"stabilize: the brightness change is measured around the area when every pixel in it is guessed"`、`"stabilize: when the visible background changes (it moved), the fill is not blended"` |
 | 埋めの落ち着かせ（合成 E2E） | 動かない背景では全フレームで混ぜ、動く背景では混ぜない | `zig build restore-e2e` の `restore-flat-fill`（`stable_fill.blended` ≥ 59）、`restore-pan7-fill`（≤ 0） |
 | 補間（合成 E2E） | 動かない滑らかな背景を harmonic で埋めると SSIM ≥ 0.95、coverage は 0 のまま。パンでは Temporal の実画素を変えずに残りを埋める | `zig build restore-e2e` の `restore-flat-fill` `restore-pan7-fill` |
@@ -78,7 +81,7 @@
 | 由来 | 各画素の由来（provenance）を 1 バイトで表す: 0 `original`（ROI の外）、1 `unrecovered`、2 `temporal_real`、4 `spatial_inpainted`。3 は予約（`alpha_recovered`）。知らない値は読まない | `src/provenance.zig` の test `"provenance: byte values are part of the file format"` |
 | 由来 | coverage は ROI の中の画素のうち、証拠から戻した由来（今は `temporal_real` だけ）の割合。ROI の外と、推測で埋めた `spatial_inpainted` は数えない | test `"provenance: coverage counts recovered pixels over the ROI, not pixels outside it"` |
 | CLI | `--window` は 1〜255（窓のフレーム数が temporal.max_window_frames = 511 に収まる範囲） | `src/main.zig` の test `"parseArgs: restore"` |
-| CLI | `vrestore restore (--roi <detection.json> \| --rect) (--out <out.mp4> \| --raw <out.rgb>) [--crf <n>] [--audio copy\|none] [--provenance <out>] [--motion affine\|translation] [--fill none\|directional\|harmonic] [--mask none\|auto] <video>` が全フレームを H.264 の MP4 と / または RGB24 の生フレームに書き、由来を書き、coverage と由来ごとの画素数を JSON で出す | `zig build restore-e2e`（`restore-pan15` で `temporal_real` の割合 ≥ 0.99、`restore-cut` で `unrecovered` の割合 = 1） |
+| CLI | `vrestore restore (--roi <detection.json> \| --rect) (--out <out.mp4> \| --raw <out.rgb>) [--crf <n>] [--audio copy\|none] [--provenance <out>] [--motion affine\|translation] [--fill none\|directional\|harmonic] [--mask none\|auto\|gradient] [--mask-image <png>] [--mask-out <png>] [--frames <n>] <video>` が全フレームを H.264 の MP4 と / または RGB24 の生フレームに書き、由来を書き、coverage と由来ごとの画素数を JSON で出す | `zig build restore-e2e`（`restore-pan15` で `temporal_real` の割合 ≥ 0.99、`restore-cut` で `unrecovered` の割合 = 1） |
 | 書き出し | `--out` の MP4 は、入力と同じ数のフレームを元の時刻で持ち、`--raw` で同時に書いた RGB との差は H.264 の符号化の分だけ（合成のパンで PSNR 42.2 dB・SSIM 0.984、判定 ≥ 38 / ≥ 0.97）。元の音声（AAC）のパケットは数も中身も同じ（再符号化しない） | `zig build restore-e2e` の `restore-export`（`check-restore` と `roi_fixture check-audio`） |
 | 書き出し（色） | デコードと書き出しで、同じ色の範囲・行列（ストリームの記述、無ければ BT.601・limited）を使う。フルレンジの入力（yuv420p + color_range=pc）の暗部・明部を潰さない。出力には入力と同じ範囲を付ける | `zig build test` の `cli_full_range check`（明るさ 0〜255 の傾斜、VP9 の劣化なし → `--crf 0`、ffmpeg に範囲の記述どおり RGB にさせて PSNR ≥ 40） |
 | 書き出し（回転・大きさ） | 回転の情報（display matrix）を写す。幅か高さが奇数なら、理由を言って書き始める前に止める | `zig build test` の `cli_rotation check`（rotation = 90）、`cli_odd_out`（321x181） |
@@ -130,7 +133,7 @@ yuv420p の動画を `ffmpeg -vf crop` で切ると座標と大きさが偶数�
 |---|---|
 | 実写での Temporal Recovery の既定での使用（on） | 画面全体の動きで借りた画素は、実写では外れがある（疑似チェックで画面の端 8.0%、中央 1.5%）。既定は auto で、確かめを通った画素だけを採る（ADR 0017） |
 | 背景復元の Alpha Inversion / 生成 | Temporal と Spatial（推測、既定では行わない）だけ（[ADR 0005](adr/0005-temporal-recovery-copies-real-pixels-and-leaves-the-rest-unrecovered.md)、[ADR 0008](adr/0008-spatial-inpainting-is-opt-in-and-never-counted-as-recovered.md)） |
-| マスクの既定での使用 | `--mask auto` で使える（ADR 0010、0011）。既定は ROI 全体を隠す。実写で取りこぼしはほぼ無くなったが、背景の動かない縁も隠すので適合率は 0.30〜0.40 |
+| マスクの既定での使用 | `--mask auto`（ADR 0010、0011）・`--mask gradient`（ADR 0019）で使える。既定は ROI 全体を隠す。gradient は長い動画で正解の形に近いが、数秒の動画では背景の縁まで取り、固定カメラの 5 秒で下がるケースがある（§4）。既定にするかはこの測定で決める |
 | Temporal の被写体ごとの動き（ROI 周辺の block motion / optical flow） | 動きは画面全体の affine（ADR 0007）。手持ちの実写で戻らないのは、背景が窓の中で露出していないためで、局所的な動きを追っても戻らない（SPEC §4） |
 | ウォーターマークの自動発見 | 解く問題を「指定されたものの位置」に絞る |
 | 音声の再符号化、MP4 以外の出力形式、映像のコーデックの選択 | 出力は H.264（libx264）の MP4 だけ。音声はそのまま写し、MP4 に入らない形式なら止めて `--audio none` を案内する（ADR 0013） |
@@ -413,6 +416,48 @@ affine で戻る割合が小さいのは正しい。平行移動が「戻した�
 減るが、隠す（推測で埋める）画素が増えるので、背景が動く素材では外接矩形の SSIM が下がる。
 SSIM は少数の画素に残るウォーターマークをほとんど罰しない。この評価のウォーターマーク（PNG を焼いたもの）は縁のにじみが少なく、
 手持ちの実写に元から焼かれていた縁取り付きの文字で見えた点線の縁取り（2 px 広げると消えた、目視）は、この表には出にくい。
+
+### マスクの形: 勾配の時間方向の中央値（`--mask gradient`、ADR 0019）
+
+2026-09-30〜10-01、同じ環境。すべて `--fill harmonic --local-flow off`、正解（焼く前の可逆のクリップ）と比べる。
+SSIM は Python の近似（輝度、7x7 の一様窓。FFmpeg の値とは一致しないので相対比較のみ）、PSNR は RGB。測る領域はウォーターマークの外接矩形 + 4 px。
+縁の帯 = 焼いた PNG の不透明な画素の外側 1〜4 px、「帯の外れ」= 帯のうち誤差（R/G/B の最大）> 16 の割合、
+ぼけ = 勾配の平均の正解に対する比（1 が正解と同じ鋭さ）、ちらつき = フレーム間の変化の正解との差の平均（PNG の画素 + 2 px）。
+適合率 / 再現率は、推定したマスクと PNG の不透明な画素（適合率は +1 px に対して）。「現行」= `--mask auto`。
+正解の形 = PNG の不透明な画素を 1 px 広げたもの（`--mask-image`、上限の目安）。
+
+| 素材（ケース数） | 焼き込んだまま | 現行 | gradient | 正解の形 | gradient が現行より上 | 最も下がったケース（SSIM / PSNR） | 適合率 / 再現率（最小） |
+|---|---|---|---|---|---|---|---|
+| 5 秒のクリップ: A 3 区間 + 1080p 固定カメラ + 人の動く 8 区間（112） | 0.337 / 14.01 | 0.639 / 20.34 | 0.696 / 21.76 | 0.804 / 26.65 | 86 | −0.040 / −5.38 dB | 0.464 / 0.991（0.904） |
+| 　うち 1080p 固定カメラの 5 秒（24） | 0.459 / 12.81 | 0.634 / 19.14 | 0.640 / 18.22 | 0.807 / 23.49 | 11 | −0.040 / −5.38 dB | 0.460 / 0.985（0.914） |
+| 　うち人の動く 8 区間（16） | 0.342 / 12.88 | 0.534 / 19.98 | 0.650 / 22.01 | 0.800 / 28.06 | 16 | +0.025 / −1.00 dB | 0.498 / 0.983（0.912） |
+| A の 5 分（2 区間 × 3 図柄 × 2 位置 × 不透明度 1 / 0.5、24） | 0.312 / 14.31 | 0.741 / 24.64 | 0.823 / 27.31 | 0.839 / 28.53 | 19 | −0.006 / −1.05 dB | 0.796 / 0.997（0.984） |
+| A の 30 分（3 図柄 × 2 位置、6） | 0.252 / 11.46 | 0.882 / 30.53 | 0.909 / 31.17 | 0.919 / 32.27 | 3 | −0.007 / −1.11 dB | 0.850 / 0.998（0.993） |
+| A の 1 時間 47 分（同、6） | 0.272 / 11.40 | 0.659 / 21.38 | 0.748 / 23.52 | 0.757 / 24.11 | 6 | +0.055 / +1.64 dB | 0.850 / 0.998（0.992） |
+| 人の動く 16 ケースに、1 時間 47 分全体から推定したマスクを当てる（16） | 0.342 / 12.88 | 0.534 / 19.98 | 0.805 / 28.44 | 0.800 / 28.06 | 16 | +0.130 / +6.27 dB | — |
+
+各セルは SSIM / PSNR（dB）の平均。5 秒のクリップの 96 ケース（人の動く区間を除く）の再エンコードだけの基準行は 0.957 / 36.34。
+5 秒・5 分は先頭 5 秒（約 150 フレーム）、30 分・1 時間 47 分は先頭 150 フレームを測り、マスクはどれもその動画全体から推定した。
+
+| 素材 | 縁の帯の誤差: 現行 → gradient（正解の形） | 帯の外れ | ぼけ | ちらつき |
+|---|---|---|---|---|
+| 5 秒の 112 | 20.53 → 16.18（6.05） | 0.529 → 0.368（0.133） | 0.31 → 0.52（0.76） | 4.36 → 3.86（3.57） |
+| 5 分の 24 | 10.05 → 4.45（3.88） | 0.217 → 0.054（0.035） | 0.51 → 0.76（0.77） | 2.16 → 1.91（1.91） |
+| 30 分の 6 | 4.62 → 3.51（3.60） | 0.064 → 0.021（0.026） | 0.71 → 0.93（0.94） | 1.54 → 1.38（1.38） |
+| 1 時間 47 分の 6 | 10.03 → 4.90（4.82） | 0.211 → 0.061（0.063） | 0.39 → 0.61（0.61） | 2.73 → 2.46（2.45） |
+| 人の動く 16（全尺から） | 19.77 → 4.35（4.54） | 0.580 → 0.049（0.061） | 0.19 → 0.59（0.59） | 2.07 → 1.55（1.56） |
+
+| 何を測ったか | 値 |
+|---|---|
+| 閾値の決め方（A の 5 分の 24 ケース、同じ推定の差分 D から） | 大津: 再現率 平均 0.967・最小 0.719（元から映っていた別の文字列に閾値が引っぱられた）、SSIM 0.809。固定 24: 0.997・0.984、SSIM 0.824。固定 16: 0.999・0.993、SSIM 0.804。中央値 + k × MAD: 最小 0（採らなかった） |
+| 広げる幅（112 ケース、正解の形） | +0 px 0.697 / 23.52、+1 px 0.804 / 26.65、+2 px 0.785 / 25.90（SSIM / PSNR） |
+| 縁を soft にする（今のマスクの縁で元のフレームと混ぜる、112 ケース） | SSIM 0.639（二値 2 px）→ 0.635（0 px から 2 px まで距離で）/ 0.622（1 → 3 px）/ 0.617（変わりにくさで 0 → 3 px）。現行より上は 55 / 5 / 11（採らなかった） |
+| 推定の時間 | 2 時間の実写 A（640x360）で 13 秒。長い素材の 12 ケースで `--frames 150` の復元を含め 18〜23 秒（`--mask auto` は 12〜16 秒） |
+| 実写 A の本物のウォーターマーク（縁取り付きの 4 行の文字、2 時間全体から） | 隠す画素（範囲 11,560 画素のうち）: 現行 8,562、gradient 6,992。現行はほぼ 1 つの塊、gradient は行ごとの帯（目視、行の中は文字どうしがつながる） |
+
+解釈: 誤差のいちばん大きな原因はマスクの形で、gradient は長い動画ほど正解の形に近づく（適合率 0.46 → 0.80 → 0.85）。
+数秒の動画では背景の勾配が打ち消し合わず、背景の縁まで隠して、固定カメラでは現行より下がるケースがある。
+⚠ 背景がまったく動かない長い動画（固定カメラで人も動かない）は測っていない。
 
 ### 埋めの落ち着かせ（`--stable-fill`、ADR 0015）
 
