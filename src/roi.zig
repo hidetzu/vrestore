@@ -351,7 +351,12 @@ pub const Reason = enum {
     low_psr,
     /// 比べる相手の位置が無く margin を測れない。測れないものは reliable と言わない
     unmeasured_margin,
+    /// 投票したフレーム（輪郭のあるフレーム）が min_frames_voted 枚に満たない
+    few_frames,
 };
+
+/// reliable と言うのに要る、投票したフレームの数。1〜2 枚の一致は「フレームがそろって同じ位置」とは言えない
+pub const min_frames_voted = 3;
 
 pub const Detection = struct {
     x: usize,
@@ -366,29 +371,44 @@ pub const Detection = struct {
     margin: ?f64,
     /// 最頻位置に投票したフレームの peak の平均
     peak: f64,
+    /// 投票したフレームの数（confidence の分母）
     frames_voted: usize,
+    /// 輪郭がまったく無く（暗転・一色）、投票しなかったフレームの数
+    frames_flat: usize,
     reliable: bool,
     reasons: std.EnumSet(Reason),
 };
 
-pub const DetectError = error{NoFrames} || LocateError;
+pub const DetectError = error{
+    NoFrames,
+    /// どのフレームにも輪郭が無い（暗転・一色）。位置を決められない
+    AllFramesFlat,
+} || LocateError;
 
 /// 各フレームで `reference` を探し、最頻位置を ROI とする。
 /// 同数なら (y, x) の小さいほうを採って結果を決定的にする。
+/// 輪郭がまったく無いフレーム（暗転・一色）は、どこの相関も 0 で (0,0) に票が集まるので投票させない。
 pub fn detect(gpa: Allocator, frames: []const Image, reference: Image, th: Thresholds) DetectError!Detection {
     if (frames.len == 0) return error.NoFrames;
 
     const tmpl = try feature(gpa, reference);
     defer tmpl.deinit(gpa);
+    // フレームが一色かより先に、参照画像が一色かを言う（直すべきは参照画像）
+    if (std.mem.allEqual(f32, tmpl.px, tmpl.px[0])) return error.FlatTemplate;
 
     const Key = struct { x: usize, y: usize };
     const Acc = struct { count: usize = 0, psr: ?f64 = 0, margin: ?f64 = 0, peak: f64 = 0 };
     var votes: std.AutoArrayHashMapUnmanaged(Key, Acc) = .empty;
     defer votes.deinit(gpa);
 
+    var n_flat: usize = 0;
     for (frames) |f| {
         const plane = try feature(gpa, f);
         defer plane.deinit(gpa);
+        if (std.mem.allEqual(f32, plane.px, plane.px[0])) {
+            n_flat += 1;
+            continue;
+        }
         const m = try locate(gpa, plane, tmpl);
         const e = try votes.getOrPut(gpa, .{ .x = m.x, .y = m.y });
         if (!e.found_existing) e.value_ptr.* = .{};
@@ -412,21 +432,25 @@ pub fn detect(gpa: Allocator, frames: []const Image, reference: Image, th: Thres
         }
     }
 
+    const n_voted = frames.len - n_flat;
+    if (n_voted == 0) return error.AllFramesFlat;
     const n: f64 = @floatFromInt(best.count);
     var d: Detection = .{
         .x = best_key.x,
         .y = best_key.y,
         .width = reference.width,
         .height = reference.height,
-        .confidence = n / @as(f64, @floatFromInt(frames.len)),
+        .confidence = n / @as(f64, @floatFromInt(n_voted)),
         .psr = if (best.psr) |v| v / n else null,
         .margin = if (best.margin) |v| v / n else null,
         .peak = best.peak / n,
-        .frames_voted = frames.len,
+        .frames_voted = n_voted,
+        .frames_flat = n_flat,
         .reliable = false,
         .reasons = .initEmpty(),
     };
     if (d.confidence < th.min_confidence) d.reasons.insert(.low_confidence);
+    if (n_voted < min_frames_voted) d.reasons.insert(.few_frames);
     if (d.margin) |m| {
         if (m < th.min_margin) d.reasons.insert(.low_margin);
     } else d.reasons.insert(.unmeasured_margin);
@@ -598,4 +622,50 @@ test "roi: detect votes for the fixed position even when some frames miss" {
     try std.testing.expect(!strict.reliable);
     try std.testing.expect(strict.reasons.contains(.low_confidence));
     try std.testing.expect(!strict.reasons.contains(.low_margin));
+}
+
+test "roi: flat frames (black / fade) do not vote, so they cannot pull the ROI to (0,0)" {
+    const gpa = std.testing.allocator;
+    const w = 160;
+    const h = 120;
+    const mark = try randomPlane(gpa, 40, 24, 99);
+    defer mark.deinit(gpa);
+    const ref_rgb = try solidRgb(gpa, 40, 24, mark);
+    defer gpa.free(ref_rgb);
+    const ref: Image = .{ .width = 40, .height = 24, .rgb = ref_rgb };
+    const th: Thresholds = .{ .min_confidence = 0.4, .min_margin = 0.08, .min_psr = 0 };
+    // 15 フレーム。先頭 n_flat 枚は真っ黒、残りは違う背景の (100, 30) に同じ模様
+    var bufs: [15][]u8 = undefined;
+    var frames: [15]Image = undefined;
+    for (0..15) |i| {
+        const bg = try randomPlane(gpa, w, h, 1000 + i);
+        defer bg.deinit(gpa);
+        for (0..mark.h) |j| @memcpy(bg.px[(30 + j) * w + 100 ..][0..mark.w], mark.px[j * mark.w ..][0..mark.w]);
+        bufs[i] = try solidRgb(gpa, w, h, bg);
+        frames[i] = .{ .width = w, .height = h, .rgb = bufs[i] };
+    }
+    defer for (bufs) |b| gpa.free(b);
+    const black = try gpa.alloc(u8, w * h * 3);
+    defer gpa.free(black);
+    @memset(black, 0);
+
+    // 直す前は、8 枚以上が真っ黒だと (0,0)・reliable=false だった
+    for ([_]usize{ 8, 12 }) |n_flat| {
+        for (frames[0..n_flat]) |*f| f.rgb = black;
+        const d = try detect(gpa, &frames, ref, th);
+        try std.testing.expectEqual(@as(usize, 100), d.x);
+        try std.testing.expectEqual(@as(usize, 30), d.y);
+        try std.testing.expectEqual(@as(usize, 15 - n_flat), d.frames_voted);
+        try std.testing.expectEqual(n_flat, d.frames_flat);
+        try std.testing.expectEqual(@as(f64, 1), d.confidence);
+        try std.testing.expect(d.reliable);
+    }
+    // 投票したのが 2 枚だけなら、位置が合っていても reliable とは言わない
+    for (frames[0..13]) |*f| f.rgb = black;
+    const few = try detect(gpa, &frames, ref, th);
+    try std.testing.expect(!few.reliable);
+    try std.testing.expect(few.reasons.contains(.few_frames));
+    // すべて真っ黒なら位置を決めない
+    for (&frames) |*f| f.rgb = black;
+    try std.testing.expectError(error.AllFramesFlat, detect(gpa, &frames, ref, th));
 }

@@ -77,6 +77,8 @@ pub const InVideoError = error{
     /// 参照画像に輪郭が無い
     FlatReference,
     NoDecodableFrame,
+    /// 取り出したフレームがすべて一色（暗転など）
+    AllFramesFlat,
 } || video.Error;
 
 pub const InVideo = struct {
@@ -97,6 +99,7 @@ pub fn detectInVideo(arena: std.mem.Allocator, gpa: std.mem.Allocator, d: *video
     for (frames, images) |f, *img| img.* = .{ .width = f.width, .height = f.height, .rgb = f.rgb };
     const det = roi.detect(gpa, images, ref, th) catch |e| return switch (e) {
         error.FlatTemplate => error.FlatReference,
+        error.AllFramesFlat => error.AllFramesFlat,
         // 大きさは上で確かめているので、ここに来るのは内部の誤り
         error.TemplateLargerThanImage, error.TemplateTooSmall, error.NoFrames => unreachable,
         error.OutOfMemory => error.OutOfMemory,
@@ -111,6 +114,7 @@ pub fn describeProblem(w: *Io.Writer, e: InVideoError, ref: roi.Image, info: vid
         error.ReferenceTooSmall => try w.print("the reference ({d}x{d}) is too small; each side needs at least {d} px. Cut it larger, with some margin around the watermark.", .{ ref.width, ref.height, roi.min_template_side }),
         error.FlatReference => try w.writeAll("the reference has no edges to match (it is a flat color). Cut a region that contains the watermark."),
         error.NoDecodableFrame => try w.writeAll("the video has no decodable frame"),
+        error.AllFramesFlat => try w.writeAll("every sampled frame is a flat color (black or fade), so there is nothing to match. Try more frames (--frames)."),
         else => |ve| try w.print("could not decode the video: {s}", .{video.describe(@errorCast(ve))}),
     }
 }
@@ -121,6 +125,7 @@ pub fn explain(r: roi.Reason) []const u8 {
         .low_margin => "another place matches almost as well (margin below --min-margin)",
         .low_psr => "the peak does not stand out from the rest (PSR below --min-psr)",
         .unmeasured_margin => "the reference is (almost) as large as the video, so no other position could be compared",
+        .few_frames => "too few frames had any edges to vote with (the rest are a flat color, e.g. black)",
     };
 }
 
@@ -130,7 +135,7 @@ pub fn writeJson(w: *Io.Writer, d: roi.Detection) Io.Writer.Error!void {
     if (d.psr) |v| try w.print("{d:.1}", .{v}) else try w.writeAll("null");
     try w.writeAll(",\"margin\":");
     if (d.margin) |v| try w.print("{d:.3}", .{v}) else try w.writeAll("null");
-    try w.print(",\"peak\":{d:.3},\"frames_voted\":{d},\"reliable\":{},\"reasons\":[", .{ d.peak, d.frames_voted, d.reliable });
+    try w.print(",\"peak\":{d:.3},\"frames_voted\":{d},\"frames_flat\":{d},\"reliable\":{},\"reasons\":[", .{ d.peak, d.frames_voted, d.frames_flat, d.reliable });
     var it = d.reasons.iterator();
     var first = true;
     while (it.next()) |r| {
@@ -192,28 +197,28 @@ test "detect_roi: writeJson" {
     var buf: [512]u8 = undefined;
     var w: Io.Writer = .fixed(&buf);
     var reasons: std.EnumSet(roi.Reason) = .initEmpty();
-    try writeJson(&w, .{ .x = 493, .y = 5, .width = 142, .height = 77, .confidence = 1, .psr = 19.54, .margin = 0.4123, .peak = 0.87, .frames_voted = 15, .reliable = true, .reasons = reasons });
+    try writeJson(&w, .{ .x = 493, .y = 5, .width = 142, .height = 77, .confidence = 1, .psr = 19.54, .margin = 0.4123, .peak = 0.87, .frames_voted = 15, .frames_flat = 0, .reliable = true, .reasons = reasons });
     try std.testing.expectEqualStrings(
-        \\{"x":493,"y":5,"width":142,"height":77,"confidence":1.000,"psr":19.5,"margin":0.412,"peak":0.870,"frames_voted":15,"reliable":true,"reasons":[]}
+        \\{"x":493,"y":5,"width":142,"height":77,"confidence":1.000,"psr":19.5,"margin":0.412,"peak":0.870,"frames_voted":15,"frames_flat":0,"reliable":true,"reasons":[]}
         \\
     , w.buffered());
 
     reasons.insert(.low_margin);
     reasons.insert(.low_confidence);
     w = .fixed(&buf);
-    try writeJson(&w, .{ .x = 0, .y = 0, .width = 20, .height = 20, .confidence = 0.2, .psr = 3, .margin = 0.01, .peak = 0.3, .frames_voted = 5, .reliable = false, .reasons = reasons });
+    try writeJson(&w, .{ .x = 0, .y = 0, .width = 20, .height = 20, .confidence = 0.2, .psr = 3, .margin = 0.01, .peak = 0.3, .frames_voted = 5, .frames_flat = 0, .reliable = false, .reasons = reasons });
     try std.testing.expect(std.mem.endsWith(u8, w.buffered(), "\"reliable\":false,\"reasons\":[\"low_confidence\",\"low_margin\"]}\n"));
 
     // 測れなかった値は JSON の null にする（inf は JSON ではない）
     w = .fixed(&buf);
-    try writeJson(&w, .{ .x = 0, .y = 0, .width = 20, .height = 20, .confidence = 1, .psr = null, .margin = null, .peak = 0.5, .frames_voted = 1, .reliable = false, .reasons = .initOne(.unmeasured_margin) });
+    try writeJson(&w, .{ .x = 0, .y = 0, .width = 20, .height = 20, .confidence = 1, .psr = null, .margin = null, .peak = 0.5, .frames_voted = 1, .frames_flat = 0, .reliable = false, .reasons = .initOne(.unmeasured_margin) });
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "\"psr\":null,\"margin\":null,") != null);
 }
 
 test "detect_roi: drawRect leaves the inside untouched and clips at the edges" {
     var rgb = [_]u8{0} ** (6 * 5 * 3);
     // (0,0) 3x2 の矩形。枠の左と上は画面外に出る
-    drawRect(&rgb, 6, 5, .{ .x = 0, .y = 0, .width = 3, .height = 2, .confidence = 0, .psr = 0, .margin = 0, .peak = 0, .frames_voted = 0, .reliable = true, .reasons = .initEmpty() }, .{ 9, 9, 9 }, 1);
+    drawRect(&rgb, 6, 5, .{ .x = 0, .y = 0, .width = 3, .height = 2, .confidence = 0, .psr = 0, .margin = 0, .peak = 0, .frames_voted = 0, .frames_flat = 0, .reliable = true, .reasons = .initEmpty() }, .{ 9, 9, 9 }, 1);
     const at = struct {
         fn f(buf: []const u8, x: usize, y: usize) u8 {
             return buf[(y * 6 + x) * 3];

@@ -27,6 +27,8 @@
 | ROI | 同じ模様が 2 か所にあると margin が 0 近くに落ちる。PSR はほとんど落ちない | test `"roi: an exact duplicate drives margin to zero, while PSR stays high"` |
 | ROI | 輪郭の無い参照画像はエラー。比べる相手の位置が無いときは margin / PSR を null にし、reliable と言わない | test `"roi: a flat reference is rejected, and a search with no other position cannot be reliable"`、`build.zig` の `cli_detect_flat_ref` |
 | ROI | 複数フレームで投票し、最頻位置と得票率を返す。閾値を下回れば理由付きで reliable=false | test `"roi: detect votes for the fixed position even when some frames miss"` |
+| ROI | 輪郭がまったく無いフレーム（暗転・一色）は投票しない（得票率の分母にも入れない）。投票したフレームが 3 枚未満なら reliable=false（`few_frames`）、すべて一色なら位置を返さずエラー。直す前は、15 枚中 8 枚以上が真っ黒だと (0,0) に票が集まった | test `"roi: flat frames (black / fade) do not vote, so they cannot pull the ROI to (0,0)"` |
+| restore | `--roi` の JSON が `reliable: false` なら、理由を言って書き始める前に止める（`--unreliable-roi use` で進める。reliable の無い JSON は `--rect` と同じ）。GUI の E も、reliable でない ROI は書き出さない | `zig build test` の `cli_restore_unreliable_roi`、`cli_restore_unreliable_roi_use` |
 | CLI | `vrestore detect-roi --ref <image> <video>` が JSON 1 行を出す。`--debug-dir` で `detection.json` / `frame-overlay.png` / `roi-crop.png` も書く | `src/detect_roi.zig` の test `"detect_roi: writeJson"`、`"detect_roi: drawRect leaves the inside untouched and clips at the edges"`。画像の中身は目視（下記） |
 | CLI | 読めない参照画像は、何が悪いかを stderr に出して終了コード 1 | `build.zig` の `cli_detect_bad_ref` |
 | ROI（合成 E2E） | 既知の位置に焼いたウォーターマークを、yuv420p にエンコードした動画から `dx=0, dy=0, IoU=1, reliable=true` で見つける（背景のパン・毎フレーム変わる背景・滑らかな背景、crf 16〜35、不透明度 0.35〜1、余白なしの参照、一部だけの参照） | `zig build e2e` の `roi check pan-full` `pan-faint-crf35` `cut-full` `flat-full` `pan-tight` `pan-part` |
@@ -100,17 +102,18 @@
 **出力（JSON 1 行）:**
 
 ```json
-{"x":493,"y":5,"width":142,"height":77,"confidence":1.000,"psr":12.9,"margin":0.552,"peak":0.949,"frames_voted":15,"reliable":true,"reasons":[]}
+{"x":493,"y":5,"width":142,"height":77,"confidence":1.000,"psr":12.9,"margin":0.552,"peak":0.949,"frames_voted":15,"frames_flat":0,"reliable":true,"reasons":[]}
 ```
 
 | キー | 意味 |
 |---|---|
-| `confidence` | 投票での最頻位置の得票率 |
+| `confidence` | 投票での最頻位置の得票率（分母は投票したフレーム） |
+| `frames_voted` / `frames_flat` | 投票したフレームの数 / 輪郭がまったく無く投票しなかったフレームの数 |
 | `margin` | その位置の相関と、それ以外で最も良い位置の相関の差（最頻位置に投票したフレームの平均）。測れないときは `null` |
 | `psr` | 相関のピークの突出度（同上）。**判定には使わない**、診断用 |
 | `peak` | 相関 (ZNCC) の値（同上） |
-| `reliable` | `confidence >= 0.4` かつ `margin >= 0.08`。閾値の根拠は §4、PSR を使わない理由は [ADR 0003](adr/0003-reliable-is-decided-by-vote-ratio-and-margin-not-psr.md)（⚠ 暫定。判定方式は見直し中） |
-| `reasons` | reliable=false の理由: `low_confidence` / `low_margin` / `low_psr`（`--min-psr` を与えたときだけ）/ `unmeasured_margin` |
+| `reliable` | `confidence >= 0.4` かつ `margin >= 0.08` かつ投票したフレームが 3 枚以上。閾値の根拠は §4、PSR を使わない理由は [ADR 0003](adr/0003-reliable-is-decided-by-vote-ratio-and-margin-not-psr.md)（⚠ 暫定。判定方式は見直し中） |
+| `reasons` | reliable=false の理由: `low_confidence` / `low_margin` / `low_psr`（`--min-psr` を与えたときだけ）/ `unmeasured_margin` / `few_frames` |
 
 **デバッグ出力（`--debug-dir <dir>`）:** `detection.json`（stdout と同じ）、`frame-overlay.png`（投票に使った
 1 枚目のフレームに検出矩形の外枠を描く。reliable なら赤、そうでなければ黄）、`roi-crop.png`（同じフレームから
