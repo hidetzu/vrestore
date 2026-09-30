@@ -12,14 +12,16 @@ const provenance = @import("provenance.zig");
 const motion = @import("motion.zig");
 const spatial = @import("spatial.zig");
 const wmask = @import("wmask.zig");
+const wgrad = @import("wgrad.zig");
 const mp4 = @import("mp4.zig");
 const stabilize = @import("stabilize.zig");
 const debug_view = @import("debug_view.zig");
 const local_temporal = @import("local_temporal.zig");
 
-/// ROI の中でウォーターマークの画素だけを隠れている扱いにするか（wmask.zig）。none なら ROI 全体を隠す。
-/// ⚠ 較正は docs/SPEC.md §4、決定は docs/adr/0010
-pub const MaskMode = enum { none, auto };
+/// ROI の中でウォーターマークの画素だけを隠れている扱いにするか。none なら ROI 全体を隠す。
+/// auto は変わりにくさ（wmask.zig、docs/adr/0010・0011）、gradient は勾配の時間方向の中央値（wgrad.zig、docs/adr/0019）。
+/// ⚠ 較正は docs/SPEC.md §4
+pub const MaskMode = enum { none, auto, gradient };
 pub const progress_every = 15;
 
 /// --out の MP4 に元の音声を入れるか
@@ -27,6 +29,8 @@ pub const AudioMode = enum { copy, none };
 pub const default_mask: MaskMode = .none;
 /// マスクを推定するときに動画全体から取るフレーム数
 pub const mask_frames = 60;
+/// --mask gradient で動画全体から取るフレーム数。背景の勾配が打ち消し合うには多いほどよい（5 分の実写で 150 枚、約 20 秒）
+pub const gradient_frames = 150;
 /// マスクを推定して埋める範囲は、ROI を上下左右にこれだけ広げたもの（動画の端で止める）。指定した範囲が
 /// ウォーターマークより少し狭くても、はみ出した文字の端を隠せる。ウォーターマークでない画素は入力のまま残る。
 /// Temporal は広げない: 広げると、背景がより遠くまで動かないと見えないので戻せる画素が減る
@@ -105,6 +109,13 @@ pub const Args = struct {
     mask: MaskMode = default_mask,
     max_ring_diff: ?f64 = default_max_ring_diff,
     temporal: temporal.Mode = default_temporal,
+    /// 使ったマスク（alpha）を、動画と同じ大きさのグレーの PNG に書く。--mask-image にそのまま渡せる
+    mask_out: ?[]const u8 = null,
+    /// 先頭のこの枚数だけ復元して止める（マスクは動画全体から推定する）。null なら全部
+    max_frames: ?u64 = null,
+    /// 外から与えるマスク（動画と同じ大きさのグレーの画像。値がそのまま alpha、0 = 元のまま、255 = 置き換え）。
+    /// 与えると --mask auto の推定の代わりに使う。見るのは ROI の周り `mask_margin` px まで
+    mask_image: ?[]const u8 = null,
     /// --temporal auto のとき、局所の optical flow の候補も試すか（local_temporal.zig、ADR 0018）
     local_flow: bool = true,
     /// --roi の JSON が reliable: false でも進めるか。既定は理由を言って止める（違う場所を全フレーム書き換えないため）
@@ -149,27 +160,66 @@ pub fn recoverInWindow(gpa: std.mem.Allocator, model: MotionModel, fill: spatial
     return fillAndTally(gpa, fill, hidden, t, out, frames[target].width, frames[target].height, prov, roi);
 }
 
-/// 動画全体から `mask_frames` 枚を取り、ROI の中のウォーターマークの画素を見分ける。`d` は読む位置が変わる
-/// `roi` は推定する範囲（マスクの範囲）、`inner` はその中の本来の ROI（見分けられなかったときに使う）
-pub fn estimateMask(gpa: std.mem.Allocator, d: *video.Decoder, roi: temporal.Rect, inner: temporal.Rect) !wmask.Estimate {
+/// 外から与えたマスクの画像を、`area`（ROI の周り）の alpha と隠す画素にする。画像の R を alpha として読む
+fn loadMaskImage(gpa: std.mem.Allocator, path: [:0]const u8, area: temporal.Rect, w: u32, h: u32) !wmask.Estimate {
+    const img = try video.loadImage(gpa, path);
+    defer gpa.free(img.rgb);
+    if (img.width != w or img.height != h) return error.SizeMismatch;
+    const n = @as(usize, area.w) * area.h;
+    const hidden = try gpa.alloc(bool, n);
+    errdefer gpa.free(hidden);
+    const alpha = try gpa.alloc(u8, n);
+    var count: usize = 0;
+    for (0..area.h) |yy| for (0..area.w) |xx| {
+        const a = img.rgb[((area.y + yy) * w + area.x + xx) * 3];
+        alpha[yy * area.w + xx] = a;
+        hidden[yy * area.w + xx] = a > 0;
+        if (a > 0) count += 1;
+    };
+    return .{ .hidden = hidden, .alpha = alpha, .accepted = true, .fraction = @as(f32, @floatFromInt(count)) / @as(f32, @floatFromInt(n)), .threshold = 0, .inside_mad = 0, .outside_mad = 0 };
+}
+
+/// 動画全体から等間隔に `n` 枚取り、`area` を切り出して返す。全画面を溜めない（1080p で 150 枚なら約 900 MB になる）。
+/// `d` は読む位置が変わる
+fn sampleCrops(arena: std.mem.Allocator, d: *video.Decoder, n: usize, area: temporal.Rect) ![][]u8 {
+    var out: std.ArrayList([]u8) = .empty;
+    const buf = try arena.alloc(u8, d.frameBytes());
+    const row = @as(usize, area.w) * 3;
+    const duration = d.info.duration_sec;
+    for (0..n) |i| {
+        // video.sampleFrames と同じ時刻（末尾ぎりぎりは尺の誤差で空振りするので少し内側に寄せる）
+        if (duration) |dur| try d.seek(dur * 0.98 * @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(n)));
+        const f = try d.next(buf) orelse {
+            if (duration == null) break;
+            continue;
+        };
+        const c = try arena.alloc(u8, row * area.h);
+        for (0..area.h) |j| @memcpy(c[j * row ..][0..row], f.rgb[((area.y + j) * f.width + area.x) * 3 ..][0..row]);
+        try out.append(arena, c);
+    }
+    return out.items;
+}
+
+/// ROI の中でウォーターマークの画素を見分ける。`area` は推定する範囲（マスクの範囲）、`inner` はその中の本来の ROI
+/// （見分けられなかったときに使う）。auto は変わりにくさ（wmask.zig、`mask_frames` 枚）、gradient は勾配の時間方向の
+/// 中央値（wgrad.zig、`gradient_frames` 枚）。`d` は読む位置が変わる
+pub fn estimateMask(gpa: std.mem.Allocator, d: *video.Decoder, mode: MaskMode, area: temporal.Rect, inner: temporal.Rect) !wmask.Estimate {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const frames = try video.sampleFrames(arena, d, mask_frames);
-    const crops = try arena.alloc([]u8, frames.len);
-    const row = @as(usize, roi.w) * 3;
-    for (frames, crops) |f, *c| {
-        c.* = try arena.alloc(u8, row * roi.h);
-        for (0..roi.h) |j| @memcpy(c.*[j * row ..][0..row], f.rgb[((roi.y + j) * f.width + roi.x) * 3 ..][0..row]);
-    }
+    const crops = try sampleCrops(arena, d, if (mode == .gradient) gradient_frames else mask_frames, area);
+    const in: wmask.Rect = .{ .x = inner.x - area.x, .y = inner.y - area.y, .w = inner.w, .h = inner.h };
     if (crops.len < 3) {
         // フレームが足りず見分けられない。ROI 全体を隠す
-        const hidden = try gpa.alloc(bool, @as(usize, roi.w) * roi.h);
+        const hidden = try gpa.alloc(bool, @as(usize, area.w) * area.h);
         @memset(hidden, false);
-        for (inner.y - roi.y..inner.y - roi.y + inner.h) |y| @memset(hidden[y * roi.w + inner.x - roi.x ..][0..inner.w], true);
-        return .{ .hidden = hidden, .accepted = false, .fraction = 1, .threshold = 0, .inside_mad = 0, .outside_mad = 0 };
+        for (in.y..in.y + in.h) |y| @memset(hidden[y * area.w + in.x ..][0..in.w], true);
+        return .{ .hidden = hidden, .alpha = try wmask.alphaOf(gpa, hidden), .accepted = false, .fraction = 1, .threshold = 0, .inside_mad = 0, .outside_mad = 0 };
     }
-    return wmask.estimate(gpa, crops, roi.w, roi.h, .{ .inner = .{ .x = inner.x - roi.x, .y = inner.y - roi.y, .w = inner.w, .h = inner.h } });
+    return switch (mode) {
+        .gradient => (try wgrad.estimate(gpa, crops, area.w, area.h, .{ .inner = in })).estimate,
+        else => wmask.estimate(gpa, crops, area.w, area.h, .{ .inner = in }),
+    };
 }
 
 /// Temporal の後に残った unrecovered を振り分けて埋め、由来を数え直す。
@@ -196,8 +246,48 @@ fn fillAndTally(gpa: std.mem.Allocator, fill: spatial.Method, hidden: ?Hidden, t
     return tally;
 }
 
-/// マスク（wmask.zig）と、それが覆う範囲（ROI を `mask_margin` 広げたもの）
-pub const Hidden = struct { mask: []const bool, area: temporal.Rect };
+/// マスク（wmask.zig）と、それが覆う範囲（ROI を `mask_margin` 広げたもの）。
+/// `mask` は復元を作る画素、`alpha` はそのうちどれだけ置き換えるか（null ならすべて置き換える）
+pub const Hidden = struct { mask: []const bool, area: temporal.Rect, alpha: ?[]const u8 = null };
+
+/// 復元の層（`out`、Temporal・埋め・落ち着かせの後）を、元のフレーム（`original`）と alpha で合成する（元のフレーム +
+/// 復元の層 + alpha。途中の alpha は今は外から与えたマスクだけが持つ）。
+/// 由来（provenance）は「どう作ったか」なので変えない。Temporal で戻した実画素は混ぜない（元の画素はウォーターマークのにじみを含む）。
+/// 混ぜた画素の数を返す
+fn blendWithOriginal(hidden: Hidden, out: []u8, original: []const u8, w: u32, prov: []const provenance.Provenance) usize {
+    const alpha = hidden.alpha orelse return 0;
+    const area = hidden.area;
+    var n: usize = 0;
+    for (0..area.h) |yy| for (0..area.w) |xx| {
+        const a = alpha[yy * area.w + xx];
+        if (a == 0 or a == 255) continue;
+        const i = (area.y + yy) * w + area.x + xx;
+        if (prov[i] != .spatial_inpainted and prov[i] != .unrecovered) continue;
+        const af: f32 = @as(f32, @floatFromInt(a)) / 255;
+        for (0..3) |c| {
+            const r: f32 = @floatFromInt(out[i * 3 + c]);
+            const o: f32 = @floatFromInt(original[i * 3 + c]);
+            out[i * 3 + c] = @intFromFloat(@round(af * r + (1 - af) * o));
+        }
+        n += 1;
+    };
+    return n;
+}
+
+test "blendWithOriginal: mixes only the guessed pixels, by alpha, and leaves real and original pixels alone" {
+    const w = 4;
+    var out = [_]u8{200} ** (w * 1 * 3);
+    const original = [_]u8{100} ** (w * 1 * 3);
+    const prov = [_]provenance.Provenance{ .spatial_inpainted, .spatial_inpainted, .temporal_real, .spatial_inpainted };
+    const mask = [_]bool{ true, true, true, true };
+    const alpha = [_]u8{ 255, 128, 128, 0 };
+    const n = blendWithOriginal(.{ .mask = &mask, .area = .{ .x = 0, .y = 0, .w = w, .h = 1 }, .alpha = &alpha }, &out, &original, w, &prov);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(@as(u8, 200), out[0]); // alpha 255: 復元のまま
+    try std.testing.expectEqual(@as(u8, 150), out[3]); // 128 / 255 で混ぜる: 100 + 100 x 0.502
+    try std.testing.expectEqual(@as(u8, 200), out[6]); // 別フレームの実画素は混ぜない
+    try std.testing.expectEqual(@as(u8, 200), out[9]); // alpha 0 は、埋めた範囲の外なので呼ぶ側で original のまま（ここでは触らない）
+}
 
 test "fillAndTally: fills the watermark pixels outside the ROI too, and keeps the rest as input" {
     // 8 x 6 の画像、ROI は (2,2) 3 x 2、マスクの範囲は (1,1) 5 x 4。
@@ -341,14 +431,38 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
     // マスク: 別に開いた decoder で動画全体から取る（流す方の読む位置を変えない）
     var mask_est: ?wmask.Estimate = null;
     defer if (mask_est) |m| m.deinit(gpa);
-    if (args.mask == .auto) {
+    const mask_mode: MaskMode = if (args.mask_image != null) .auto else args.mask;
+    if (args.mask_image) |mp| {
+        mask_est = loadMaskImage(gpa, try arena.dupeZ(u8, mp), maskArea(.auto, rect, w, h), w, h) catch |e| {
+            try err.print("vrestore: could not use the mask image '{s}': {s}\n", .{ mp, if (e == error.SizeMismatch) "it must be the same size as the video" else @errorName(e) });
+            return 1;
+        };
+    } else if (args.mask != .none) {
         var d2 = try video.Decoder.open(try arena.dupeZ(u8, args.video));
         defer d2.close();
-        mask_est = try estimateMask(gpa, &d2, maskArea(args.mask, rect, w, h), rect);
+        mask_est = try estimateMask(gpa, &d2, mask_mode, maskArea(mask_mode, rect, w, h), rect);
     }
     // 見分けられなかったときは ROI 全体を隠す（広げた範囲は使わない）
     // 見分けられなかったときも、ROI の中すべてと、周りの帯のはみ出した縁を隠すマスクになっている（wmask.Params.inner）
-    const hidden: ?Hidden = if (mask_est) |m| .{ .mask = m.hidden, .area = maskArea(args.mask, rect, w, h) } else null;
+    if (args.mask_out) |mo| {
+        const png_rgb = try arena.alloc(u8, @as(usize, w) * h * 3);
+        @memset(png_rgb, 0);
+        if (mask_est) |m| {
+            const area = maskArea(mask_mode, rect, w, h);
+            for (0..area.h) |yy| for (0..area.w) |xx| {
+                const a = m.alpha[yy * area.w + xx];
+                png_rgb[((area.y + yy) * w + area.x + xx) * 3 ..][0..3].* = .{ a, a, a };
+            };
+        }
+        const png = try video.encodePng(gpa, w, h, png_rgb);
+        defer gpa.free(png);
+        cwd.writeFile(io, .{ .sub_path = mo, .data = png }) catch |e| {
+            try err.print("vrestore: could not write '{s}': {s}\n", .{ mo, @errorName(e) });
+            return 1;
+        };
+    }
+    const hidden: ?Hidden = if (mask_est) |m| .{ .mask = m.hidden, .area = maskArea(mask_mode, rect, w, h), .alpha = if (args.mask_image != null) m.alpha else null } else null;
+    var n_blended: u64 = 0;
 
     // 画素ごとの借りた / 借りなかった理由（JSON の集計と debug の可視化）
     const detail = try arena.alloc(temporal.Detail, @as(usize, rect.w) * rect.h);
@@ -477,6 +591,8 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
             if (stable == null) stable = try stabilize.State.init(gpa, .{ .x = area.x, .y = area.y, .w = area.w, .h = area.h }, w, h);
             stable.?.apply(out_rgb, target_rgb, w, prov, .{});
         }
+        // 復元の層を、元のフレームと alpha で合成する（soft mask。二値なら何もしない）
+        if (hidden) |m| n_blended += blendWithOriginal(m, out_rgb, target_rgb, w, prov);
         total.merge(r);
         coverage_min = @min(coverage_min, r.coverage());
 
@@ -503,6 +619,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
             }
         }
         next_target += 1;
+        if (args.max_frames) |mf| if (next_target >= mf) break;
 
         // 次の target の窓から外れたフレームを捨てる
         while (lo + keep < next_target and slots.items.len > 0) {
@@ -542,9 +659,9 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
         const ls = local_stats;
         try summary.print(",\"local_flow\":{{\"frames\":{d},\"gated_light\":{d},\"gated_motion\":{d},\"gated_cooldown\":{d},\"decoy_early\":{d},\"decoy_failed\":{d},\"decoy_accepted\":{d},\"decoy_wrong\":{d},\"accepted\":{d},\"rejected\":{d},\"pairs_computed\":{d}}}", .{ ls.frames, ls.gated_light, ls.gated_motion, ls.gated_cooldown, ls.decoy_early, ls.decoy_failed, ls.decoy_accepted, ls.decoy_wrong, ls.accepted, ls.rejected, ls.pairs_computed });
     } else if (args.temporal == .auto and args.local_flow) try summary.writeAll(",\"local_flow\":\"no room for the decoy\"");
-    try summary.print(",\"mask\":\"{s}\"", .{@tagName(args.mask)});
+    if (args.mask_image != null) try summary.writeAll(",\"mask\":\"image\"") else try summary.print(",\"mask\":\"{s}\"", .{@tagName(args.mask)});
     if (stable) |st| try summary.print(",\"stable_fill\":{{\"blended\":{d},\"reset\":{d}}}", .{ st.blended, st.reset });
-    if (mask_est) |m| try summary.print(",\"mask_accepted\":{},\"mask_fraction\":{d:.4},\"mask_inside_mad\":{d:.2},\"mask_outside_mad\":{d:.2}", .{ m.accepted, m.fraction, m.inside_mad, m.outside_mad });
+    if (mask_est) |m| try summary.print(",\"mask_accepted\":{},\"mask_fraction\":{d:.4},\"mask_inside_mad\":{d:.2},\"mask_outside_mad\":{d:.2},\"mask_blended\":{d}", .{ m.accepted, m.fraction, m.inside_mad, m.outside_mad, n_blended });
     if (mp4_w) |*m| {
         try summary.print(",\"out\":{{\"frames\":{d},\"crf\":{d},\"audio\":", .{ m.frames, args.crf });
         if (m.audioPackets()) |n| try summary.print("{{\"copied_packets\":{d}}}", .{n}) else try summary.print("\"{s}\"", .{if (args.audio == .none) "none" else "absent"});

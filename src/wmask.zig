@@ -38,8 +38,11 @@ pub const Params = struct {
 };
 
 pub const Estimate = struct {
-    /// ROI の画素ごと（行優先、w x h）。true = ウォーターマーク（隠れている）
+    /// ROI の画素ごと（行優先、w x h）。true = ウォーターマーク（隠れている）。復元を作る範囲（alpha > 0）
     hidden: []bool,
+    /// 画素ごとに、復元でどれだけ置き換えるか（0 = 元の画素のまま、255 = 復元の画素だけ）。`hidden` と同じ並び。
+    /// この推定は二値（隠す画素が 255）。途中の値は、外から与えたマスク（restore --mask-image）が持つ
+    alpha: []u8,
     /// マスクを使うか。false なら見分けられなかったので ROI 全体を隠す（`hidden` はすべて true）
     accepted: bool,
     /// 隠す画素の割合（広げた後）
@@ -51,6 +54,7 @@ pub const Estimate = struct {
 
     pub fn deinit(e: Estimate, gpa: std.mem.Allocator) void {
         gpa.free(e.hidden);
+        gpa.free(e.alpha);
     }
 };
 
@@ -112,8 +116,10 @@ pub fn estimate(gpa: std.mem.Allocator, crops: []const []const u8, w: u32, h: u3
             for (r.y..r.y + r.h) |y| @memset(hidden[y * w + r.x ..][0..r.w], true);
         } else @memset(hidden, true);
     }
+    const alpha = try alphaOf(gpa, hidden);
     return .{
         .hidden = hidden,
+        .alpha = alpha,
         .accepted = accepted,
         .fraction = fractionOf(hidden),
         .threshold = th,
@@ -223,8 +229,15 @@ fn splitMedians(gpa: std.mem.Allocator, mad: []const f32, hidden: []const bool) 
     return .{ if (a.items.len > 0) median(a.items) else 0, if (b.items.len > 0) median(b.items) else 0 };
 }
 
+/// 隠す画素は 255（復元で置き換える）、それ以外は 0（元の画素のまま）
+pub fn alphaOf(gpa: std.mem.Allocator, hidden: []const bool) ![]u8 {
+    const alpha = try gpa.alloc(u8, hidden.len);
+    for (alpha, hidden) |*a, hd| a.* = if (hd) 255 else 0;
+    return alpha;
+}
+
 /// true の画素を上下左右斜めに `r` px 広げる
-fn dilate(gpa: std.mem.Allocator, m: []bool, w: u32, h: u32, r: u32) !void {
+pub fn dilate(gpa: std.mem.Allocator, m: []bool, w: u32, h: u32, r: u32) !void {
     if (r == 0) return;
     const src = try gpa.dupe(bool, m);
     defer gpa.free(src);
