@@ -5,11 +5,13 @@
 //! 次をすべて満たした画素だけを戻したと数える（どれかを緩めると、実写で外れが 12% 台に増えた。SPEC §4）:
 //!
 //! 1. 大きな局所の動き: ROI の周りの帯の輝度の変化（軽い関門）と、flow の大きさ（90 パーセンタイルの平均 ≥ 1.5 px/フレーム）
-//! 2. 鎖: 前後それぞれ最大 45 フレーム、一歩ごとに往復のずれ ≤ 1 px（合わなくなったらその先はたどらない）
+//! 2. 鎖: 前後それぞれ最大 45 フレーム、一歩ごとに往復のずれ ≤ 0.5 px（合わなくなったらその先はたどらない）。画面の端から 8 px 以内には入らない
 //! 3. 借りる元: ウォーターマーク（マスクで隠した画素、無ければ ROI + 8 px、temporal.Guard）の外で、flow を求めた範囲の中
-//! 4. 候補: 3 枚以上、過去と未来の両方を含み、中央値からのずれ（R/G/B の最大）≤ 12。値は中央値
-//! 5. 実行時の疑似チェック: ROI の隣の、ウォーターマークの無い場所（おとり）でも同じことをし、採った画素を実際の入力と比べる。
-//!    50 画素以上を採り、外れ（誤差 > 32）が 1% 以下のフレームでだけ、本物の ROI の候補を採る
+//! 4. 候補: 5 枚以上、過去と未来の両方を含み、中央値からのずれ（R/G/B の最大）≤ 8。値は中央値
+//! 5. 実行時の疑似チェック: ROI の隣の、ウォーターマークの無い 2 か所（おとり）でも同じことをし、採った画素を実際の入力と比べる。
+//!    どちらのおとりでも 100 画素以上を採り、外れ（誤差 > 32）が 0.5% 以下のフレームでだけ、本物の ROI の候補を採る
+//!
+//! 最初の条件（3 枚・ずれ 12・往復 1 px・おとり 1 か所で外れ 1%）では、実写の疑似チェックで画面の端の位置の外れが 11.8% だった（SPEC §4）
 //!
 //! この module は FFmpeg と SDL に依存しない。
 
@@ -24,15 +26,19 @@ pub const Rect = temporal.Rect;
 pub const Params = struct {
     /// 前後にたどるフレーム数の上限
     k: u32 = 45,
-    min_candidates: u32 = 3,
-    max_spread: f32 = 12,
-    max_fb: f32 = 1,
+    min_candidates: u32 = 5,
+    max_spread: f32 = 8,
+    max_fb: f32 = 0.5,
+    /// 画面の端からこの px 以内の位置は借りない（端では flow の窓が切れて当てにならない）
+    border: u32 = 8,
     /// 軽い関門: 帯の輝度の変化の平均（前後 15 フレーム）
     min_ring_change: f32 = 3,
     /// flow の関門: 帯の flow の大きさの 90 パーセンタイルの、前後 k フレームの平均（px/フレーム）
     min_motion: f32 = 1.5,
-    decoy_min_accepted: u32 = 50,
-    decoy_max_wrong: f32 = 0.01,
+    /// おとりの数（すべてが合格したフレームでだけ本物の候補を採る）
+    decoys: u32 = 2,
+    decoy_min_accepted: u32 = 100,
+    decoy_max_wrong: f32 = 0.005,
     wrong_error: f32 = 32,
     flow: flow.Params = .{},
 };
@@ -71,7 +77,8 @@ pub const Session = struct {
     gpa: std.mem.Allocator,
     region: flow.Region,
     roi: Rect,
-    decoy: Rect,
+    decoy: [2]Rect,
+    n_decoys: u32,
     /// 範囲の画素ごと: ウォーターマーク（借りない、本物の ROI の穴）
     wm: []bool,
     /// 範囲の画素ごと: おとり + 3 px（おとりの鎖では借りない）
@@ -96,19 +103,31 @@ pub const Session = struct {
             .{ @as(i64, a.x) + a.w + gap, roi.y },
             .{ @as(i64, a.x) - gap - roi.w, roi.y },
         };
-        var decoy: ?Rect = null;
+        var decoys: [2]Rect = undefined;
+        var nd: u32 = 0;
         for (cands) |c| {
+            if (nd == @min(p.decoys, 2)) break;
             const xy = c.?;
             if (xy[0] < 3 or xy[1] < 3 or xy[0] + roi.w + 3 > frame_w or xy[1] + roi.h + 3 > frame_h) continue;
-            decoy = .{ .x = @intCast(xy[0]), .y = @intCast(xy[1]), .w = roi.w, .h = roi.h };
-            break;
+            decoys[nd] = .{ .x = @intCast(xy[0]), .y = @intCast(xy[1]), .w = roi.w, .h = roi.h };
+            nd += 1;
         }
-        const dcy = decoy orelse return null;
+        if (nd < p.decoys) return null;
         const margin: u32 = 24;
-        const x0 = @min(a.x, dcy.x) -| margin;
-        const y0 = @min(a.y, dcy.y) -| margin;
-        const x1 = @min(frame_w, @max(a.x + a.w, dcy.x + dcy.w) + margin);
-        const y1 = @min(frame_h, @max(a.y + a.h, dcy.y + dcy.h) + margin);
+        var bx0 = a.x;
+        var by0 = a.y;
+        var bx1 = a.x + a.w;
+        var by1 = a.y + a.h;
+        for (decoys[0..nd]) |dcy| {
+            bx0 = @min(bx0, dcy.x);
+            by0 = @min(by0, dcy.y);
+            bx1 = @max(bx1, dcy.x + dcy.w);
+            by1 = @max(by1, dcy.y + dcy.h);
+        }
+        const x0 = bx0 -| margin;
+        const y0 = by0 -| margin;
+        const x1 = @min(frame_w, bx1 + margin);
+        const y1 = @min(frame_h, by1 + margin);
         const region: flow.Region = .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
         const n = @as(usize, region.w) * region.h;
         const wm = try gpa.alloc(bool, n);
@@ -124,7 +143,10 @@ pub const Session = struct {
             const i = y * region.w + x;
             const in_roi = gx >= roi.x and gx < @as(i64, roi.x) + roi.w and gy >= roi.y and gy < @as(i64, roi.y) + roi.h;
             wm[i] = in_roi or guard.blocks(gx, gy);
-            dg[i] = gx >= @as(i64, dcy.x) - 3 and gx < @as(i64, dcy.x) + dcy.w + 3 and gy >= @as(i64, dcy.y) - 3 and gy < @as(i64, dcy.y) + dcy.h + 3;
+            dg[i] = false;
+            for (decoys[0..nd]) |dcy| {
+                if (gx >= @as(i64, dcy.x) - 3 and gx < @as(i64, dcy.x) + dcy.w + 3 and gy >= @as(i64, dcy.y) - 3 and gy < @as(i64, dcy.y) + dcy.h + 3) dg[i] = true;
+            }
             ignore[i] = wm[i] or dg[i];
         };
         // flow の窓（半径 p.flow.radius）がウォーターマーク・おとりにかかる画素も補う側に入れる
@@ -147,7 +169,7 @@ pub const Session = struct {
             }
             hole[y * region.w + x] = any;
         };
-        return .{ .gpa = gpa, .region = region, .roi = roi, .decoy = dcy, .wm = wm, .dg = dg, .ignore = ignore, .hole = hole, .frame_w = frame_w, .frame_h = frame_h, .p = p };
+        return .{ .gpa = gpa, .region = region, .roi = roi, .decoy = decoys, .n_decoys = nd, .wm = wm, .dg = dg, .ignore = ignore, .hole = hole, .frame_w = frame_w, .frame_h = frame_h, .p = p };
     }
 
     pub fn deinit(s: Session) void {
@@ -249,6 +271,11 @@ pub const Session = struct {
                 const nx = px + d[0];
                 const ny = py + d[1];
                 if (nx < 0 or ny < 0 or nx > rw - 1 or ny > rh - 1) break;
+                // 画面の端の近くは借りない
+                const gxf = nx + @as(f32, @floatFromInt(s.region.x));
+                const gyf = ny + @as(f32, @floatFromInt(s.region.y));
+                const bd: f32 = @floatFromInt(s.p.border);
+                if (gxf < bd or gyf < bd or gxf > @as(f32, @floatFromInt(s.frame_w)) - 1 - bd or gyf > @as(f32, @floatFromInt(s.frame_h)) - 1 - bd) break;
                 const e = g.sample(nx, ny);
                 if (std.math.hypot(nx + e[0] - px, ny + e[1] - py) > s.p.max_fb) break;
                 px = nx;
@@ -336,17 +363,26 @@ pub const Session = struct {
         var buf: [2 * 256]Candidate = undefined;
         // 3. おとりで確かめる
         const tf = frames[target];
-        for (s.decoy.y..s.decoy.y + s.decoy.h) |y| for (s.decoy.x..s.decoy.x + s.decoy.w) |x| {
-            const m = s.gather(frames, pairs, target, @intCast(x), @intCast(y), s.dg, &buf);
-            const v = s.decide(buf[0..m]) orelse continue;
-            st.decoy_accepted += 1;
-            const i = (y * s.frame_w + x) * 3;
-            var err: f32 = 0;
-            for (0..3) |c| err = @max(err, @abs(v[c] - @as(f32, @floatFromInt(tf[i + c]))));
-            if (err > s.p.wrong_error) st.decoy_wrong += 1;
-        };
-        const wrong_rate = if (st.decoy_accepted == 0) 1 else @as(f32, @floatFromInt(st.decoy_wrong)) / @as(f32, @floatFromInt(st.decoy_accepted));
-        if (st.decoy_accepted < s.p.decoy_min_accepted or wrong_rate > s.p.decoy_max_wrong) {
+        var all_pass = true;
+        for (s.decoy[0..s.n_decoys]) |dcy| {
+            var acc: u64 = 0;
+            var wrong: u64 = 0;
+            for (dcy.y..dcy.y + dcy.h) |y| for (dcy.x..dcy.x + dcy.w) |x| {
+                const m = s.gather(frames, pairs, target, @intCast(x), @intCast(y), s.dg, &buf);
+                const v = s.decide(buf[0..m]) orelse continue;
+                acc += 1;
+                const i = (y * s.frame_w + x) * 3;
+                var err: f32 = 0;
+                for (0..3) |c| err = @max(err, @abs(v[c] - @as(f32, @floatFromInt(tf[i + c]))));
+                if (err > s.p.wrong_error) wrong += 1;
+            };
+            st.decoy_accepted += acc;
+            st.decoy_wrong += wrong;
+            const rate = if (acc == 0) 1 else @as(f32, @floatFromInt(wrong)) / @as(f32, @floatFromInt(acc));
+            // どのおとりも合格すること
+            if (acc < s.p.decoy_min_accepted or rate > s.p.decoy_max_wrong) all_pass = false;
+        }
+        if (!all_pass) {
             st.decoy_failed = 1;
             return st;
         }
@@ -467,7 +503,8 @@ test "local_temporal: brings back the pixels of a large moving object from the f
     defer freeFrames(gpa, truth);
     const r = try runDisc(gpa, truth, .{ .x = 70, .y = 50, .w = 20, .h = 20 }, 15, .{ .k = 15, .min_ring_change = 0.5, .min_motion = 1.0, .decoy_min_accepted = 1 });
 
-    try std.testing.expect(r.stats.accepted > 100);
+    // 実測（今の条件）: 31 画素、正解との差は最大 2
+    try std.testing.expect(r.stats.accepted >= 20);
     try std.testing.expect(r.worst <= 32);
 }
 
