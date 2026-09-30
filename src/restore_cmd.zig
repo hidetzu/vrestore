@@ -107,6 +107,8 @@ pub const Args = struct {
     temporal: temporal.Mode = default_temporal,
     /// --temporal auto のとき、局所の optical flow の候補も試すか（local_temporal.zig、ADR 0018）
     local_flow: bool = true,
+    /// --roi の JSON が reliable: false でも進めるか。既定は理由を言って止める（違う場所を全フレーム書き換えないため）
+    use_unreliable_roi: bool = false,
     /// Temporal の debug の可視化の出力先（debug_view.zig）。.mp4 なら動画、それ以外はディレクトリに連番の PNG
     debug_out: ?[]const u8 = null,
     /// RGB24 の生フレームの出力先。"-" なら標準出力（そのとき集計は標準エラーへ）。空なら書かない
@@ -273,11 +275,18 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
             try err.print("vrestore: could not read '{s}': {s}\n", .{ path, @errorName(e) });
             return 1;
         };
-        const Roi = struct { x: u32, y: u32, width: u32, height: u32 };
+        // reliable が無い JSON（手で書いた範囲）は --rect と同じに扱う
+        const Roi = struct { x: u32, y: u32, width: u32, height: u32, reliable: ?bool = null, reasons: []const []const u8 = &.{} };
         const r = std.json.parseFromSliceLeaky(Roi, arena, data, .{ .ignore_unknown_fields = true }) catch {
             try err.print("vrestore: '{s}' is not a detect-roi JSON (needs x, y, width, height)\n", .{path});
             return 1;
         };
+        if (r.reliable == false and !args.use_unreliable_roi) {
+            try err.print("vrestore: the ROI in '{s}' is not reliable (", .{path});
+            for (r.reasons, 0..) |reason, i| try err.print("{s}{s}", .{ if (i > 0) ", " else "", reason });
+            try err.writeAll("), so it may not be where the watermark is. Check it (detect-roi --debug-dir) and detect again, or pass --unreliable-roi use to restore it anyway\n");
+            return 1;
+        }
         break :blk .{ .x = r.x, .y = r.y, .w = r.width, .h = r.height };
     };
 

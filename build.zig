@@ -95,6 +95,28 @@ pub fn build(b: *std.Build) void {
     cli_detect_flat_ref.addFileArg(steps_mp4);
     cli_detect_flat_ref.expectStdErrMatch("has no edges to match");
     cli_detect_flat_ref.expectExitCode(1);
+    // detect-roi が reliable: false と言った ROI では、restore は理由を言って止まる（違う場所を全フレーム書き換えない）。
+    // --unreliable-roi use なら進む
+    const unreliable_json = b.addWriteFiles().add("unreliable.json",
+        \\{"x":0,"y":0,"width":20,"height":20,"confidence":0.533,"reliable":false,"reasons":["low_margin","few_frames"]}
+        \\
+    );
+    const cli_unreliable = b.addRunArtifact(exe);
+    cli_unreliable.setName("cli_restore_unreliable_roi");
+    cli_unreliable.addArgs(&.{ "restore", "--raw", "-", "--roi" });
+    cli_unreliable.addFileArg(unreliable_json);
+    cli_unreliable.addFileArg(steps_mp4);
+    cli_unreliable.expectStdErrMatch("is not reliable (low_margin, few_frames)");
+    cli_unreliable.expectExitCode(1);
+    const cli_unreliable_use = b.addRunArtifact(exe);
+    cli_unreliable_use.setName("cli_restore_unreliable_roi_use");
+    cli_unreliable_use.addArgs(&.{ "restore", "--unreliable-roi", "use", "--raw" });
+    _ = cli_unreliable_use.addOutputFileArg("unreliable.rgb");
+    cli_unreliable_use.addArg("--roi");
+    cli_unreliable_use.addFileArg(unreliable_json);
+    cli_unreliable_use.addFileArg(steps_mp4);
+    _ = cli_unreliable_use.captureStdOut(.{});
+    cli_unreliable_use.expectExitCode(0);
     // 幅・高さが奇数の動画は H.264（4:2:0）に書き出せない。理由を言って、書き始める前に止まること
     const gen_odd = b.addSystemCommand(&.{ "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=320x180:r=10:d=0.5", "-vf", "scale=321:181,format=gbrp", "-c:v", "ffv1" });
     gen_odd.setName("generate odd.mkv");
@@ -154,6 +176,8 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&ramp_chk.step);
         test_step.dependOn(&rot_chk.step);
         test_step.dependOn(&cli_odd_out.step);
+        test_step.dependOn(&cli_unreliable.step);
+        test_step.dependOn(&cli_unreliable_use.step);
         test_step.dependOn(&cli_detect_bad_ref.step);
         test_step.dependOn(&cli_detect_flat_ref.step);
         test_step.dependOn(&cli_stdout_file.step);

@@ -222,6 +222,8 @@ const App = struct {
     fn startExport(app: *App, out_prefix: ?[]const u8) !void {
         if (app.job != null) return app.setProblem("already exporting (X: stop)", .{});
         const det = app.detection orelse return app.setProblem("detect the ROI first (Enter), then E", .{});
+        // CLI の restore も reliable: false の ROI では止まる（--unreliable-roi）。書き出す前に、ここで理由を見せる
+        if (!det.reliable) return app.setProblem("the ROI is NOT RELIABLE, so it is not exported. Select the watermark again (with some margin) and detect (Enter)", .{});
         var arena_state: std.heap.ArenaAllocator = .init(app.gpa);
         errdefer arena_state.deinit();
         const arena = arena_state.allocator();

@@ -31,6 +31,8 @@ const usage =
     \\      moved out from under it (Temporal Recovery). Writes every frame as an H.264 MP4 with the
     \\      original audio (--out) and/or as RGB24 raw frames (--raw); pixels it could not recover are
     \\      left as they were. Prints the recovery coverage as JSON.
+    \\      --unreliable-roi <s> stop (default): if the --roi JSON says reliable: false, say why and stop.
+    \\                          use: restore that ROI anyway
     \\      --crf <n>           H.264 quality for --out, 0-51, lower is better and larger (default 18)
     \\      --audio <a>         copy (put the original audio in --out as is, default) or none
     \\      --temporal <t>      auto (default): take a pixel from other frames only when the source is outside
@@ -205,6 +207,8 @@ fn parseRestore(args: []const []const u8) Command {
             if (out.crf > 51) return .{ .bad_arg = .{ .why = "--crf needs an integer from 0 to 51", .arg = v } };
         } else if (std.mem.eql(u8, a, "--temporal")) {
             out.temporal = std.meta.stringToEnum(temporal.Mode, v) orelse return .{ .bad_arg = .{ .why = "--temporal needs off, on or auto", .arg = v } };
+        } else if (std.mem.eql(u8, a, "--unreliable-roi")) {
+            out.use_unreliable_roi = if (std.mem.eql(u8, v, "stop")) false else if (std.mem.eql(u8, v, "use")) true else return .{ .bad_arg = .{ .why = "--unreliable-roi needs stop or use", .arg = v } };
         } else if (std.mem.eql(u8, a, "--local-flow")) {
             out.local_flow = if (std.mem.eql(u8, v, "on")) true else if (std.mem.eql(u8, v, "off")) false else return .{ .bad_arg = .{ .why = "--local-flow needs on or off", .arg = v } };
         } else if (std.mem.eql(u8, a, "--debug")) {
