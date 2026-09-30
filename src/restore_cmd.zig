@@ -366,11 +366,11 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
     const prov = try arena.alloc(provenance.Provenance, @as(usize, w) * h);
 
     // 局所の optical flow（auto のとき）。前後 k 枚を持つので、画面全体の方式の window より多く読む
-    const local_session: ?local_temporal.Session = if (args.temporal == .auto and args.local_flow)
+    var local_session: ?local_temporal.Session = if (args.temporal == .auto and args.local_flow)
         try local_temporal.Session.init(gpa, rect, temporalGuard(hidden, rect, args.temporal_guard, w, h), w, h, .{})
     else
         null;
-    defer if (local_session) |ls| ls.deinit();
+    defer if (local_session) |*ls| ls.deinit();
     var local_stats: local_temporal.Stats = .{};
     const keep: usize = if (local_session) |ls| @max(args.window, ls.p.k) else args.window;
     // pairs.items[i] / rings.items[i] は slots[i] と slots[i + 1] の flow（必要になったら求める）と帯の変化
@@ -448,7 +448,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
         defer track.deinit(gpa);
         const target_rgb = slots.items[next_target - lo].rgb;
         var t_r = temporal.recoverFrame(images, track, next_target - lo - g_first, rect, temporalGuard(hidden, rect, args.temporal_guard, w, h), .{ .mode = args.temporal, .max_ring_diff = args.max_ring_diff }, out_rgb, prov, detail);
-        if (local_session) |ls| {
+        if (local_session) |*ls| {
             // 画面全体の方式で戻せなかった画素だけに、局所の flow の候補を試す
             const frames_all = try gpa.alloc([]const u8, slots.items.len);
             defer gpa.free(frames_all);
@@ -531,7 +531,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
     try summary.print(",\"temporal\":\"{s}\",\"temporal_pixels\":{{\"accepted\":{d},\"rejected\":{d}}}", .{ @tagName(args.temporal), n_accepted, n_rejected });
     if (local_session != null) {
         const ls = local_stats;
-        try summary.print(",\"local_flow\":{{\"frames\":{d},\"gated_light\":{d},\"gated_motion\":{d},\"decoy_failed\":{d},\"decoy_accepted\":{d},\"decoy_wrong\":{d},\"accepted\":{d},\"rejected\":{d},\"pairs_computed\":{d}}}", .{ ls.frames, ls.gated_light, ls.gated_motion, ls.decoy_failed, ls.decoy_accepted, ls.decoy_wrong, ls.accepted, ls.rejected, ls.pairs_computed });
+        try summary.print(",\"local_flow\":{{\"frames\":{d},\"gated_light\":{d},\"gated_motion\":{d},\"gated_cooldown\":{d},\"decoy_early\":{d},\"decoy_failed\":{d},\"decoy_accepted\":{d},\"decoy_wrong\":{d},\"accepted\":{d},\"rejected\":{d},\"pairs_computed\":{d}}}", .{ ls.frames, ls.gated_light, ls.gated_motion, ls.gated_cooldown, ls.decoy_early, ls.decoy_failed, ls.decoy_accepted, ls.decoy_wrong, ls.accepted, ls.rejected, ls.pairs_computed });
     } else if (args.temporal == .auto and args.local_flow) try summary.writeAll(",\"local_flow\":\"no room for the decoy\"");
     try summary.print(",\"mask\":\"{s}\"", .{@tagName(args.mask)});
     if (stable) |st| try summary.print(",\"stable_fill\":{{\"blended\":{d},\"reset\":{d}}}", .{ st.blended, st.reset });

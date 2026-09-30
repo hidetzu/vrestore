@@ -39,6 +39,13 @@ pub const Params = struct {
     decoys: u32 = 2,
     decoy_min_accepted: u32 = 100,
     decoy_max_wrong: f32 = 0.005,
+    /// おとりの確かめが不合格だったら、しばらく試さない。休む枚数は不合格が続くたびに倍にし（この上限まで）、合格したら 1 に戻す
+    /// （重い処理を続けない。採る条件は変えない）
+    max_cooldown: u32 = 16,
+    /// flow の関門に使う前後のフレーム数（鎖の flow は、鎖がたどった所だけ求める）
+    motion_span: u32 = 2,
+    /// おとりをまずこの間隔（縦横）の画素だけで確かめ、届く見込み（採る数が基準の半分）が無ければ全部は見ない
+    decoy_sparse_step: u32 = 3,
     wrong_error: f32 = 32,
     flow: flow.Params = .{},
 };
@@ -59,6 +66,10 @@ pub const Stats = struct {
     /// 動きが小さく試さなかった（軽い関門 / flow の関門）
     gated_light: u64 = 0,
     gated_motion: u64 = 0,
+    /// 直前のおとりの不合格のあと、休んだフレーム
+    gated_cooldown: u64 = 0,
+    /// おとりの一部だけで見切った（不合格）フレーム
+    decoy_early: u64 = 0,
     /// おとりで外れが多い・採れる画素が足りず、本物の候補を採らなかった
     decoy_failed: u64 = 0,
     decoy_accepted: u64 = 0,
@@ -91,6 +102,9 @@ pub const Session = struct {
     frame_w: u32,
     frame_h: u32,
     p: Params,
+    /// 休む残りのフレーム数と、次に不合格だったときに休む枚数
+    cooldown_left: u32 = 0,
+    backoff: u32 = 1,
 
     /// おとりを置く場所が無ければ null（局所の方式は使わない）
     pub fn init(gpa: std.mem.Allocator, roi: Rect, guard: temporal.Guard, frame_w: u32, frame_h: u32, p: Params) !?Session {
@@ -251,7 +265,7 @@ pub const Session = struct {
     }
 
     /// 画素 (x, y)（画面の座標）から鎖を前後にたどり、`own`（範囲の画素ごと、借りない）の外に出たフレームの値を集める
-    fn gather(s: Session, frames: []const []const u8, pairs: []const ?Pair, target: usize, x: u32, y: u32, own: []const bool, buf: []Candidate) usize {
+    fn gather(s: Session, frames: []const []const u8, pairs: []?Pair, target: usize, x: u32, y: u32, own: []const bool, k: u32, buf: []Candidate, st: *Stats) !usize {
         var n: usize = 0;
         const rw: f32 = @floatFromInt(s.region.w);
         const rh: f32 = @floatFromInt(s.region.h);
@@ -259,12 +273,17 @@ pub const Session = struct {
             var px: f32 = @floatFromInt(x - s.region.x);
             var py: f32 = @floatFromInt(y - s.region.y);
             var step: i64 = 1;
-            while (step <= s.p.k) : (step += 1) {
+            while (step <= k) : (step += 1) {
                 const k0 = @as(i64, @intCast(target)) + sign * (step - 1);
                 const k1 = @as(i64, @intCast(target)) + sign * step;
                 if (k1 < 0 or k1 >= frames.len) break;
                 const pi: usize = @intCast(@min(k0, k1));
-                const pr = pairs[pi] orelse break;
+                // 鎖がたどった所の flow だけを求める（持ち回る）
+                if (pairs[pi] == null) {
+                    pairs[pi] = try s.pair(frames[pi], frames[pi + 1]);
+                    st.pairs_computed += 1;
+                }
+                const pr = pairs[pi].?;
                 const f = if (sign < 0) pr.bw else pr.fw; // k0 → k1
                 const g = if (sign < 0) pr.fw else pr.bw; // k1 → k0（往復の確かめ）
                 const d = f.sample(px, py);
@@ -315,6 +334,27 @@ pub const Session = struct {
         return med;
     }
 
+    /// おとり `dcy` の、`step` 間隔（縦横）の画素について、採った数と外れの数
+    fn decoyScore(s: Session, frames: []const []const u8, pairs: []?Pair, target: usize, dcy: Rect, step: u32, k: u32, buf: []Candidate, st: *Stats) ![2]u64 {
+        const tf = frames[target];
+        var acc: u64 = 0;
+        var wrong: u64 = 0;
+        var y: usize = dcy.y;
+        while (y < dcy.y + dcy.h) : (y += step) {
+            var x: usize = dcy.x;
+            while (x < dcy.x + dcy.w) : (x += step) {
+                const m = try s.gather(frames, pairs, target, @intCast(x), @intCast(y), s.dg, k, buf, st);
+                const v = s.decide(buf[0..m]) orelse continue;
+                acc += 1;
+                const i = (y * s.frame_w + x) * 3;
+                var err: f32 = 0;
+                for (0..3) |c| err = @max(err, @abs(v[c] - @as(f32, @floatFromInt(tf[i + c]))));
+                if (err > s.p.wrong_error) wrong += 1;
+            }
+        }
+        return .{ acc, wrong };
+    }
+
     fn nearestDt(c: []const Candidate) i16 {
         var best: i16 = c[0].dt;
         for (c) |x| if (@abs(x.dt) < @abs(best)) {
@@ -326,10 +366,16 @@ pub const Session = struct {
     /// フレーム `target` の ROI のうち、まだ戻せていない（unrecovered）ウォーターマークの画素を、局所の flow で戻す。
     /// `pairs[i]` はフレーム i と i+1 の flow（null なら必要なときに求めて入れる。呼ぶ側が持ち、使い回す）。
     /// `ring[i]` はフレーム i と i+1 の帯の変化（ringChange）。`detail` は ROI の画素ごと（temporal.Detail）
-    pub fn recover(s: Session, frames: []const []const u8, pairs: []?Pair, ring: []const f32, target: usize, out: []u8, prov: []Provenance, detail: []temporal.Detail) !Stats {
+    pub fn recover(s: *Session, frames: []const []const u8, pairs: []?Pair, ring: []const f32, target: usize, out: []u8, prov: []Provenance, detail: []temporal.Detail) !Stats {
         var st: Stats = .{ .frames = 1 };
         const n = frames.len;
         std.debug.assert(pairs.len == n - 1 and ring.len == n - 1);
+        // 0. 直前におとりが不合格だったら、しばらく試さない
+        if (s.cooldown_left > 0) {
+            s.cooldown_left -= 1;
+            st.gated_cooldown = 1;
+            return st;
+        }
         // 1. 軽い関門（前後 15 フレーム）
         const lo15 = target -| 15;
         const hi15 = @min(n - 1, target + 15);
@@ -343,9 +389,9 @@ pub const Session = struct {
             st.gated_light = 1;
             return st;
         }
-        // 2. flow（必要な分だけ）と flow の関門
-        const lo = target -| s.p.k;
-        const hi = @min(n - 1, target + s.p.k);
+        // 2. flow の関門（前後 motion_span フレームの flow だけで判断する）
+        const lo = target -| s.p.motion_span;
+        const hi = @min(n - 1, target + s.p.motion_span);
         var msum: f32 = 0;
         var mcnt: f32 = 0;
         for (lo..hi) |i| {
@@ -361,31 +407,40 @@ pub const Session = struct {
             return st;
         }
         var buf: [2 * 256]Candidate = undefined;
-        // 3. おとりで確かめる
-        const tf = frames[target];
+        // 3. おとりで確かめる。まず一部の画素だけで見て、届く見込みが無ければ全部は見ない。1 か所でも不合格なら残りは見ない
+        const sp = s.p.decoy_sparse_step;
         var all_pass = true;
         for (s.decoy[0..s.n_decoys]) |dcy| {
-            var acc: u64 = 0;
-            var wrong: u64 = 0;
-            for (dcy.y..dcy.y + dcy.h) |y| for (dcy.x..dcy.x + dcy.w) |x| {
-                const m = s.gather(frames, pairs, target, @intCast(x), @intCast(y), s.dg, &buf);
-                const v = s.decide(buf[0..m]) orelse continue;
-                acc += 1;
-                const i = (y * s.frame_w + x) * 3;
-                var err: f32 = 0;
-                for (0..3) |c| err = @max(err, @abs(v[c] - @as(f32, @floatFromInt(tf[i + c]))));
-                if (err > s.p.wrong_error) wrong += 1;
-            };
-            st.decoy_accepted += acc;
-            st.decoy_wrong += wrong;
-            const rate = if (acc == 0) 1 else @as(f32, @floatFromInt(wrong)) / @as(f32, @floatFromInt(acc));
+            if (sp > 1) {
+                const r = try s.decoyScore(frames, pairs, target, dcy, sp, s.p.k, &buf, &st);
+                const need = s.p.decoy_min_accepted / (2 * sp * sp);
+                const rate = if (r[0] == 0) 1 else @as(f32, @floatFromInt(r[1])) / @as(f32, @floatFromInt(r[0]));
+                if (r[0] < need or rate > 4 * s.p.decoy_max_wrong) {
+                    st.decoy_early = 1;
+                    all_pass = false;
+                    break;
+                }
+            }
+            const r = try s.decoyScore(frames, pairs, target, dcy, 1, s.p.k, &buf, &st);
+            st.decoy_accepted += r[0];
+            st.decoy_wrong += r[1];
+            const rate = if (r[0] == 0) 1 else @as(f32, @floatFromInt(r[1])) / @as(f32, @floatFromInt(r[0]));
             // どのおとりも合格すること
-            if (acc < s.p.decoy_min_accepted or rate > s.p.decoy_max_wrong) all_pass = false;
+            if (r[0] < s.p.decoy_min_accepted or rate > s.p.decoy_max_wrong) {
+                all_pass = false;
+                break;
+            }
         }
         if (!all_pass) {
             st.decoy_failed = 1;
+            // 窓の前か後ろが足りない所（動画の端）では、両側の候補がそろわず不合格になるのは当然なので休まない
+            if (target >= s.p.k and target + s.p.k < n) {
+                s.cooldown_left = s.backoff;
+                s.backoff = @min(s.backoff * 2, s.p.max_cooldown);
+            }
             return st;
         }
+        s.backoff = 1;
         // 4. 本物の ROI
         const roi = s.roi;
         for (roi.y..roi.y + roi.h) |y| for (roi.x..roi.x + roi.w) |x| {
@@ -393,7 +448,7 @@ pub const Session = struct {
             if (prov[pi] != .unrecovered) continue;
             const ri = (y - s.region.y) * s.region.w + (x - s.region.x);
             if (!s.wm[ri]) continue;
-            const m = s.gather(frames, pairs, target, @intCast(x), @intCast(y), s.wm, &buf);
+            const m = try s.gather(frames, pairs, target, @intCast(x), @intCast(y), s.wm, s.p.k, &buf, &st);
             if (m == 0) continue;
             const k = (y - roi.y) * roi.w + (x - roi.x);
             if (s.decide(buf[0..m])) |v| {
@@ -486,7 +541,8 @@ fn runDisc(gpa: std.mem.Allocator, truth: []const []u8, roi: Rect, t: usize, p: 
     const detail = try gpa.alloc(temporal.Detail, @as(usize, roi.w) * roi.h);
     defer gpa.free(detail);
     @memset(detail, .{});
-    const st = try fx.session.recover(frames, fx.pairs, fx.ring, t, out, prov, detail);
+    var session = fx.session;
+    const st = try session.recover(frames, fx.pairs, fx.ring, t, out, prov, detail);
     var worst: f32 = 0;
     for (roi.y..roi.y + roi.h) |y| for (roi.x..roi.x + roi.w) |x| {
         if (prov[y * W + x] != .temporal_real) continue;
@@ -541,7 +597,8 @@ test "local_temporal: does not try when nothing moves, and does not take when th
         prov[y * W + x] = .unrecovered;
     };
     var detail = [_]temporal.Detail{.{}} ** (20 * 20);
-    const st = try fx.session.recover(still, fx.pairs, fx.ring, 10, out, &prov, &detail);
+    var s1 = fx.session;
+    const st = try s1.recover(still, fx.pairs, fx.ring, 10, out, &prov, &detail);
     try std.testing.expectEqual(@as(u64, 1), st.gated_light);
     try std.testing.expectEqual(@as(u64, 0), st.pairs_computed);
 
@@ -550,7 +607,39 @@ test "local_temporal: does not try when nothing moves, and does not take when th
     defer freeFrames(gpa, moving);
     const fx2 = try Fixture.init(gpa, moving, roi, .{ .k = 15, .min_ring_change = 0.5, .min_motion = 1.0, .decoy_min_accepted = 1_000_000 });
     defer fx2.deinit(gpa);
-    const st2 = try fx2.session.recover(moving, fx2.pairs, fx2.ring, 15, out, &prov, &detail);
+    var s2 = fx2.session;
+    const st2 = try s2.recover(moving, fx2.pairs, fx2.ring, 15, out, &prov, &detail);
     try std.testing.expectEqual(@as(u64, 1), st2.decoy_failed);
     try std.testing.expectEqual(@as(u64, 0), st2.accepted);
+}
+
+test "local_temporal: after a decoy failure it rests, and each further failure doubles the rest (up to max_cooldown)" {
+    const gpa = std.testing.allocator;
+    const roi: Rect = .{ .x = 70, .y = 50, .w = 20, .h = 20 };
+    const moving = try movingDisc(gpa, 31, 3, 0, 30);
+    defer freeFrames(gpa, moving);
+    // おとりで採れる画素の数の条件を満たせないので、試せば必ず不合格
+    const fx = try Fixture.init(gpa, moving, roi, .{ .k = 10, .min_ring_change = 0.5, .min_motion = 1.0, .decoy_min_accepted = 1_000_000, .max_cooldown = 2 });
+    defer fx.deinit(gpa);
+    const out = try gpa.dupe(u8, moving[15]);
+    defer gpa.free(out);
+    var prov = [_]Provenance{.original} ** (W * H);
+    var detail = [_]temporal.Detail{.{}} ** (20 * 20);
+    var s = fx.session;
+    // 窓（前後 10 枚）がそろうフレーム 10..20 で順に呼ぶ: 試す・休む・試す・休む 2・試す・休む 2（上限）
+    var got: [8]u8 = undefined;
+    for (&got, 10..) |*g, t| {
+        const st = try s.recover(moving, fx.pairs, fx.ring, t, out, &prov, &detail);
+        g.* = if (st.gated_cooldown == 1) 'c' else if (st.decoy_failed == 1) 'f' else '?';
+    }
+    try std.testing.expectEqualStrings("fcfccfcc", &got);
+
+    // 窓の前がそろわないフレーム（0..9）では、不合格でも休まない
+    var s2 = fx.session;
+    var edge: [3]u8 = undefined;
+    for (&edge, 4..) |*g, t| {
+        const st = try s2.recover(moving, fx.pairs, fx.ring, t, out, &prov, &detail);
+        g.* = if (st.gated_cooldown == 1) 'c' else if (st.decoy_failed == 1) 'f' else '?';
+    }
+    try std.testing.expectEqualStrings("fff", &edge);
 }
