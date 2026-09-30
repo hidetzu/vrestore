@@ -441,6 +441,7 @@ const DetectionJson = struct {
     margin: ?f64,
     peak: f64,
     frames_voted: u32,
+    frames_flat: u32,
     reliable: bool,
     reasons: []const []const u8,
 };
