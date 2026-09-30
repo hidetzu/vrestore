@@ -54,8 +54,15 @@ const usage =
     \\      --progress <file>   rewrite <file> every 15 frames with "frames <done> <expected total>"
     \\      --window <n>        frames to look at on each side, 1-255 (default 15)
     \\      --motion <m>        translation (whole-frame shift) or affine (shift + rotation + zoom)
-    \\      --mask <m>          none (hide the whole ROI) or auto (hide only the watermark's own pixels,
-    \\                          found as those that stay the same across the video)
+    \\      --mask <m>          none (hide the whole ROI), auto (hide only the watermark's own pixels, found as
+    \\                          those that stay the same across the video) or gradient (find the watermark's
+    \\                          shape from the edges that stay the same over 150 frames spread over the video;
+    \\                          works best on long videos)
+    \\      --mask-out <png>    also write the mask used (0 = kept, 255 = replaced) as an image the size of the
+    \\                          video; it can be given back with --mask-image
+    \\      --frames <n>        restore only the first <n> frames (the mask is still estimated from the whole video)
+    \\      --mask-image <png> use this mask instead of estimating one (--mask): a grayscale image the size of the video,
+    \\                          0 = keep the original, 255 = replace, in between = blend (read within 8 px of the ROI)
     \\      --fill <f>          none, directional or harmonic: guess the pixels still unrecovered from
     \\                          their surroundings (provenance spatial_inpainted; not counted in coverage)
     \\      --provenance <out>  also write where each pixel came from, 1 byte per pixel per frame:
@@ -207,6 +214,13 @@ fn parseRestore(args: []const []const u8) Command {
             if (out.crf > 51) return .{ .bad_arg = .{ .why = "--crf needs an integer from 0 to 51", .arg = v } };
         } else if (std.mem.eql(u8, a, "--temporal")) {
             out.temporal = std.meta.stringToEnum(temporal.Mode, v) orelse return .{ .bad_arg = .{ .why = "--temporal needs off, on or auto", .arg = v } };
+        } else if (std.mem.eql(u8, a, "--frames")) {
+            out.max_frames = std.fmt.parseInt(u64, v, 10) catch 0;
+            if (out.max_frames.? == 0) return .{ .bad_arg = .{ .why = "--frames needs a positive number of frames", .arg = v } };
+        } else if (std.mem.eql(u8, a, "--mask-out")) {
+            out.mask_out = v;
+        } else if (std.mem.eql(u8, a, "--mask-image")) {
+            out.mask_image = v;
         } else if (std.mem.eql(u8, a, "--unreliable-roi")) {
             out.use_unreliable_roi = if (std.mem.eql(u8, v, "stop")) false else if (std.mem.eql(u8, v, "use")) true else return .{ .bad_arg = .{ .why = "--unreliable-roi needs stop or use", .arg = v } };
         } else if (std.mem.eql(u8, a, "--local-flow")) {
@@ -230,7 +244,7 @@ fn parseRestore(args: []const []const u8) Command {
             // 前後 window 枚と表示中の 1 枚が temporal.max_window_frames に収まること（超えると固定長の配列の外に書く）
             if (out.window == 0 or 2 * out.window + 1 > temporal.max_window_frames) return .{ .bad_arg = .{ .why = "--window needs an integer from 1 to 255", .arg = v } };
         } else if (std.mem.eql(u8, a, "--mask")) {
-            out.mask = std.meta.stringToEnum(restore_cmd.MaskMode, v) orelse return .{ .bad_arg = .{ .why = "--mask needs none or auto", .arg = v } };
+            out.mask = std.meta.stringToEnum(restore_cmd.MaskMode, v) orelse return .{ .bad_arg = .{ .why = "--mask needs none, auto or gradient", .arg = v } };
         } else if (std.mem.eql(u8, a, "--fill")) {
             out.fill = std.meta.stringToEnum(@import("spatial.zig").Method, v) orelse return .{ .bad_arg = .{ .why = "--fill needs none, directional or harmonic", .arg = v } };
         } else if (std.mem.eql(u8, a, "--motion")) {
@@ -332,6 +346,7 @@ test {
     _ = @import("glyphs.zig");
     _ = @import("fonts.zig");
     _ = @import("wmask.zig");
+    _ = @import("wgrad.zig");
     _ = @import("export_job.zig");
     _ = @import("stabilize.zig");
     _ = @import("debug_view.zig");

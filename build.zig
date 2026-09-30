@@ -117,6 +117,35 @@ pub fn build(b: *std.Build) void {
     cli_unreliable_use.addFileArg(steps_mp4);
     _ = cli_unreliable_use.captureStdOut(.{});
     cli_unreliable_use.expectExitCode(0);
+    // --mask gradient の推定を --mask-out で画像に書き、--mask-image でそのまま読み戻せる。--frames で先頭だけ復元して止まる
+    const cli_mask_out = b.addRunArtifact(exe);
+    cli_mask_out.setName("cli_mask_out");
+    cli_mask_out.addArgs(&.{ "restore", "--rect", "10,10,20,20", "--mask", "gradient", "--frames", "2", "--mask-out" });
+    const mask_png = cli_mask_out.addOutputFileArg("mask.png");
+    cli_mask_out.addArg("--raw");
+    _ = cli_mask_out.addOutputFileArg("mask-out.rgb");
+    cli_mask_out.addFileArg(steps_mp4);
+    cli_mask_out.addCheck(.{ .expect_stdout_match = "{\"frames\":2," });
+    cli_mask_out.addCheck(.{ .expect_stdout_match = "\"mask\":\"gradient\"" });
+    const cli_mask_image = b.addRunArtifact(exe);
+    cli_mask_image.setName("cli_mask_image");
+    cli_mask_image.addArgs(&.{ "restore", "--rect", "10,10,20,20", "--frames", "2", "--mask-image" });
+    cli_mask_image.addFileArg(mask_png);
+    cli_mask_image.addArg("--raw");
+    _ = cli_mask_image.addOutputFileArg("mask-image.rgb");
+    cli_mask_image.addFileArg(steps_mp4);
+    cli_mask_image.addCheck(.{ .expect_stdout_match = "\"mask\":\"image\"" });
+    // 動画と大きさの違うマスクは、理由を言って止まる
+    const gen_small_png = b.addSystemCommand(&.{ "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "color=white:s=32x32", "-frames:v", "1" });
+    gen_small_png.setName("generate small.png");
+    const small_png = gen_small_png.addOutputFileArg("small.png");
+    const cli_mask_image_size = b.addRunArtifact(exe);
+    cli_mask_image_size.setName("cli_mask_image_size");
+    cli_mask_image_size.addArgs(&.{ "restore", "--rect", "10,10,20,20", "--raw", "-", "--mask-image" });
+    cli_mask_image_size.addFileArg(small_png);
+    cli_mask_image_size.addFileArg(steps_mp4);
+    cli_mask_image_size.expectStdErrMatch("must be the same size as the video");
+    cli_mask_image_size.expectExitCode(1);
     // 幅・高さが奇数の動画は H.264（4:2:0）に書き出せない。理由を言って、書き始める前に止まること
     const gen_odd = b.addSystemCommand(&.{ "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=320x180:r=10:d=0.5", "-vf", "scale=321:181,format=gbrp", "-c:v", "ffv1" });
     gen_odd.setName("generate odd.mkv");
@@ -177,6 +206,9 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&rot_chk.step);
         test_step.dependOn(&cli_odd_out.step);
         test_step.dependOn(&cli_unreliable.step);
+        test_step.dependOn(&cli_mask_out.step);
+        test_step.dependOn(&cli_mask_image.step);
+        test_step.dependOn(&cli_mask_image_size.step);
         test_step.dependOn(&cli_unreliable_use.step);
         test_step.dependOn(&cli_detect_bad_ref.step);
         test_step.dependOn(&cli_detect_flat_ref.step);
@@ -512,6 +544,9 @@ const restore_cases = [_]RestoreCase{
     // 毎フレーム別の模様を、ウォーターマークの画素だけ埋める（--mask auto）。本物の背景が見えている画素は残す。
     // 実測（crf 23）: ROI 全体を埋めると SSIM 0.649、マスクで 0.758。再現率 1.0000
     .{ .roi = .{ .spec = "name=restore-cut-mask,bg=cut,x=240,y=150,frames=60", .crf = 23 }, .fill = "harmonic", .mask = "auto", .expect = "coverage<=0,ssim>=0.67,mask_accepted>=1" },
+    // 同じ素材で、動画全体の勾配の中央値から形を推定する（--mask gradient、ADR 0019）。文字の間の背景を残せる。
+    // 実測（crf 23）: SSIM 0.755（--mask auto は 0.689）。再現率 1.0000
+    .{ .roi = .{ .spec = "name=restore-cut-gradient,bg=cut,x=240,y=150,frames=60", .crf = 23 }, .fill = "harmonic", .mask = "gradient", .expect = "coverage<=0,mask_accepted>=1,ssim>=0.73" },
     // ROI がウォーターマークより 4 px 小さい（文字の外接矩形 241..383 x 151..201 を 4 px 縮めた）。はみ出した縁を借りず、
     // 周りの帯もその外で確かめる（temporal.Guard、ROI + 8 px）。実測（crf 23）: coverage 0.995、外れ 0.0001。
     // 守る範囲が無いと帯で全フレームが拒否されて coverage 0、ROI + 4 px だと外れ 0.0157

@@ -437,7 +437,7 @@ const App = struct {
         if (app.mask == null) {
             var d = try video.Decoder.open(app.path);
             defer d.close();
-            app.mask = try restore_cmd.estimateMask(app.gpa, &d, area, roi_rect);
+            app.mask = try restore_cmd.estimateMask(app.gpa, &d, app.mask_mode, area, roi_rect);
         }
         const m = app.mask.?;
         return .{ .mask = m.hidden, .area = area };
@@ -533,7 +533,7 @@ pub fn main(init: std.process.Init) !u8 {
             temporal_mode = std.meta.stringToEnum(temporal.Mode, args[i]) orelse return badArg(&err.interface, "--temporal needs off, on or auto", args[i]);
         } else if (std.mem.eql(u8, a, "--mask") and i + 1 < args.len) {
             i += 1;
-            mask_mode = std.meta.stringToEnum(restore_cmd.MaskMode, args[i]) orelse return badArg(&err.interface, "--mask needs none or auto", args[i]);
+            mask_mode = std.meta.stringToEnum(restore_cmd.MaskMode, args[i]) orelse return badArg(&err.interface, "--mask needs none, auto or gradient", args[i]);
         } else if (std.mem.eql(u8, a, "--fill") and i + 1 < args.len) {
             i += 1;
             fill_method = std.meta.stringToEnum(spatial.Method, args[i]) orelse return badArg(&err.interface, "--fill needs none, directional or harmonic", args[i]);
