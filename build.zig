@@ -193,8 +193,16 @@ pub fn build(b: *std.Build) void {
     const tool_tests = b.addRunArtifact(b.addTest(.{ .root_module = tool_mod, .filters = test_filters }));
     test_step.dependOn(&tool_tests.step);
 
+    // 合成 E2E が叩く vrestore。画素ごとの処理（局所の flow など）は Debug だと 1 桁遅い
+    // （restore-blob-local: Debug 187 s、ReleaseFast 20 s）ので、安全検査を残した ReleaseSafe にする。
+    // CLI の配線の検査（上の cli_*）は既定の最適化の exe のまま
+    const e2e_exe = b.addExecutable(.{
+        .name = "vrestore",
+        .root_module = createRootModule(b, target, .ReleaseSafe, options),
+    });
+
     const e2e_step = b.step("e2e", "ROI detection on synthetic videos, checked against the known position");
-    for (roi_cases) |c| e2e_step.dependOn(roiCase(b, tool, exe, c));
+    for (roi_cases) |c| e2e_step.dependOn(roiCase(b, tool, e2e_exe, c));
 
     // ---- GUI（vrestore-gui）--------------------------------------------------
     // SDL2 が要るので本体とは別の実行ファイルにして、既定の install には入れない（docs/adr/0004）
@@ -286,7 +294,7 @@ pub fn build(b: *std.Build) void {
     gui_export.setName("gui export-and-exit");
     gui_export.setEnvironmentVariable("SDL_VIDEODRIVER", "dummy");
     gui_export.addArgs(&.{ "--at", "3", "--select", "234,144,158,68", "--detect-and-exit", "--vrestore" });
-    gui_export.addArtifactArg(exe);
+    gui_export.addArtifactArg(e2e_exe);
     gui_export.addArg("--export");
     const gui_export_mp4 = gui_export.addOutputFileArg("gui-export.mp4");
     gui_export.addFileArg(gui_audio);
@@ -312,15 +320,15 @@ pub fn build(b: *std.Build) void {
     // 合成 → エンコード → detect-roi → restore → 正解（ウォーターマーク無しの同じ背景）と compare。
     // 判定値は較正（scripts/restore-calibrate.sh、docs/SPEC.md §4）の実測から余裕を取ったもの
     const restore_step = b.step("restore-e2e", "Temporal Recovery on synthetic videos, compared with the clean original");
-    for (restore_cases) |c| restore_step.dependOn(restoreCase(b, tool, exe, c));
-    restore_step.dependOn(exportCase(b, tool, exe));
-    restore_step.dependOn(debugCase(b, tool, exe));
+    for (restore_cases) |c| restore_step.dependOn(restoreCase(b, tool, e2e_exe, c));
+    restore_step.dependOn(exportCase(b, tool, e2e_exe));
+    restore_step.dependOn(debugCase(b, tool, e2e_exe));
 
     // ---- 復元の指標を FFmpeg と突き合わせる ----------------------------------
     // SSIM / PSNR を自前の実装とだけ比べても何も示さないので、FFmpeg の ssim / psnr フィルタと
     // フレームごとに比べる（src/metrics.zig）。色変換の差を持ち込まないよう、素材は RGB のまま可逆で持つ
     const metrics_step = b.step("metrics", "Cross-check vrestore compare against FFmpeg ssim / psnr");
-    metrics_step.dependOn(metricsCrosscheck(b, tool, exe));
+    metrics_step.dependOn(metricsCrosscheck(b, tool, e2e_exe));
 
     // check: 変更が壊れていないと言うために回すものの全部。
     // 何を回すかはここだけが持つ（.claude/skills/verify/SKILL.md と CI はここを呼ぶ）
@@ -492,7 +500,7 @@ const restore_cases = [_]RestoreCase{
     .{ .roi = .{ .spec = "name=restore-cut-auto,bg=cut,x=240,y=150,frames=60", .crf = 23 }, .temporal = "auto", .expect = "coverage<=0,temporal_pixels.accepted<=0" },
     // 止まった背景の上を、模様の付いた大きな円板が縦に 3 px/フレームで横切る（ROI と周りの帯を覆う）。画面全体の動きは 0 なので
     // 画面全体の方式は何も戻せない。局所の optical flow（ADR 0018）は、前後それぞれ 3 枚以上がそろい、おとりの疑似チェックに
-    // 通った画素だけを戻す。実測（crf 23、--fill none）: 局所あり coverage 0.514・外れ 0、局所なし 0
+    // 通った画素だけを戻す。実測（crf 23、--fill none）: 局所あり coverage 0.463・外れ 0、局所なし 0
     .{ .roi = .{ .spec = "name=restore-blob-local,bg=blob,pan_x=0,pan_y=3,x=240,y=150,frames=60", .crf = 23 }, .rect = "234,144,158,68", .temporal = "auto", .expect = "coverage>=0.4,masked_bad_fraction<=0.001,local_flow.accepted>=1,local_flow.decoy_wrong<=0" },
     .{ .roi = .{ .spec = "name=restore-blob-global,bg=blob,pan_x=0,pan_y=3,x=240,y=150,frames=60", .crf = 23 }, .rect = "234,144,158,68", .temporal = "auto", .extra = &.{ "--local-flow", "off" }, .expect = "coverage<=0" },
     // --temporal off: 背景が動いていても借りない
