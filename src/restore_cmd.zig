@@ -15,6 +15,7 @@ const wmask = @import("wmask.zig");
 const mp4 = @import("mp4.zig");
 const stabilize = @import("stabilize.zig");
 const debug_view = @import("debug_view.zig");
+const local_temporal = @import("local_temporal.zig");
 
 /// ROI の中でウォーターマークの画素だけを隠れている扱いにするか（wmask.zig）。none なら ROI 全体を隠す。
 /// ⚠ 較正は docs/SPEC.md §4、決定は docs/adr/0010
@@ -104,6 +105,8 @@ pub const Args = struct {
     mask: MaskMode = default_mask,
     max_ring_diff: ?f64 = default_max_ring_diff,
     temporal: temporal.Mode = default_temporal,
+    /// --temporal auto のとき、局所の optical flow の候補も試すか（local_temporal.zig、ADR 0018）
+    local_flow: bool = true,
     /// Temporal の debug の可視化の出力先（debug_view.zig）。.mp4 なら動画、それ以外はディレクトリに連番の PNG
     debug_out: ?[]const u8 = null,
     /// RGB24 の生フレームの出力先。"-" なら標準出力（そのとき集計は標準エラーへ）。空なら書かない
@@ -362,7 +365,24 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
     const out_rgb = try arena.alloc(u8, frame_bytes);
     const prov = try arena.alloc(provenance.Provenance, @as(usize, w) * h);
 
-    // 前後 window 枚ずつを持つリングの代わりに、先頭を捨てる配列（最大 2 * window + 1 枚）
+    // 局所の optical flow（auto のとき）。前後 k 枚を持つので、画面全体の方式の window より多く読む
+    var local_session: ?local_temporal.Session = if (args.temporal == .auto and args.local_flow)
+        try local_temporal.Session.init(gpa, rect, temporalGuard(hidden, rect, args.temporal_guard, w, h), w, h, .{})
+    else
+        null;
+    defer if (local_session) |*ls| ls.deinit();
+    var local_stats: local_temporal.Stats = .{};
+    const keep: usize = if (local_session) |ls| @max(args.window, ls.p.k) else args.window;
+    // pairs.items[i] / rings.items[i] は slots[i] と slots[i + 1] の flow（必要になったら求める）と帯の変化
+    var pairs: std.ArrayList(?local_temporal.Pair) = .empty;
+    defer {
+        for (pairs.items) |pp| if (pp) |x| x.deinit(gpa);
+        pairs.deinit(gpa);
+    }
+    var rings: std.ArrayList(f32) = .empty;
+    defer rings.deinit(gpa);
+
+    // 前後 keep 枚ずつを持つリングの代わりに、先頭を捨てる配列（最大 2 * keep + 1 枚）
     var slots: std.ArrayList(Slot) = .empty;
     defer for (slots.items) |sl| if (sl.luma) |l| l.deinit(gpa);
     var free: std.ArrayList([]u8) = .empty; // 使い終わったバッファを再利用する
@@ -377,7 +397,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
 
     while (true) {
         // target + window まで読み進める
-        while (!eof and lo + slots.items.len <= next_target + args.window) {
+        while (!eof and lo + slots.items.len <= next_target + keep) {
             const buf = free.pop() orelse try arena.alloc(u8, frame_bytes);
             const f = d.next(buf) catch |e| {
                 try err.print("vrestore: could not decode '{s}': {s}\n", .{ args.video, video.describe(e) });
@@ -404,23 +424,39 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
                 peak_min = @min(peak_min, est.shift.peak);
                 peak_max = @max(peak_max, est.shift.peak);
             }
+            if (local_session) |ls| if (slots.items.len > 0) {
+                try rings.append(gpa, ls.ringChange(slots.items[slots.items.len - 1].rgb, f.rgb));
+                try pairs.append(gpa, null);
+            };
             try slots.append(arena, .{ .rgb = buf, .pts = f.pts, .luma = luma, .motion = m });
         }
         if (next_target >= lo + slots.items.len) break;
 
-        // 窓の中のフレームと、隣り合うペアの移動量（フレームごとに作って捨てる。arena に積むと尺に比例して増える）
-        const n = slots.items.len;
+        // 画面全体の方式の窓（前後 window 枚）と、隣り合うペアの移動量（フレームごとに作って捨てる。arena に積むと尺に比例して増える）
+        const g_first = (next_target -| args.window) -| lo;
+        const g_last = @min(slots.items.len - 1, next_target + args.window - lo);
+        const n = g_last - g_first + 1;
         const images = try gpa.alloc(temporal.Image, n);
         defer gpa.free(images);
         const motions = try gpa.alloc(?motion.Affine, n - 1);
         defer gpa.free(motions);
-        for (slots.items, 0..) |s, i| {
+        for (slots.items[g_first .. g_last + 1], 0..) |s, i| {
             images[i] = .{ .width = w, .height = h, .rgb = s.rgb };
             if (i > 0) motions[i - 1] = s.motion;
         }
         const track = try temporal.Track.buildAffine(gpa, motions);
         defer track.deinit(gpa);
-        const t_r = temporal.recoverFrame(images, track, next_target - lo, rect, temporalGuard(hidden, rect, args.temporal_guard, w, h), .{ .mode = args.temporal, .max_ring_diff = args.max_ring_diff }, out_rgb, prov, detail);
+        const target_rgb = slots.items[next_target - lo].rgb;
+        var t_r = temporal.recoverFrame(images, track, next_target - lo - g_first, rect, temporalGuard(hidden, rect, args.temporal_guard, w, h), .{ .mode = args.temporal, .max_ring_diff = args.max_ring_diff }, out_rgb, prov, detail);
+        if (local_session) |*ls| {
+            // 画面全体の方式で戻せなかった画素だけに、局所の flow の候補を試す
+            const frames_all = try gpa.alloc([]const u8, slots.items.len);
+            defer gpa.free(frames_all);
+            for (slots.items, frames_all) |s, *fa| fa.* = s.rgb;
+            local_stats.merge(try ls.recover(frames_all, pairs.items, rings.items, next_target - lo, out_rgb, prov, detail));
+            t_r = .{};
+            for (rect.y..rect.y + rect.h) |y| for (rect.x..rect.x + rect.w) |x| t_r.add(prov[y * w + x]);
+        }
         for (detail) |dd| switch (dd.class) {
             .accepted => n_accepted += 1,
             .rejected => n_rejected += 1,
@@ -430,7 +466,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
         if (args.stable_fill and args.fill != .none) {
             const area = if (hidden) |m| m.area else rect;
             if (stable == null) stable = try stabilize.State.init(gpa, .{ .x = area.x, .y = area.y, .w = area.w, .h = area.h }, w, h);
-            stable.?.apply(out_rgb, images[next_target - lo].rgb, w, prov, .{});
+            stable.?.apply(out_rgb, target_rgb, w, prov, .{});
         }
         total.merge(r);
         coverage_min = @min(coverage_min, r.coverage());
@@ -443,7 +479,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
         };
         if (prov_w) |*pw| try pw.interface.writeAll(std.mem.sliceAsBytes(prov));
         if (debug_buf) |db| {
-            debug_view.render(db, w, h, images[next_target - lo].rgb, out_rgb, prov, rect, if (hidden) |m| m.area else rect, detail, args.window);
+            debug_view.render(db, w, h, target_rgb, out_rgb, prov, rect, if (hidden) |m| m.area else rect, detail, args.window);
             if (debug_mp4) |*m| m.write(db, slots.items[next_target - lo].pts) catch |e| {
                 try err.print("vrestore: could not write '{s}': {s}\n", .{ args.debug_out.?, mp4.describe(e) });
                 return 1;
@@ -460,10 +496,14 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
         next_target += 1;
 
         // 次の target の窓から外れたフレームを捨てる
-        while (lo + args.window < next_target and slots.items.len > 0) {
+        while (lo + keep < next_target and slots.items.len > 0) {
             const old = slots.orderedRemove(0);
             if (old.luma) |l| l.deinit(gpa);
             try free.append(arena, old.rgb);
+            if (pairs.items.len > 0) {
+                if (pairs.orderedRemove(0)) |pp| pp.deinit(gpa);
+                _ = rings.orderedRemove(0);
+            }
             lo += 1;
         }
     }
@@ -489,6 +529,10 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
     });
     try total.writeJson(summary);
     try summary.print(",\"temporal\":\"{s}\",\"temporal_pixels\":{{\"accepted\":{d},\"rejected\":{d}}}", .{ @tagName(args.temporal), n_accepted, n_rejected });
+    if (local_session != null) {
+        const ls = local_stats;
+        try summary.print(",\"local_flow\":{{\"frames\":{d},\"gated_light\":{d},\"gated_motion\":{d},\"gated_cooldown\":{d},\"decoy_early\":{d},\"decoy_failed\":{d},\"decoy_accepted\":{d},\"decoy_wrong\":{d},\"accepted\":{d},\"rejected\":{d},\"pairs_computed\":{d}}}", .{ ls.frames, ls.gated_light, ls.gated_motion, ls.gated_cooldown, ls.decoy_early, ls.decoy_failed, ls.decoy_accepted, ls.decoy_wrong, ls.accepted, ls.rejected, ls.pairs_computed });
+    } else if (args.temporal == .auto and args.local_flow) try summary.writeAll(",\"local_flow\":\"no room for the decoy\"");
     try summary.print(",\"mask\":\"{s}\"", .{@tagName(args.mask)});
     if (stable) |st| try summary.print(",\"stable_fill\":{{\"blended\":{d},\"reset\":{d}}}", .{ st.blended, st.reset });
     if (mask_est) |m| try summary.print(",\"mask_accepted\":{},\"mask_fraction\":{d:.4},\"mask_inside_mad\":{d:.2},\"mask_outside_mad\":{d:.2}", .{ m.accepted, m.fraction, m.inside_mad, m.outside_mad });

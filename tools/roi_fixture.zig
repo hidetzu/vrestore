@@ -37,7 +37,9 @@ pub const Case = struct {
     /// pan: 模様がパンする / cut: 毎フレーム別の模様 / flat: 動かない滑らかなグラデーション
     /// zoom: 画面中央を中心に 1 フレームあたり 1% ずつ拡大する（画面全体の平行移動ではない動き）。
     /// warp: 画面中央を中心に、1 フレームあたり `zoom` の拡大・`rot` 度の回転・(pan_x, pan_y) の平行移動を重ねる
-    bg: enum { pan, cut, flat, zoom, warp } = .pan,
+    /// blob: 止まった背景の上を、模様の付いた半径 150 px の円板が 1 フレームに (pan_x, pan_y) px 動き、クリップの中ほどで
+    /// 画面の中央を通る（pan_x, pan_y ≥ 0）
+    bg: enum { pan, cut, flat, zoom, warp, blob } = .pan,
     /// warp の 1 フレームあたりの拡大率（0.005 = 0.5%）
     zoom: f32 = 0,
     /// warp の 1 フレームあたりの回転（度）
@@ -306,6 +308,23 @@ fn synth(gpa: std.mem.Allocator, io: Io, c: Case, out_path: []const u8, truth_pa
                     break :blk tex[ch][iy * tw + ix];
                 },
                 .cut => cut_tex[ch][y * w + x],
+                .blob => blk: {
+                    const kf: f32 = @floatFromInt(k);
+                    // 円板の中心は、クリップの中ほどで画面の中央を通る
+                    const half: f32 = @as(f32, @floatFromInt(c.frames)) / 2;
+                    const cx = @as(f32, @floatFromInt(w)) / 2 + @as(f32, @floatFromInt(c.pan_x)) * (kf - half);
+                    const cy = @as(f32, @floatFromInt(h)) / 2 + @as(f32, @floatFromInt(c.pan_y)) * (kf - half);
+                    const dx = @as(f32, @floatFromInt(x)) - cx;
+                    const dy = @as(f32, @floatFromInt(y)) - cy;
+                    if (dx * dx + dy * dy < 150 * 150) {
+                        // 円板の模様は円板と一緒に動く（模様の、移動した分だけ手前の位置を取る）
+                        const ix = x + span_x - @as(u32, @intCast(c.pan_x)) * @as(u32, @intCast(k));
+                        const iy = y + span_y - @as(u32, @intCast(c.pan_y)) * @as(u32, @intCast(k));
+                        break :blk tex[ch][iy * tw + ix];
+                    }
+                    // 背景は止まっている（模様の右下の、円板とは別の所）
+                    break :blk tex[(ch + 1) % 3][(th - h + y) * tw + (tw - w + x)];
+                },
                 .flat => (@as(f32, @floatFromInt(x)) / @as(f32, @floatFromInt(w)) * 0.6 +
                     @as(f32, @floatFromInt(y)) / @as(f32, @floatFromInt(h)) * 0.3 + 0.05 * @as(f32, @floatFromInt(ch))),
             } * 255;

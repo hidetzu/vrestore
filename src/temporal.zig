@@ -256,7 +256,7 @@ pub const Guard = struct {
     /// `area` の画素ごと（行優先）。true = ウォーターマーク（wmask.zig）
     hidden: ?[]const bool = null,
 
-    fn blocks(g: Guard, x: i64, y: i64) bool {
+    pub fn blocks(g: Guard, x: i64, y: i64) bool {
         if (!inRoi(g.area, x, y)) return false;
         const m = g.hidden orelse return true;
         return m[@as(usize, @intCast(y - g.area.y)) * g.area.w + @as(usize, @intCast(x - g.area.x))];
@@ -331,6 +331,8 @@ pub const Detail = struct {
     class: Class = .none,
     /// 借りた（不採用なら最初の候補の）フレームの、表示中からの差。0 は無し
     src: i16 = 0,
+    /// 候補を出した方式: 画面全体の動き（この module）か、局所の flow（local_temporal.zig）
+    kind: enum(u8) { global, local } = .global,
 };
 
 pub fn recoverFrame(frames: []const Image, track: Track, target: usize, roi: Rect, guard: Guard, opts: Options, out: []u8, prov: []Provenance, detail: ?[]Detail) Recovered {
