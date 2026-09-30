@@ -68,6 +68,9 @@
 | 復元（借りない範囲） | 別のフレームから、マスクで隠した画素（マスクが無ければ ROI + 8 px）の中は借りず、移動の確かめはその外の帯で行う。ROI がウォーターマークより 4 px 小さくても、はみ出した縁を借りない | `zig build restore-e2e` の `restore-overhang`（coverage ≥ 0.9、外れ ≤ 0.001。守る範囲が無いと coverage 0、ROI + 4 px だと外れ 0.0157） |
 | 復元（auto） | `--temporal auto`（既定）は、前後のフレームの両方から取れて値が近く（≤ 10）、帯の差 ≤ 4、動きが落ち着いた（跳ね ≤ 2 px）画素だけを戻したと数える。前後で違う物体が写っていれば採らず、跳ねたペアを越えて借りない。動画の最後のフレームでは採らない。off は借りない | `src/temporal.zig` の test `"temporal: auto takes a pixel only when the frames before and after agree, and it is exact"`、`"temporal: auto rejects a pixel whose frames before and after disagree (something moved there)"`、`"temporal: auto does not borrow across a pair whose motion jumps"` |
 | 復元（auto、合成 E2E） | auto で採った画素は外れない。毎フレーム別の模様では採らない。off は借りない | `zig build restore-e2e` の `restore-pan7-auto`、`restore-overhang-auto`（外れ ≤ 0.001）、`restore-cut-auto`、`restore-pan7-off` |
+| 局所の flow | 動く模様（ずらした正弦波）の flow を 0.2 px 以内で当てる（1.5〜12 px）。止まったウォーターマークの画素を窓の計算から外すと、隣の flow が引っぱられない（右 1 px で 9.99 → 0.18 px）。隠れた所の flow を周りから補う | `src/flow.zig` の test |
+| 局所の flow の復元（auto） | 大きな局所の動き・鎖（前後最大 45 フレーム、往復 ≤ 0.5 px、画面の端 8 px 以内に入らない）・借りる元がウォーターマークの外・候補 5 枚以上で過去と未来の両方・ずれ ≤ 8・おとり 2 か所の疑似チェック（各 100 画素以上、外れ ≤ 0.5%）をすべて満たした画素だけを temporal_real にする。動かなければ flow を求めない。おとりが不合格なら採らない。最後のフレームでは採らない。周りの動きが混ざる場面でも外れを採らない | `src/local_temporal.zig` の test |
+| 局所の flow の復元（合成 E2E） | 止まった背景の上を大きな模様の円板が動くと、画面全体の方式は何も戻せず、局所の flow は外れなしに戻す | `zig build restore-e2e` の `restore-blob-local`（coverage ≥ 0.4、外れ ≤ 0.001、おとりの外れ 0）、`restore-blob-global`（`--local-flow off` で coverage 0） |
 | debug の可視化 | `--debug` で、画素の扱い（緑 = 別のフレームから戻した、赤 = auto の条件を通らず推測で埋めた、青 = 候補なしで推測で埋めた、マゼンタ = 埋めていない）と、借りたフレーム（過去 = 青系、未来 = 橙系、遠いほど明るい、灰色 = 不採用）を横並びに描く。.mp4 なら入力と同じフレーム数・幅 2 倍の動画、ディレクトリなら 1 フレーム 1 枚の PNG | `src/debug_view.zig` の test、`zig build restore-e2e` の `restore-debug mp4 check`・`restore-debug png check` |
 | 復元（明るさ） | 借りた画素に、ROI の周りの帯で測った明るさの差（表示中 − 借りたフレーム、R/G/B の平均）を足す。露出がフレームごとに 1 ずつ変わる動画でも、戻した画素は表示中のフレームの正解と一致する | test `"temporal: recoverFrame matches the brightness of the borrowed pixels to the frame shown"` |
 | 由来 | 各画素の由来（provenance）を 1 バイトで表す: 0 `original`（ROI の外）、1 `unrecovered`、2 `temporal_real`、4 `spatial_inpainted`。3 は予約（`alpha_recovered`）。知らない値は読まない | `src/provenance.zig` の test `"provenance: byte values are part of the file format"` |
@@ -478,6 +481,41 @@ coverage / 外れ（誤差 > 32 の割合、戻した画素のうち）:
 
 解釈: 実写では画面全体の動きで借りた画素は当てにならず、auto はほぼ採らない。借りない範囲は、はみ出しのある合成では外れを消すが、
 はみ出しの無い実写では戻す量を減らし外れを増やす（大きく動くフレームほど、画面全体の動きの近似が合わない、と考える。未検証）。
+
+### 局所の optical flow（`--temporal auto`、ADR 0018）
+
+2026-09-30、同じ環境。
+
+合成（止まった背景の上を、模様の付いた半径 150 px の円板が縦に 3 px/フレームで横切る、640x360 / 10 fps / 60 フレーム / crf 23、ROI 158x68、`--fill none`）:
+
+| 設定 | coverage | 外れ | SSIM（ROI） |
+|---|---|---|---|
+| on（画面全体の動き） | 0 | — | 0.1217 |
+| auto・局所なし（`--local-flow off`） | 0 | — | 0.1217 |
+| auto・局所あり・最初の条件 | 0.514 | 0% | 0.5410 |
+| **auto・局所あり（今の条件）** | 0.463 | 0% | 0.4915 |
+
+手持ちの実写 A の疑似チェック（`scripts/temporal-pseudo-check.sh`、20 クリップ × 20 秒、ウォーターマークの無い場所の 120x72、`--temporal auto`）:
+
+| 条件 | 左上（本物の ROI を左右反転した位置） | 中央 |
+|---|---|---|
+| 局所なし（ADR 0017） | 0 画素 | 0 画素 |
+| 局所・最初の条件（3 枚・ずれ 12・往復 1 px・おとり 1 か所で外れ 1%） | 3,590 画素・外れ 11.8% | 95,474 画素・外れ 1.18% |
+| **局所・今の条件** | 0 画素 | 282 画素・外れ 0%（PSNR 33.6 dB） |
+
+同じ実写の 8 区間（静止カメラ 6・手持ち 2）に合成のウォーターマークを中央に焼いた 16 ケース（10 秒、正解あり、ROI = 外接矩形 + 6 px、auto・harmonic）:
+
+| 条件 | SSIM（外接矩形、平均） | 局所で戻した画素 | その外れ | 1 ケースの時間（平均） |
+|---|---|---|---|---|
+| 局所なし | 0.4921 | — | — | 20.4 秒 |
+| 局所・最初の条件 | 0.4921 | 2,796 | 1.79%（手持ちの 1 ケースで 2.6%） | 32.9 秒 |
+| **局所・今の条件** | 0.4921 | 0 | — | 36.2 秒 |
+
+今の条件では、静止カメラの 12 ケースはすべてのフレームが関門で止まる（試さない）。試したフレーム（中くらいの動きと手持ちの 4 ケース）は、
+すべておとりで 100 画素を採れずに不合格だった。時間は試したケースで増える（手持ち 25 → 106 秒）。
+
+解釈: 局所の flow で確かに運べるのは、大きな模様が前後それぞれ見える位置まで動く場面に限られ、手持ちの実写では採れる画素がほぼ無い。
+条件を緩めると、実写で外れが増える（上の最初の条件）。
 
 ### YUV と RGB の往復（デコード → 書き出し）
 
