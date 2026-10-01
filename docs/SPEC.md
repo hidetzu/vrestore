@@ -65,6 +65,7 @@
 | マスク（勾配、合成 E2E） | 毎フレーム別の模様の背景で、`--mask gradient` + harmonic が SSIM ≥ 0.73（実測 0.755、`--mask auto` は 0.689）、再現率 ≥ 0.99 | `zig build restore-e2e` の `restore-cut-gradient`（check-mask を含む。3 px 広げると 0.685 で落ちる） |
 | マスク（勾配の自己判定、ADR 0020） | 帯（ROI の外）・おとり（ROI の隣の同じ大きさの範囲）でウォーターマークらしい画素が多い、ROI の中のどのフレームでも同じ輪郭を取りこぼしている、のどれかなら信用せず `--mask auto` に戻す。背景が動かない模様では帯で信用しない。背景の水準に近い 2 色の板の境目を取りこぼすと信用しない。おとりは画面に収まる所にだけ置く | `src/wgrad.zig` の test `"wgrad: on a background that never moves, the background's edges stand out too, so it is not trusted"`、`"wgrad: a watermark close to the background level is missed, and the steady edge inside it says so"`、`"wgrad: decoys go below, above, right, then left of the area, only where they fit"` |
 | マスク（既定、合成 E2E） | 既定（`--mask` を渡さない）は gradient で、信用できれば使う（毎フレーム別の模様で SSIM ≥ 0.73）。模様のある背景が動かないと信用せず auto に戻す（auto も見分けられず ROI 全体を埋める） | `zig build restore-e2e` の `restore-cut-default`、`restore-still-gradient`（戻す処理を外すと落ちる） |
+| マスク（信用できないときの案内、ADR 0021） | gradient を信用できず auto に戻したとき、理由と `scripts/sam-mask.py`（1 枚のフレームから MobileSAM で作るマスク、`--mask-image` で渡す）を標準エラーで案内する | `zig build restore-e2e` の `restore-still-gradient`（標準エラーの文を照合）。スクリプト自体は CI で回さない（PyTorch が要る） |
 | マスク（外から与える / 書き出す） | `--mask-out` で使ったマスクを動画と同じ大きさの画像に書き、`--mask-image` でそのまま読み戻せる（値が alpha。0〜255 の途中は元のフレームと混ぜる）。大きさが違えば理由を言って止まる。`--frames n` で先頭 n フレームだけ復元する（マスクは動画全体から推定） | `zig build test` の `cli_mask_out`、`cli_mask_image`、`cli_mask_image_size`。混ぜ方は `src/restore_cmd.zig` の test `"blendWithOriginal: mixes only the guessed pixels, by alpha, and leaves real and original pixels alone"` |
 | 埋めの落ち着かせ | 前のフレームでも埋めた画素は、見えている背景の明るさの変化 Δ を足した前の値と混ぜる（λ = 0.3）。明るさが 1 フレームに +1 変わる背景で、埋めた値の乱れ（±6）が半分未満になり、フェードに遅れない（±3 以内）。範囲の中をすべて埋めていても周りの画素で Δ を測る。見えている画素がばらばらに変わる（動いた）ときは混ぜない | `src/stabilize.zig` の test `"stabilize: a static background averages the jitter of the fill, and a fade is followed without lag"`、`"stabilize: the brightness change is measured around the area when every pixel in it is guessed"`、`"stabilize: when the visible background changes (it moved), the fill is not blended"` |
 | 埋めの落ち着かせ（合成 E2E） | 動かない背景では全フレームで混ぜ、動く背景では混ぜない | `zig build restore-e2e` の `restore-flat-fill`（`stable_fill.blended` ≥ 59）、`restore-pan7-fill`（≤ 0） |
@@ -135,7 +136,7 @@ yuv420p の動画を `ffmpeg -vf crop` で切ると座標と大きさが偶数�
 |---|---|
 | 実写での Temporal Recovery の既定での使用（on） | 画面全体の動きで借りた画素は、実写では外れがある（疑似チェックで画面の端 8.0%、中央 1.5%）。既定は auto で、確かめを通った画素だけを採る（ADR 0017） |
 | 背景復元の Alpha Inversion / 生成 | Temporal と Spatial（推測、既定では行わない）だけ（[ADR 0005](adr/0005-temporal-recovery-copies-real-pixels-and-leaves-the-rest-unrecovered.md)、[ADR 0008](adr/0008-spatial-inpainting-is-opt-in-and-never-counted-as-recovered.md)） |
-| 背景が止まり模様のある動画・数秒の動画でのマスクの改善 | 既定は gradient で、信用できなければ auto に戻す（ADR 0020）。止まった模様の背景では時間方向の手がかりが無く、none・auto・gradient のどれも正解の形に届かない（§4）。外から与える `--mask-image` だけが使える |
+| 1 枚のフレームからのマスク（MobileSAM）の本体への組み込み | 外のスクリプト（`scripts/sam-mask.py`）で作り `--mask-image` で渡す（ADR 0021）。実行時の依存（PyTorch / ONNX Runtime）を増やさない |
 | Temporal の被写体ごとの動き（ROI 周辺の block motion / optical flow） | 動きは画面全体の affine（ADR 0007）。手持ちの実写で戻らないのは、背景が窓の中で露出していないためで、局所的な動きを追っても戻らない（SPEC §4） |
 | ウォーターマークの自動発見 | 解く問題を「指定されたものの位置」に絞る |
 | 音声の再符号化、MP4 以外の出力形式、映像のコーデックの選択 | 出力は H.264（libx264）の MP4 だけ。音声はそのまま写し、MP4 に入らない形式なら止めて `--audio none` を案内する（ADR 0013） |
@@ -496,6 +497,30 @@ none との差の最悪は −0.143（720p の録画の 1 ケース、外周 1 p
 
 解釈: 動きのある長い動画では、判定を通った gradient が正解の形と同程度まで届く。止まった模様の背景・録画・数秒の動画は auto に戻り、
 none とほぼ同じ（差 −0.029〜+0.01）。そこで正解の形との差（0.08〜0.26）が残るのは、時間方向の手がかりが無いため。
+
+### 1 枚のフレームからのマスク（MobileSAM、ADR 0021）
+
+2026-10-01〜02、同じ環境（PyTorch 2.2.2・torchvision 0.17.2、Python 3.12、Rosetta 上の x86_64）。MobileSAM（vit_t）に ROI を箱で与え、
+75 枚目のフレームで切り、1 px 広げて `--mask-image` で渡す。それ以外の条件は「マスクの既定と自己判定」と同じ。
+
+| 素材 | ケース数 | 既定 | MobileSAM | 組み合わせ（gradient を信用できればそれ） | 正解の形 + 1 px | 組み合わせが既定より上 / 下 | 最悪 |
+|---|---|---|---|---|---|---|---|
+| 探索: 止めた背景（A の 2 フレーム、1080p、720p） | 24 | 0.65 前後 | — | 0.79〜0.88 | 0.72〜0.92 | 22 / 2 | −0.006 |
+| 探索: 固定カメラ全体（7 分 44 秒） | 9 | 0.923 | 0.921 | 0.926 | 0.948 | 2 / 3 | −0.016 |
+| 探索 全体（SSIM / PSNR） | 33 | 0.712 / 25.69 | 0.837 / 30.00 | 0.839 | 0.879 | 24 / 5 | −0.016 / −1.60 dB |
+| 確かめ（holdout2 で gradient を信用できなかった 12） | 12 | 0.692 / 22.27 | — | 0.799 / 26.41 | 0.823 | 12 / 0 | +0.012 |
+
+マスクの適合率 / 再現率（探索 33）: 既定 0.52 / 0.985、MobileSAM 0.88 / 0.990（IoU 0.83）。確かめ 12: 適合率 0.48 → 0.93。
+推論は 1 フレーム 0.9〜1.6 秒（CPU）。
+
+同じ残差に対して試し、採らなかったもの（探索、正解の形のマスクで）:
+
+| 試したこと | 結果 |
+|---|---|
+| 学習済みの flow（RAFT small）で穴の下を前後から運ぶ（往復一致、過去と未来 5 枚以上） | 動きのある 12 ケース × 3 フレームで、往復の許容 0.5 / 1 / 2 px でも実画素 0.01% / 0.05% / 0.24%、SSIM 0.9627 → 0.9628。運ぶ先がまたウォーターマークの中で、両側がそろわない |
+| `--temporal on`（確かめの緩い画面全体の方式）で細い穴を借りる | 動きのある 42 ケースで実画素 0.07% → 3.8%、外れ平均 5.7%（最大 65%）、SSIM 0.852 → 0.851 |
+| 1 フレームの埋め方（TV・双調和） | 中ほどの 1 フレームで harmonic 0.9266、TV 0.9231。双調和は 21 ケースで SSIM 0.9235 → 0.9279 だが誤差 10.55 → 11.94 |
+| マスクを広げる（2 px、閾値 16、ヒステリシス）・埋める範囲だけ広げる | 84 ケースで 0.789 → 0.755〜0.779 |
 
 ### 埋めの落ち着かせ（`--stable-fill`、ADR 0015）
 
