@@ -150,7 +150,8 @@ const usage =
     \\  --show-provenance       with --restore, show the provenance colors (as pressing P)
     \\  --motion <m>            translation or affine (as pressing M)
     \\  --fill <f>              none, directional or harmonic (F toggles none / harmonic)
-    \\  --mask <m>              none or auto (K toggles): hide only the watermark's own pixels
+    \\  --mask <m>              gradient (default), auto or none (K cycles): hide only the watermark's own
+    \\                          pixels; gradient falls back to auto when its shape cannot be trusted
     \\  --temporal <t>          auto, on or off (T cycles): take pixels from other frames (see vrestore --help)
     \\  --screenshot <png>      with --detect-and-exit, also save what the window shows
     \\  --export <out.mp4>      with --detect-and-exit, export every frame as E does (the same child
@@ -190,6 +191,8 @@ const App = struct {
     /// 別のフレームから借りるか（T で auto → on → off と切り替え）
     temporal_mode: temporal.Mode = restore_cmd.default_temporal,
     mask: ?wmask.Estimate = null,
+    /// 推定したときに実際に使ったマスク（gradient を信用できなければ auto、restore_cmd.chooseMask）。null ならまだ推定していない
+    mask_used: ?restore_cmd.MaskMode = null,
     /// 表示用の画素（処理後で、戻せなかった画素をマゼンタにしたもの）
     display: []u8,
     /// 映像の上に重ねる操作パネルと、再生の時計
@@ -433,19 +436,21 @@ const App = struct {
     /// 復元の後、戻せなかった画素のうち埋めるものを絞るマスク。使うなら、必要になった時に一度だけ推定する
     fn hiddenMask(app: *App, roi_rect: temporal.Rect) !?restore_cmd.Hidden {
         if (app.mask_mode == .none) return null;
-        const area = restore_cmd.maskArea(app.mask_mode, roi_rect, app.dec.info.width, app.dec.info.height);
-        if (app.mask == null) {
+        if (app.mask_used == null) {
             var d = try video.Decoder.open(app.path);
             defer d.close();
-            app.mask = try restore_cmd.estimateMask(app.gpa, &d, app.mask_mode, area, roi_rect);
+            const ch = try restore_cmd.chooseMask(app.gpa, &d, app.mask_mode, roi_rect);
+            app.mask = ch.estimate;
+            app.mask_used = ch.used;
         }
-        const m = app.mask.?;
-        return .{ .mask = m.hidden, .area = area };
+        const m = app.mask orelse return null;
+        return .{ .mask = m.hidden, .area = restore_cmd.maskArea(app.mask_used.?, roi_rect, app.dec.info.width, app.dec.info.height) };
     }
 
     fn clearMask(app: *App) void {
         if (app.mask) |m| m.deinit(app.gpa);
         app.mask = null;
+        app.mask_used = null;
     }
 
     fn detect(app: *App) !void {
@@ -828,7 +833,12 @@ pub fn main(init: std.process.Init) !u8 {
                         },
                         sdl.SDL_SCANCODE_K => {
                             app.clearRestored();
-                            app.mask_mode = if (app.mask_mode == .none) .auto else .none;
+                            app.clearMask();
+                            app.mask_mode = switch (app.mask_mode) {
+                                .gradient => .auto,
+                                .auto => .none,
+                                .none => .gradient,
+                            };
                         },
                         sdl.SDL_SCANCODE_F => {
                             app.clearRestored();
@@ -953,7 +963,9 @@ fn info(w: *Io.Writer, app: *const App) !void {
         if (app.recovered.counts.get(.spatial_inpainted) > 0) try w.print("  inpainted {d:.1}%", .{app.recovered.fraction(.spatial_inpainted) * 100});
         try w.print("  unrecovered {d:.1}%  {s}/{s}/temporal {s}", .{ app.recovered.fraction(.unrecovered) * 100, @tagName(app.motion_model), @tagName(app.fill), @tagName(app.temporal_mode) });
         if (app.mask) |m| {
-            if (m.accepted) try w.print("  mask {d:.0}%", .{m.fraction * 100}) else try w.writeAll("  mask: whole ROI + edges");
+            try w.print("  mask {s}", .{@tagName(app.mask_used.?)});
+            if (app.mask_used.? != app.mask_mode) try w.print(" (not {s})", .{@tagName(app.mask_mode)});
+            if (m.accepted) try w.print(" {d:.0}%", .{m.fraction * 100}) else try w.writeAll(": whole ROI + edges");
         }
         return;
     }
