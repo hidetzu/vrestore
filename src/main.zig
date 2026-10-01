@@ -54,10 +54,11 @@ const usage =
     \\      --progress <file>   rewrite <file> every 15 frames with "frames <done> <expected total>"
     \\      --window <n>        frames to look at on each side, 1-255 (default 15)
     \\      --motion <m>        translation (whole-frame shift) or affine (shift + rotation + zoom)
-    \\      --mask <m>          none (hide the whole ROI), auto (hide only the watermark's own pixels, found as
-    \\                          those that stay the same across the video) or gradient (find the watermark's
-    \\                          shape from the edges that stay the same over 150 frames spread over the video;
-    \\                          works best on long videos)
+    \\      --mask <m>          gradient (default): find the watermark's shape from the edges that stay the
+    \\                          same over 150 frames spread over the video, check it (the band around the ROI
+    \\                          and a decoy next to it must stay empty, and no steady edge may be left out)
+    \\                          and fall back to auto when it cannot be trusted. auto: hide the pixels that
+    \\                          stay the same across the video. none: hide the whole ROI
     \\      --mask-out <png>    also write the mask used (0 = kept, 255 = replaced) as an image the size of the
     \\                          video; it can be given back with --mask-image
     \\      --frames <n>        restore only the first <n> frames (the mask is still estimated from the whole video)

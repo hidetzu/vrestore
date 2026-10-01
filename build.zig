@@ -509,6 +509,8 @@ const RestoreCase = struct {
     temporal: []const u8 = "on",
     /// restore に足す引数
     extra: []const []const u8 = &.{},
+    /// true なら --mask を渡さず既定を確かめる（mask が null のケースは、既定が変わっても同じものを確かめるよう --mask none を渡す）
+    default_mask: bool = false,
     /// tools/roi_fixture check-restore の条件
     expect: []const u8,
 };
@@ -546,7 +548,12 @@ const restore_cases = [_]RestoreCase{
     .{ .roi = .{ .spec = "name=restore-cut-mask,bg=cut,x=240,y=150,frames=60", .crf = 23 }, .fill = "harmonic", .mask = "auto", .expect = "coverage<=0,ssim>=0.67,mask_accepted>=1" },
     // 同じ素材で、動画全体の勾配の中央値から形を推定する（--mask gradient、ADR 0019）。文字の間の背景を残せる。
     // 実測（crf 23）: SSIM 0.755（--mask auto は 0.689）。再現率 1.0000
-    .{ .roi = .{ .spec = "name=restore-cut-gradient,bg=cut,x=240,y=150,frames=60", .crf = 23 }, .fill = "harmonic", .mask = "gradient", .expect = "coverage<=0,mask_accepted>=1,ssim>=0.73" },
+    .{ .roi = .{ .spec = "name=restore-cut-gradient,bg=cut,x=240,y=150,frames=60", .crf = 23 }, .fill = "harmonic", .mask = "gradient", .expect = "coverage<=0,mask_accepted>=1,ssim>=0.73,mask_trust.reliable>=1" },
+    // 模様のある背景が動かない: 背景の輪郭も「どのフレームでも同じ勾配」なので、帯とおとりで信用しないと判定し、
+    // auto に戻す（ADR 0020）。auto も見分けられず ROI 全体を埋める。実測: 帯 0.71、おとり 0.87
+    .{ .roi = .{ .spec = "name=restore-still-gradient,bg=pan,pan_x=0,pan_y=0,x=240,y=150,frames=60", .crf = 23 }, .fill = "harmonic", .mask = "gradient", .expect = "mask_trust.reliable<=0,mask_accepted<=0,provenance.spatial_inpainted.fraction>=1" },
+    // 既定（--mask を渡さない）は gradient で、信用できれば使う
+    .{ .roi = .{ .spec = "name=restore-cut-default,bg=cut,x=240,y=150,frames=60", .crf = 23 }, .fill = "harmonic", .default_mask = true, .expect = "coverage<=0,mask_trust.reliable>=1,ssim>=0.73" },
     // ROI がウォーターマークより 4 px 小さい（文字の外接矩形 241..383 x 151..201 を 4 px 縮めた）。はみ出した縁を借りず、
     // 周りの帯もその外で確かめる（temporal.Guard、ROI + 8 px）。実測（crf 23）: coverage 0.995、外れ 0.0001。
     // 守る範囲が無いと帯で全フレームが拒否されて coverage 0、ROI + 4 px だと外れ 0.0157
@@ -602,7 +609,7 @@ fn restoreCase(b: *std.Build, tool: *std.Build.Step.Compile, exe: *std.Build.Ste
     restore.addArgs(c.extra);
     if (c.motion) |m| restore.addArgs(&.{ "--motion", m });
     if (c.fill) |f| restore.addArgs(&.{ "--fill", f });
-    if (c.mask) |m| restore.addArgs(&.{ "--mask", m });
+    if (!c.default_mask) restore.addArgs(&.{ "--mask", c.mask orelse "none" });
     if (c.rect) |r| {
         restore.addArgs(&.{ "--rect", r });
     } else {

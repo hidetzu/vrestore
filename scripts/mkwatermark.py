@@ -8,6 +8,7 @@ PIL と CJK フォントが要るので CI では使わない。CI の合成素�
 
 design:
   jp-block  日本語 2 行 + 英字 2 行、赤と青、黒の縁取り（よくある配布元表記の形）
+  jp-yellow 黄色の 4 行に太い黒の縁取り（文字が密で、縁取りでつながる形）
   url       URL 1 行、白、黒の縁取り
   repeat    同じ語を 3 回繰り返した 1 行（「PSR は高いが位置が違う」を起こしやすい）
   logo      円と四角の図形 + 短い語
@@ -26,6 +27,7 @@ FONTS = [
 
 RED = (255, 40, 40)
 BLUE = (40, 110, 255)
+YELLOW = (250, 230, 40)
 WHITE = (255, 255, 255)
 
 
@@ -85,6 +87,14 @@ def main():
         img = text_block([("SAMPLE SAMPLE SAMPLE", WHITE, z(40))])
     elif design == "logo":
         img = logo(k)
+    elif design == "jp-yellow":
+        # 黄色の文字に太い黒の縁取りの 4 行（実写に元から焼かれていた種類の見た目）
+        img = text_block([
+            ("見本娯楽城本店", YELLOW, z(34)),
+            ("網上見本登録中", YELLOW, z(34)),
+            ("開戸無料送58元", YELLOW, z(34)),
+            ("www.sample.invalid", YELLOW, z(30)),
+        ], stroke=max(2, int(3 * k)))
     elif design == "small":
         img = text_block([("@sample", WHITE, z(24))], stroke=1)
     else:

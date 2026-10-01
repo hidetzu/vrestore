@@ -26,7 +26,8 @@ pub const progress_every = 15;
 
 /// --out の MP4 に元の音声を入れるか
 pub const AudioMode = enum { copy, none };
-pub const default_mask: MaskMode = .none;
+/// 既定は gradient（信用できなければ auto に戻す、docs/adr/0020）
+pub const default_mask: MaskMode = .gradient;
 /// マスクを推定するときに動画全体から取るフレーム数
 pub const mask_frames = 60;
 /// --mask gradient で動画全体から取るフレーム数。背景の勾配が打ち消し合うには多いほどよい（5 分の実写で 150 枚、約 20 秒）
@@ -179,12 +180,12 @@ fn loadMaskImage(gpa: std.mem.Allocator, path: [:0]const u8, area: temporal.Rect
     return .{ .hidden = hidden, .alpha = alpha, .accepted = true, .fraction = @as(f32, @floatFromInt(count)) / @as(f32, @floatFromInt(n)), .threshold = 0, .inside_mad = 0, .outside_mad = 0 };
 }
 
-/// 動画全体から等間隔に `n` 枚取り、`area` を切り出して返す。全画面を溜めない（1080p で 150 枚なら約 900 MB になる）。
-/// `d` は読む位置が変わる
-fn sampleCrops(arena: std.mem.Allocator, d: *video.Decoder, n: usize, area: temporal.Rect) ![][]u8 {
-    var out: std.ArrayList([]u8) = .empty;
+/// 動画全体から等間隔に `n` 枚取り、`areas` のそれぞれを切り出して返す（[範囲][フレーム]）。全画面を溜めない
+/// （1080p で 150 枚なら約 900 MB になる）。`d` は読む位置が変わる
+fn sampleCrops(arena: std.mem.Allocator, d: *video.Decoder, n: usize, areas: []const temporal.Rect) ![][][]u8 {
+    const out = try arena.alloc(std.ArrayList([]u8), areas.len);
+    for (out) |*o| o.* = .empty;
     const buf = try arena.alloc(u8, d.frameBytes());
-    const row = @as(usize, area.w) * 3;
     const duration = d.info.duration_sec;
     for (0..n) |i| {
         // video.sampleFrames と同じ時刻（末尾ぎりぎりは尺の誤差で空振りするので少し内側に寄せる）
@@ -193,33 +194,91 @@ fn sampleCrops(arena: std.mem.Allocator, d: *video.Decoder, n: usize, area: temp
             if (duration == null) break;
             continue;
         };
-        const c = try arena.alloc(u8, row * area.h);
-        for (0..area.h) |j| @memcpy(c[j * row ..][0..row], f.rgb[((area.y + j) * f.width + area.x) * 3 ..][0..row]);
-        try out.append(arena, c);
+        for (areas, out) |area, *o| {
+            const row = @as(usize, area.w) * 3;
+            const c = try arena.alloc(u8, row * area.h);
+            for (0..area.h) |j| @memcpy(c[j * row ..][0..row], f.rgb[((area.y + j) * f.width + area.x) * 3 ..][0..row]);
+            try o.append(arena, c);
+        }
     }
-    return out.items;
+    const res = try arena.alloc([][]u8, areas.len);
+    for (res, out) |*r, o| r.* = o.items;
+    return res;
 }
+
+/// gradient のマスクを信用してよいかの判定（wgrad.judge）と、その材料
+pub const GradientTrust = struct {
+    ring: ?f32,
+    /// ROI の中の、どのフレームでも同じ輪郭のうち、隠す画素に入らなかった割合
+    leak: f32,
+    /// おとりで閾値を超えた割合の最大。おとりが画面に収まらなければ null
+    decoy: ?f32,
+    decoys: usize,
+    distrust: std.EnumSet(wgrad.Distrust),
+};
 
 /// ROI の中でウォーターマークの画素を見分ける。`area` は推定する範囲（マスクの範囲）、`inner` はその中の本来の ROI
 /// （見分けられなかったときに使う）。auto は変わりにくさ（wmask.zig、`mask_frames` 枚）、gradient は勾配の時間方向の
 /// 中央値（wgrad.zig、`gradient_frames` 枚）。`d` は読む位置が変わる
 pub fn estimateMask(gpa: std.mem.Allocator, d: *video.Decoder, mode: MaskMode, area: temporal.Rect, inner: temporal.Rect) !wmask.Estimate {
+    return (try estimateMaskJudged(gpa, d, mode, area, inner)).estimate;
+}
+
+/// 使うマスクを決める（restore と GUI の共通の入口）。gradient は形を推定して信用してよいかを判定し、信用できなければ
+/// auto（変わりにくさ）に戻す（docs/adr/0020）。none なら推定しない。`d` は読む位置が変わる
+pub const Chosen = struct {
+    /// null なら ROI 全体を隠す
+    estimate: ?wmask.Estimate,
+    /// 実際に使ったマスク
+    used: MaskMode,
+    trust: ?GradientTrust,
+};
+
+pub fn chooseMask(gpa: std.mem.Allocator, d: *video.Decoder, mode: MaskMode, rect: temporal.Rect) !Chosen {
+    if (mode == .none) return .{ .estimate = null, .used = .none, .trust = null };
+    const area = maskArea(mode, rect, d.info.width, d.info.height);
+    const j = try estimateMaskJudged(gpa, d, mode, area, rect);
+    if (j.trust) |t| if (t.distrust.count() > 0) {
+        j.estimate.deinit(gpa);
+        return .{ .estimate = try estimateMask(gpa, d, .auto, maskArea(.auto, rect, d.info.width, d.info.height), rect), .used = .auto, .trust = t };
+    };
+    return .{ .estimate = j.estimate, .used = mode, .trust = j.trust };
+}
+
+/// `estimateMask` と同じ。gradient なら、帯とおとりで信用してよいかも判定する（それ以外は trust = null）
+pub fn estimateMaskJudged(gpa: std.mem.Allocator, d: *video.Decoder, mode: MaskMode, area: temporal.Rect, inner: temporal.Rect) !struct { estimate: wmask.Estimate, trust: ?GradientTrust } {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const crops = try sampleCrops(arena, d, if (mode == .gradient) gradient_frames else mask_frames, area);
+    const dc = wgrad.decoys(.{ .x = area.x, .y = area.y, .w = area.w, .h = area.h }, d.info.width, d.info.height);
+    var areas: [3]temporal.Rect = undefined;
+    areas[0] = area;
+    const n_areas: usize = if (mode == .gradient) 1 + dc.n else 1;
+    for (dc.rects[0..dc.n], 1..) |r, k| areas[k] = .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h };
+    const all = try sampleCrops(arena, d, if (mode == .gradient) gradient_frames else mask_frames, areas[0..n_areas]);
+    const crops = all[0];
     const in: wmask.Rect = .{ .x = inner.x - area.x, .y = inner.y - area.y, .w = inner.w, .h = inner.h };
     if (crops.len < 3) {
         // フレームが足りず見分けられない。ROI 全体を隠す
         const hidden = try gpa.alloc(bool, @as(usize, area.w) * area.h);
         @memset(hidden, false);
         for (in.y..in.y + in.h) |y| @memset(hidden[y * area.w + in.x ..][0..in.w], true);
-        return .{ .hidden = hidden, .alpha = try wmask.alphaOf(gpa, hidden), .accepted = false, .fraction = 1, .threshold = 0, .inside_mad = 0, .outside_mad = 0 };
+        const est: wmask.Estimate = .{ .hidden = hidden, .alpha = try wmask.alphaOf(gpa, hidden), .accepted = false, .fraction = 1, .threshold = 0, .inside_mad = 0, .outside_mad = 0 };
+        return .{ .estimate = est, .trust = if (mode == .gradient) .{ .ring = null, .leak = 0, .decoy = null, .decoys = 0, .distrust = .initOne(.not_separated) } else null };
     }
-    return switch (mode) {
-        .gradient => (try wgrad.estimate(gpa, crops, area.w, area.h, .{ .inner = in })).estimate,
-        else => wmask.estimate(gpa, crops, area.w, area.h, .{ .inner = in }),
-    };
+    if (mode != .gradient) return .{ .estimate = try wmask.estimate(gpa, crops, area.w, area.h, .{ .inner = in }), .trust = null };
+    const p: wgrad.Params = .{ .inner = in };
+    const r = try wgrad.estimate(gpa, crops, area.w, area.h, p);
+    // おとりも同じ手順で: ROI 相当の範囲（同じ相対位置）で閾値を超えた割合
+    var decoy: ?f32 = null;
+    for (all[1..]) |dcrops| {
+        const st = try wgrad.stands(gpa, dcrops, area.w, area.h, p);
+        defer gpa.free(st.map);
+        defer gpa.free(st.edge);
+        const f = wgrad.fractionOf(st.map, area.w, area.h, in, true).?;
+        decoy = @max(decoy orelse 0, f);
+    }
+    return .{ .estimate = r.estimate, .trust = .{ .ring = r.ring_fraction, .leak = r.leak_fraction, .decoy = decoy, .decoys = dc.n, .distrust = wgrad.judge(r, decoy, .{}) } };
 }
 
 /// Temporal の後に残った unrecovered を振り分けて埋め、由来を数え直す。
@@ -431,7 +490,8 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
     // マスク: 別に開いた decoder で動画全体から取る（流す方の読む位置を変えない）
     var mask_est: ?wmask.Estimate = null;
     defer if (mask_est) |m| m.deinit(gpa);
-    const mask_mode: MaskMode = if (args.mask_image != null) .auto else args.mask;
+    var mask_mode: MaskMode = if (args.mask_image != null) .auto else args.mask;
+    var grad_trust: ?GradientTrust = null;
     if (args.mask_image) |mp| {
         mask_est = loadMaskImage(gpa, try arena.dupeZ(u8, mp), maskArea(.auto, rect, w, h), w, h) catch |e| {
             try err.print("vrestore: could not use the mask image '{s}': {s}\n", .{ mp, if (e == error.SizeMismatch) "it must be the same size as the video" else @errorName(e) });
@@ -440,13 +500,18 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
     } else if (args.mask != .none) {
         var d2 = try video.Decoder.open(try arena.dupeZ(u8, args.video));
         defer d2.close();
-        mask_est = try estimateMask(gpa, &d2, mask_mode, maskArea(mask_mode, rect, w, h), rect);
+        const ch = try chooseMask(gpa, &d2, mask_mode, rect);
+        mask_est = ch.estimate;
+        grad_trust = ch.trust;
+        mask_mode = ch.used;
     }
     // 見分けられなかったときは ROI 全体を隠す（広げた範囲は使わない）
     // 見分けられなかったときも、ROI の中すべてと、周りの帯のはみ出した縁を隠すマスクになっている（wmask.Params.inner）
     if (args.mask_out) |mo| {
         const png_rgb = try arena.alloc(u8, @as(usize, w) * h * 3);
         @memset(png_rgb, 0);
+        // マスクを使わないときは ROI 全体を置き換える
+        if (mask_est == null) for (rect.y..rect.y + rect.h) |yy| @memset(png_rgb[(yy * w + rect.x) * 3 ..][0 .. rect.w * 3], 255);
         if (mask_est) |m| {
             const area = maskArea(mask_mode, rect, w, h);
             for (0..area.h) |yy| for (0..area.w) |xx| {
@@ -660,6 +725,17 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
         try summary.print(",\"local_flow\":{{\"frames\":{d},\"gated_light\":{d},\"gated_motion\":{d},\"gated_cooldown\":{d},\"decoy_early\":{d},\"decoy_failed\":{d},\"decoy_accepted\":{d},\"decoy_wrong\":{d},\"accepted\":{d},\"rejected\":{d},\"pairs_computed\":{d}}}", .{ ls.frames, ls.gated_light, ls.gated_motion, ls.gated_cooldown, ls.decoy_early, ls.decoy_failed, ls.decoy_accepted, ls.decoy_wrong, ls.accepted, ls.rejected, ls.pairs_computed });
     } else if (args.temporal == .auto and args.local_flow) try summary.writeAll(",\"local_flow\":\"no room for the decoy\"");
     if (args.mask_image != null) try summary.writeAll(",\"mask\":\"image\"") else try summary.print(",\"mask\":\"{s}\"", .{@tagName(args.mask)});
+    if (grad_trust) |t| {
+        try summary.print(",\"mask_trust\":{{\"reliable\":{},\"ring\":", .{t.distrust.count() == 0});
+        if (t.ring) |v| try summary.print("{d:.4}", .{v}) else try summary.writeAll("null");
+        try summary.print(",\"leak\":{d:.4},\"decoy\":", .{t.leak});
+        if (t.decoy) |v| try summary.print("{d:.4}", .{v}) else try summary.writeAll("null");
+        try summary.print(",\"decoys\":{d},\"reasons\":[", .{t.decoys});
+        var it = t.distrust.iterator();
+        var first = true;
+        while (it.next()) |r| : (first = false) try summary.print("{s}\"{s}\"", .{ if (first) "" else ",", @tagName(r) });
+        try summary.print("],\"used\":\"{s}\"}}", .{@tagName(mask_mode)});
+    }
     if (stable) |st| try summary.print(",\"stable_fill\":{{\"blended\":{d},\"reset\":{d}}}", .{ st.blended, st.reset });
     if (mask_est) |m| try summary.print(",\"mask_accepted\":{},\"mask_fraction\":{d:.4},\"mask_inside_mad\":{d:.2},\"mask_outside_mad\":{d:.2},\"mask_blended\":{d}", .{ m.accepted, m.fraction, m.inside_mad, m.outside_mad, n_blended });
     if (mp4_w) |*m| {
