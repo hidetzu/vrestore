@@ -708,11 +708,11 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
     }
     if (want_raw) try raw_w.interface.flush();
     if (args.progress_out) |pp| try writeProgress(io, pp, next_target, next_target);
-    if (debug_mp4) |*m| m.finish() catch |e| {
+    if (debug_mp4) |*m| m.finish(true) catch |e| {
         try err.print("vrestore: could not write '{s}': {s}\n", .{ args.debug_out.?, mp4.describe(e) });
         return 1;
     };
-    if (mp4_w) |*m| m.finish() catch |e| {
+    if (mp4_w) |*m| m.finish(args.max_frames != null) catch |e| {
         try err.print("vrestore: could not write '{s}': {s}\n", .{ args.mp4_out.?, mp4.describe(e) });
         return 1;
     };

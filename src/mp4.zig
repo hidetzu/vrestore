@@ -242,11 +242,13 @@ pub const Writer = struct {
         }
     }
 
-    /// エンコーダに残ったフレームと、残りの音声を書いて閉じる
-    pub fn finish(w: *Writer) Error!void {
+    /// エンコーダに残ったフレームと、残りの音声を書いて閉じる。`audio_to_video_end` なら、音声は最後に書いた映像の
+    /// フレームの終わりまでで止める（入力の途中で止めたとき。restore --frames）
+    pub fn finish(w: *Writer, audio_to_video_end: bool) Error!void {
         if (c.avcodec_send_frame(w.enc, null) < 0) return error.EncodeFailed;
         try w.drain();
-        try w.writeAudioUntil(std.math.inf(f64));
+        const until = if (audio_to_video_end and w.last_pts != null) tsToSec(w.last_pts.? + w.frame_ticks, w.src_tb) else std.math.inf(f64);
+        try w.writeAudioUntil(until);
         if (c.av_write_trailer(w.oc) < 0) return error.WriteFailed;
     }
 

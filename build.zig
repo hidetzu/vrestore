@@ -729,6 +729,25 @@ fn exportCase(b: *std.Build, tool: *std.Build.Step.Compile, exe: *std.Build.Step
     achk.addFileArg(out_mp4);
     achk.expectExitCode(0);
     chk.step.dependOn(&achk.step);
+
+    // --frames で途中まで書き出したら、音声もそこで止める（前は音声を最後まで写していた。60 フレーム中 30 で全体の約半分）
+    const part = b.addRunArtifact(exe);
+    part.setName(name ++ " restore --frames 30");
+    part.addArgs(&.{ "restore", "--frames", "30", "--roi" });
+    part.addFileArg(roi_json);
+    part.addArg("--out");
+    _ = part.addOutputFileArg("part.mp4");
+    part.addFileArg(with_audio);
+    const part_json = part.captureStdOut(.{});
+    _ = part.captureStdErr(.{});
+    const pchk = b.addRunArtifact(tool);
+    pchk.setName(name ++ " check --frames 30");
+    pchk.addArgs(&.{ "check-restore", name ++ "-part" });
+    pchk.addFileArg(part_json);
+    pchk.addFileArg(cmp_json);
+    pchk.addArg("out.frames<=30,out.audio.copied_packets>=100,out.audio.copied_packets<=160");
+    pchk.expectExitCode(0);
+    chk.step.dependOn(&pchk.step);
     return &chk.step;
 }
 
@@ -741,6 +760,7 @@ fn debugCase(b: *std.Build, tool: *std.Build.Step.Compile, exe: *std.Build.Step.
     const dbg_mp4 = run_mp4.addOutputFileArg("debug.mp4");
     run_mp4.addFileArg(v.mp4);
     _ = run_mp4.captureStdOut(.{});
+    _ = run_mp4.captureStdErr(.{});
     const chk_mp4 = b.addSystemCommand(&.{
         "sh", "-c",
         \\r=$(ffprobe -v error -count_frames -select_streams v -show_entries stream=width,height,nb_read_frames -of csv=p=0 "$0")
@@ -755,6 +775,7 @@ fn debugCase(b: *std.Build, tool: *std.Build.Step.Compile, exe: *std.Build.Step.
     const dbg_dir = run_png.addOutputDirectoryArg("debug");
     run_png.addFileArg(v.mp4);
     _ = run_png.captureStdOut(.{});
+    _ = run_png.captureStdErr(.{});
     const chk_png = b.addSystemCommand(&.{
         "sh", "-c",
         \\n=$(ls "$0" | grep -c '^frame-[0-9]\{6\}\.png$'); w=$(ffprobe -v error -show_entries stream=width -of csv=p=0 "$0/frame-000019.png")
