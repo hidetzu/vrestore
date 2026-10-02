@@ -504,6 +504,14 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
         mask_est = ch.estimate;
         grad_trust = ch.trust;
         mask_mode = ch.used;
+        if (ch.trust) |t| if (t.distrust.count() > 0) {
+            // 背景が止まっていて模様がある・短い動画など。1 枚の画像から作ったマスクを外から与えられる（docs/adr/0021）
+            try err.writeAll("vrestore: the watermark shape from --mask gradient could not be trusted (");
+            var it = t.distrust.iterator();
+            var first = true;
+            while (it.next()) |r| : (first = false) try err.print("{s}{s}", .{ if (first) "" else ", ", @tagName(r) });
+            try err.writeAll("), so --mask auto is used. A mask made from one frame (scripts/sam-mask.py) can be given with --mask-image\n");
+        };
     }
     // 見分けられなかったときは ROI 全体を隠す（広げた範囲は使わない）
     // 見分けられなかったときも、ROI の中すべてと、周りの帯のはみ出した縁を隠すマスクになっている（wmask.Params.inner）
@@ -700,11 +708,11 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, arg
     }
     if (want_raw) try raw_w.interface.flush();
     if (args.progress_out) |pp| try writeProgress(io, pp, next_target, next_target);
-    if (debug_mp4) |*m| m.finish() catch |e| {
+    if (debug_mp4) |*m| m.finish(true) catch |e| {
         try err.print("vrestore: could not write '{s}': {s}\n", .{ args.debug_out.?, mp4.describe(e) });
         return 1;
     };
-    if (mp4_w) |*m| m.finish() catch |e| {
+    if (mp4_w) |*m| m.finish(args.max_frames != null) catch |e| {
         try err.print("vrestore: could not write '{s}': {s}\n", .{ args.mp4_out.?, mp4.describe(e) });
         return 1;
     };

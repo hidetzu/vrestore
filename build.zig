@@ -116,6 +116,7 @@ pub fn build(b: *std.Build) void {
     cli_unreliable_use.addFileArg(unreliable_json);
     cli_unreliable_use.addFileArg(steps_mp4);
     _ = cli_unreliable_use.captureStdOut(.{});
+    _ = cli_unreliable_use.captureStdErr(.{});
     cli_unreliable_use.expectExitCode(0);
     // --mask gradient の推定を --mask-out で画像に書き、--mask-image でそのまま読み戻せる。--frames で先頭だけ復元して止まる
     const cli_mask_out = b.addRunArtifact(exe);
@@ -125,6 +126,7 @@ pub fn build(b: *std.Build) void {
     cli_mask_out.addArg("--raw");
     _ = cli_mask_out.addOutputFileArg("mask-out.rgb");
     cli_mask_out.addFileArg(steps_mp4);
+    _ = cli_mask_out.captureStdErr(.{});
     cli_mask_out.addCheck(.{ .expect_stdout_match = "{\"frames\":2," });
     cli_mask_out.addCheck(.{ .expect_stdout_match = "\"mask\":\"gradient\"" });
     const cli_mask_image = b.addRunArtifact(exe);
@@ -169,6 +171,7 @@ pub fn build(b: *std.Build) void {
     const ramp_mp4 = ramp_out.addOutputFileArg("ramp-out.mp4");
     ramp_out.addFileArg(ramp);
     _ = ramp_out.captureStdOut(.{});
+    _ = ramp_out.captureStdErr(.{});
     const ramp_chk = b.addSystemCommand(&.{
         "sh", "-c",
         \\p=$(ffmpeg -i "$0" -i "$1" -lavfi "[0:v]crop=280:140:40:40,scale=in_range=auto:out_range=full,format=gbrp[a];[1:v]crop=280:140:40:40,scale=in_range=auto:out_range=full,format=gbrp[b];[a][b]psnr" -f null - 2>&1 | grep -o "average:[^ ]*" | cut -d: -f2)
@@ -193,6 +196,7 @@ pub fn build(b: *std.Build) void {
     const rot_out_mp4 = rot_out.addOutputFileArg("rotated-out.mp4");
     rot_out.addFileArg(rot_mp4);
     _ = rot_out.captureStdOut(.{});
+    _ = rot_out.captureStdErr(.{});
     const rot_chk = b.addSystemCommand(&.{
         "sh", "-c",
         \\r=$(ffprobe -v error -select_streams v -show_entries stream_side_data=rotation -of csv=p=0 "$0")
@@ -509,6 +513,8 @@ const RestoreCase = struct {
     temporal: []const u8 = "on",
     /// restore に足す引数
     extra: []const []const u8 = &.{},
+    /// restore の標準エラーに含まれるはずの文（null なら確かめない）
+    stderr_has: ?[]const u8 = null,
     /// true なら --mask を渡さず既定を確かめる（mask が null のケースは、既定が変わっても同じものを確かめるよう --mask none を渡す）
     default_mask: bool = false,
     /// tools/roi_fixture check-restore の条件
@@ -551,7 +557,7 @@ const restore_cases = [_]RestoreCase{
     .{ .roi = .{ .spec = "name=restore-cut-gradient,bg=cut,x=240,y=150,frames=60", .crf = 23 }, .fill = "harmonic", .mask = "gradient", .expect = "coverage<=0,mask_accepted>=1,ssim>=0.73,mask_trust.reliable>=1" },
     // 模様のある背景が動かない: 背景の輪郭も「どのフレームでも同じ勾配」なので、帯とおとりで信用しないと判定し、
     // auto に戻す（ADR 0020）。auto も見分けられず ROI 全体を埋める。実測: 帯 0.71、おとり 0.87
-    .{ .roi = .{ .spec = "name=restore-still-gradient,bg=pan,pan_x=0,pan_y=0,x=240,y=150,frames=60", .crf = 23 }, .fill = "harmonic", .mask = "gradient", .expect = "mask_trust.reliable<=0,mask_accepted<=0,provenance.spatial_inpainted.fraction>=1" },
+    .{ .roi = .{ .spec = "name=restore-still-gradient,bg=pan,pan_x=0,pan_y=0,x=240,y=150,frames=60", .crf = 23 }, .fill = "harmonic", .mask = "gradient", .stderr_has = "could not be trusted (ring, decoy), so --mask auto is used", .expect = "mask_trust.reliable<=0,mask_accepted<=0,provenance.spatial_inpainted.fraction>=1" },
     // 既定（--mask を渡さない）は gradient で、信用できれば使う
     .{ .roi = .{ .spec = "name=restore-cut-default,bg=cut,x=240,y=150,frames=60", .crf = 23 }, .fill = "harmonic", .default_mask = true, .expect = "coverage<=0,mask_trust.reliable>=1,ssim>=0.73" },
     // ROI がウォーターマークより 4 px 小さい（文字の外接矩形 241..383 x 151..201 を 4 px 縮めた）。はみ出した縁を借りず、
@@ -622,6 +628,7 @@ fn restoreCase(b: *std.Build, tool: *std.Build.Step.Compile, exe: *std.Build.Ste
     const prov = restore.addOutputFileArg("provenance.bin");
     restore.addFileArg(v.mp4);
     const restore_json = restore.captureStdOut(.{});
+    if (c.stderr_has) |m| restore.expectStdErrMatch(m);
     const restored_mkv = rawToFfv1(b, b.fmt("{s} encode restored", .{name}), out_rgb, "restored.mkv");
 
     const cmp = b.addRunArtifact(exe);
@@ -722,6 +729,25 @@ fn exportCase(b: *std.Build, tool: *std.Build.Step.Compile, exe: *std.Build.Step
     achk.addFileArg(out_mp4);
     achk.expectExitCode(0);
     chk.step.dependOn(&achk.step);
+
+    // --frames で途中まで書き出したら、音声もそこで止める（前は音声を最後まで写していた。60 フレーム中 30 で全体の約半分）
+    const part = b.addRunArtifact(exe);
+    part.setName(name ++ " restore --frames 30");
+    part.addArgs(&.{ "restore", "--frames", "30", "--roi" });
+    part.addFileArg(roi_json);
+    part.addArg("--out");
+    _ = part.addOutputFileArg("part.mp4");
+    part.addFileArg(with_audio);
+    const part_json = part.captureStdOut(.{});
+    _ = part.captureStdErr(.{});
+    const pchk = b.addRunArtifact(tool);
+    pchk.setName(name ++ " check --frames 30");
+    pchk.addArgs(&.{ "check-restore", name ++ "-part" });
+    pchk.addFileArg(part_json);
+    pchk.addFileArg(cmp_json);
+    pchk.addArg("out.frames<=30,out.audio.copied_packets>=100,out.audio.copied_packets<=160");
+    pchk.expectExitCode(0);
+    chk.step.dependOn(&pchk.step);
     return &chk.step;
 }
 
@@ -734,6 +760,7 @@ fn debugCase(b: *std.Build, tool: *std.Build.Step.Compile, exe: *std.Build.Step.
     const dbg_mp4 = run_mp4.addOutputFileArg("debug.mp4");
     run_mp4.addFileArg(v.mp4);
     _ = run_mp4.captureStdOut(.{});
+    _ = run_mp4.captureStdErr(.{});
     const chk_mp4 = b.addSystemCommand(&.{
         "sh", "-c",
         \\r=$(ffprobe -v error -count_frames -select_streams v -show_entries stream=width,height,nb_read_frames -of csv=p=0 "$0")
@@ -748,6 +775,7 @@ fn debugCase(b: *std.Build, tool: *std.Build.Step.Compile, exe: *std.Build.Step.
     const dbg_dir = run_png.addOutputDirectoryArg("debug");
     run_png.addFileArg(v.mp4);
     _ = run_png.captureStdOut(.{});
+    _ = run_png.captureStdErr(.{});
     const chk_png = b.addSystemCommand(&.{
         "sh", "-c",
         \\n=$(ls "$0" | grep -c '^frame-[0-9]\{6\}\.png$'); w=$(ffprobe -v error -show_entries stream=width -of csv=p=0 "$0/frame-000019.png")
