@@ -135,7 +135,7 @@ yuv420p の動画を `ffmpeg -vf crop` で切ると座標と大きさが偶数�
 | 実装しない | 理由 |
 |---|---|
 | 実写での Temporal Recovery の既定での使用（on） | 画面全体の動きで借りた画素は、実写では外れがある（疑似チェックで画面の端 8.0%、中央 1.5%）。既定は auto で、確かめを通った画素だけを採る（ADR 0017） |
-| 背景復元の Alpha Inversion / 生成 | Temporal と Spatial（推測、既定では行わない）だけ（[ADR 0005](adr/0005-temporal-recovery-copies-real-pixels-and-leaves-the-rest-unrecovered.md)、[ADR 0008](adr/0008-spatial-inpainting-is-opt-in-and-never-counted-as-recovered.md)） |
+| 背景復元の Alpha Inversion / 生成 | Temporal と Spatial（推測、既定では行わない）だけ（[ADR 0005](adr/0005-temporal-recovery-copies-real-pixels-and-leaves-the-rest-unrecovered.md)、[ADR 0008](adr/0008-spatial-inpainting-is-opt-in-and-never-counted-as-recovered.md)）。学習済みの埋め・α の逆算・遠い時刻の追跡は測って採らなかった（[ADR 0022](adr/0022-the-masked-region-stays-harmonic-learned-fills-alpha-inversion-and-long-range-tracking-are-not-added.md)） |
 | 1 枚のフレームからのマスク（MobileSAM）の本体への組み込み | 外のスクリプト（`scripts/sam-mask.py`）で作り `--mask-image` で渡す（ADR 0021）。実行時の依存（PyTorch / ONNX Runtime）を増やさない |
 | Temporal の被写体ごとの動き（ROI 周辺の block motion / optical flow） | 動きは画面全体の affine（ADR 0007）。手持ちの実写で戻らないのは、背景が窓の中で露出していないためで、局所的な動きを追っても戻らない（SPEC §4） |
 | ウォーターマークの自動発見 | 解く問題を「指定されたものの位置」に絞る |
@@ -521,6 +521,28 @@ none とほぼ同じ（差 −0.029〜+0.01）。そこで正解の形との差�
 | `--temporal on`（確かめの緩い画面全体の方式）で細い穴を借りる | 動きのある 42 ケースで実画素 0.07% → 3.8%、外れ平均 5.7%（最大 65%）、SSIM 0.852 → 0.851 |
 | 1 フレームの埋め方（TV・双調和） | 中ほどの 1 フレームで harmonic 0.9266、TV 0.9231。双調和は 21 ケースで SSIM 0.9235 → 0.9279 だが誤差 10.55 → 11.94 |
 | マスクを広げる（2 px、閾値 16、ヒステリシス）・埋める範囲だけ広げる | 84 ケースで 0.789 → 0.755〜0.779 |
+
+### マスクの中の復元: 学習済みモデル・α の逆算・遠い時刻（ADR 0022、採らなかった）
+
+2026-10-03〜08。マスクは正解の形 + 1 px（マスクの誤差とは分ける）。評価は先頭 40 フレーム（ProPainter と MI-GAN の最初の比較は 80）、
+ROI ± 64 px の切り出し。比較の相手は harmonic（`--stable-fill` と同じ落ち着かせ 0.3）。
+指標: PSNR / SSIM、LPIPS（AlexNet、マスクの外は正解に置き換え）、E_warp（マスクの中の時間方向の差。正解のフレームの RAFT small の flow で運び、
+往復のずれ > 1 px の画素は除く。harmonic はぼけて正解より小さくなるので、正解そのものの値を超えた分で読む）。
+探索 15（A の 5 分 6、止めた背景 3、720p の録画 3、人の動く区間 3）、確かめ 30（holdout2: A の 3 区間 × 図柄 6、止めた背景 6、録画 3、5 秒 3）。
+PyTorch 2.2.2（CPU、Rosetta 上の x86_64）と PyTorch 2.11 + CUDA 12.8（Linux、RTX 4070 12 GB。CLEAR・BootsTAPIR）。
+
+| 試したこと | 素材 | 結果 |
+|---|---|---|
+| ProPainter（非商用、評価だけ） | 探索 15、80 フレーム | SSIM 0.9661 → 0.9742、35.70 → 37.58 dB（上 10 / 15、最悪 −0.05 dB）。止めた背景でちらつき 0 → 0.194。CPU で harmonic の 38 倍の時間 |
+| MI-GAN（MIT）をフレームごと | 探索 15、80 フレーム | +0.26 dB、上 5 / 下 5、最悪 −1.70 dB |
+| MI-GAN を止まった背景だけ（MobileSAM のマスク） | 探索の止めた背景 19 | 35.57 → 34.99 dB、上 9 / 下 9、最悪 −10.65 dB |
+| 輪郭に沿ってつなぐ（OpenCV Telea / Navier–Stokes） | 探索 84、確かめ 30 | 誤差 11.30 → 11.76 / 11.93（悪い 58〜63 / 84）。細い線の誤差 39 → 40〜41 |
+| α の逆算（不透明度 0.5） | 探索 12、3 フレーム | 穴の中の誤差 harmonic 10.79 → 正解の α で逆算 28.04（上 3 / 12） |
+| MI-GAN を見た目の近さで比べ直す | 確かめ 30 | LPIPS −21%（23 / 30 で良い）、PSNR +0.06（最悪 −2.66）、E_warp の超過 0.01 → 9.76 |
+| MI-GAN の埋めを flow で次のフレームへ運ぶ（帯の差 > 4.0 で埋め直し） | 確かめ 30 | LPIPS −22%（27 / 30）、PSNR +0.15（最悪 −2.50、止めた背景）、E_warp の超過 0.01 → 3.69 |
+| CLEAR（Wan2.1-Fun-V1.1-1.3B-Control + LoRA、Apache-2.0）の出力をマスクの中だけ | 探索 6、41 フレーム、5 ステップ | PSNR は 6 / 6 で下（−1.23 〜 −22.89 dB）。止めた背景で LPIPS 0.028 → 0.449（文字を消さず色を変えた）。マスクの外も描き直す（帯の差 10〜17）。2.6 秒 / フレーム |
+| 点の追跡（BootsTAPIR、Apache-2.0）の上限: 正解の動画で、穴の中の点が 150 フレームのどこかで穴の外に見え、色が近い（≤ 12）割合 | 探索 15、確かめ 30 | 止めた背景・固定カメラの録画 0〜9%。動く素材 11〜100%（中央値 0.62 / 0.66）。±16 フレーム以内に限ると中央値 0.10 / 0.25。背景をパンさせた合成 0.96 |
+| 点の追跡で、帯の点を穴の中に来た時刻へ置く | 探索 3（上限 0.92〜1.00） | 入力で追跡: 置けたのは 0.03〜2.9%、外れ（> 32）27〜43%、PSNR −0.01〜−1.63 dB。harmonic で埋めてから追跡: 5〜17%、外れ 5〜42%、−0.43〜−3.0 dB。正解で追跡しても 61%、+0.11 dB、E_warp 3.11 → 22.01 |
 
 ### 埋めの落ち着かせ（`--stable-fill`、ADR 0015）
 
