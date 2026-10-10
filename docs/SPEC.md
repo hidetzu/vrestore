@@ -135,7 +135,7 @@ yuv420p の動画を `ffmpeg -vf crop` で切ると座標と大きさが偶数�
 | 実装しない | 理由 |
 |---|---|
 | 実写での Temporal Recovery の既定での使用（on） | 画面全体の動きで借りた画素は、実写では外れがある（疑似チェックで画面の端 8.0%、中央 1.5%）。既定は auto で、確かめを通った画素だけを採る（ADR 0017） |
-| 背景復元の Alpha Inversion / 生成 | Temporal と Spatial（推測、既定では行わない）だけ（[ADR 0005](adr/0005-temporal-recovery-copies-real-pixels-and-leaves-the-rest-unrecovered.md)、[ADR 0008](adr/0008-spatial-inpainting-is-opt-in-and-never-counted-as-recovered.md)）。学習済みの埋め・α の逆算・遠い時刻の追跡は測って採らなかった（[ADR 0022](adr/0022-the-masked-region-stays-harmonic-learned-fills-alpha-inversion-and-long-range-tracking-are-not-added.md)） |
+| 背景復元の Alpha Inversion / 生成 | Temporal と Spatial（推測、既定では行わない）だけ（[ADR 0005](adr/0005-temporal-recovery-copies-real-pixels-and-leaves-the-rest-unrecovered.md)、[ADR 0008](adr/0008-spatial-inpainting-is-opt-in-and-never-counted-as-recovered.md)）。汎用の学習済み inpainting・α の逆算・遠い時刻の追跡は測って採らなかった。動画ごとの自己教師の学習は評価中（[ADR 0022](adr/0022-pretrained-inpainting-alpha-inversion-and-long-range-tracking-are-not-added-per-video-learning-is-under-evaluation.md)） |
 | 1 枚のフレームからのマスク（MobileSAM）の本体への組み込み | 外のスクリプト（`scripts/sam-mask.py`）で作り `--mask-image` で渡す（ADR 0021）。実行時の依存（PyTorch / ONNX Runtime）を増やさない |
 | Temporal の被写体ごとの動き（ROI 周辺の block motion / optical flow） | 動きは画面全体の affine（ADR 0007）。手持ちの実写で戻らないのは、背景が窓の中で露出していないためで、局所的な動きを追っても戻らない（SPEC §4） |
 | ウォーターマークの自動発見 | 解く問題を「指定されたものの位置」に絞る |
@@ -522,7 +522,7 @@ none とほぼ同じ（差 −0.029〜+0.01）。そこで正解の形との差�
 | 1 フレームの埋め方（TV・双調和） | 中ほどの 1 フレームで harmonic 0.9266、TV 0.9231。双調和は 21 ケースで SSIM 0.9235 → 0.9279 だが誤差 10.55 → 11.94 |
 | マスクを広げる（2 px、閾値 16、ヒステリシス）・埋める範囲だけ広げる | 84 ケースで 0.789 → 0.755〜0.779 |
 
-### マスクの中の復元: 学習済みモデル・α の逆算・遠い時刻（ADR 0022、採らなかった）
+### マスクの中の復元: 学習済みモデル・α の逆算・遠い時刻・動画ごとの学習（ADR 0022）
 
 2026-10-03〜08。マスクは正解の形 + 1 px（マスクの誤差とは分ける）。評価は先頭 40 フレーム（ProPainter と MI-GAN の最初の比較は 80）、
 ROI ± 64 px の切り出し。比較の相手は harmonic（`--stable-fill` と同じ落ち着かせ 0.3）。
@@ -543,6 +543,21 @@ PyTorch 2.2.2（CPU、Rosetta 上の x86_64）と PyTorch 2.11 + CUDA 12.8（Lin
 | CLEAR（Wan2.1-Fun-V1.1-1.3B-Control + LoRA、Apache-2.0）の出力をマスクの中だけ | 探索 6、41 フレーム、5 ステップ | PSNR は 6 / 6 で下（−1.23 〜 −22.89 dB）。止めた背景で LPIPS 0.028 → 0.449（文字を消さず色を変えた）。マスクの外も描き直す（帯の差 10〜17）。2.6 秒 / フレーム |
 | 点の追跡（BootsTAPIR、Apache-2.0）の上限: 正解の動画で、穴の中の点が 150 フレームのどこかで穴の外に見え、色が近い（≤ 12）割合 | 探索 15、確かめ 30 | 止めた背景・固定カメラの録画 0〜9%。動く素材 11〜100%（中央値 0.62 / 0.66）。±16 フレーム以内に限ると中央値 0.10 / 0.25。背景をパンさせた合成 0.96 |
 | 点の追跡で、帯の点を穴の中に来た時刻へ置く | 探索 3（上限 0.92〜1.00） | 入力で追跡: 置けたのは 0.03〜2.9%、外れ（> 32）27〜43%、PSNR −0.01〜−1.63 dB。harmonic で埋めてから追跡: 5〜17%、外れ 5〜42%、−0.43〜−3.0 dB。正解で追跡しても 61%、+0.11 dB、E_warp 3.11 → 22.01 |
+
+動画ごとの自己教師の学習（評価中、ADR 0022）。2026-10-08〜10、Linux・RTX 4070・PyTorch 2.11。その動画だけで小さな U-Net（3 段、32〜128 ch）を学習する。
+穴と同じ形を穴の外にずらして置き、そこを当てる（損失はずらした穴のうち本物の穴の外だけ）。入力は −24・−8・0・+8・+24 フレーム（穴は 0）、
+穴、harmonic の埋め。出力は harmonic からの差。入力の先頭 150 フレーム、ROI ± 128 px から 128 px 四方、batch 8、10000 回、Adam 2e-4（cosine）。
+時間の項: t と t+1 を同じ穴で予測し、t+1 の出力を flow（入力の動画から RAFT large、穴の中は周りから補う）で t へ運び、穴の中の差の L1 を重み 0.5 で足す
+（往復のずれ > 1 px・運び先が切り出しの外の画素は除く。重みは探索 15 で 0.5 / 2 を比べて決めた）。推論は 1 フレームずつ。比較の相手は上と同じ harmonic。
+
+| 設定（確かめ 30） | 走らせ方 | LPIPS | PSNR 平均 | PSNR 最悪 | E_warp の超過（harmonic 0.01） | 止めた背景の超過 | 4 条件を通った |
+|---|---|---|---|---|---|---|---|
+| 時間の項なし | seed 0 / 1 / 2 と範囲 ± 96 / 160（5 通り） | −22.0% ± 3.9（改善 27〜30） | +0.78 ± 0.20 | −1.04 ± 0.28（−0.73 〜 −1.36） | 0.27 ± 0.15（0.01 〜 0.41） | 0.000 | 1 / 5 |
+| 時間の項 0.5 | seed 0 / 1 / 2 | −17.4% ± 5.7（改善 27〜30） | +0.78 ± 0.25 | −0.88 ± 0.73（−0.25 / −1.68 / −0.70） | 0.003（0.001 〜 0.005） | 0.000 | 2 / 3 |
+
+ばらつきの主因は seed（時間の項なしで PSNR の sd: seed 0.24、範囲 0.08）。ケースごとの PSNR の seed の間の sd は中央値 0.27 dB、最大 3.06 dB（時間の項 0.5）。
+時間の項 0.5 で seed 1 の最悪（録画、−1.68 dB、同じケースが seed 0 では +2.28 dB）は、穴の中にウォーターマークの文字の形がうっすら出た。
+学習は 1 ケース 340〜650 秒（2 本を同時に回したときは長い）。
 
 ### 埋めの落ち着かせ（`--stable-fill`、ADR 0015）
 
