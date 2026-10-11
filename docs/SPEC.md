@@ -135,7 +135,7 @@ yuv420p の動画を `ffmpeg -vf crop` で切ると座標と大きさが偶数�
 | 実装しない | 理由 |
 |---|---|
 | 実写での Temporal Recovery の既定での使用（on） | 画面全体の動きで借りた画素は、実写では外れがある（疑似チェックで画面の端 8.0%、中央 1.5%）。既定は auto で、確かめを通った画素だけを採る（ADR 0017） |
-| 背景復元の Alpha Inversion / 生成 | Temporal と Spatial（推測、既定では行わない）だけ（[ADR 0005](adr/0005-temporal-recovery-copies-real-pixels-and-leaves-the-rest-unrecovered.md)、[ADR 0008](adr/0008-spatial-inpainting-is-opt-in-and-never-counted-as-recovered.md)）。汎用の学習済み inpainting・α の逆算・遠い時刻の追跡は測って採らなかった。動画ごとの自己教師の学習は評価中（[ADR 0022](adr/0022-pretrained-inpainting-alpha-inversion-and-long-range-tracking-are-not-added-per-video-learning-is-under-evaluation.md)） |
+| 背景復元の Alpha Inversion / 生成 | Temporal と Spatial（推測、既定では行わない）だけ（[ADR 0005](adr/0005-temporal-recovery-copies-real-pixels-and-leaves-the-rest-unrecovered.md)、[ADR 0008](adr/0008-spatial-inpainting-is-opt-in-and-never-counted-as-recovered.md)）。汎用の学習済み inpainting・α の逆算・遠い時刻の追跡は測って採らなかった。動画ごとの自己教師の学習は、現方式が採用条件に届かず保留（[ADR 0022](adr/0022-pretrained-inpainting-alpha-inversion-and-long-range-tracking-are-not-added-per-video-learning-is-on-hold.md)） |
 | 1 枚のフレームからのマスク（MobileSAM）の本体への組み込み | 外のスクリプト（`scripts/sam-mask.py`）で作り `--mask-image` で渡す（ADR 0021）。実行時の依存（PyTorch / ONNX Runtime）を増やさない |
 | Temporal の被写体ごとの動き（ROI 周辺の block motion / optical flow） | 動きは画面全体の affine（ADR 0007）。手持ちの実写で戻らないのは、背景が窓の中で露出していないためで、局所的な動きを追っても戻らない（SPEC §4） |
 | ウォーターマークの自動発見 | 解く問題を「指定されたものの位置」に絞る |
@@ -544,7 +544,7 @@ PyTorch 2.2.2（CPU、Rosetta 上の x86_64）と PyTorch 2.11 + CUDA 12.8（Lin
 | 点の追跡（BootsTAPIR、Apache-2.0）の上限: 正解の動画で、穴の中の点が 150 フレームのどこかで穴の外に見え、色が近い（≤ 12）割合 | 探索 15、確かめ 30 | 止めた背景・固定カメラの録画 0〜9%。動く素材 11〜100%（中央値 0.62 / 0.66）。±16 フレーム以内に限ると中央値 0.10 / 0.25。背景をパンさせた合成 0.96 |
 | 点の追跡で、帯の点を穴の中に来た時刻へ置く | 探索 3（上限 0.92〜1.00） | 入力で追跡: 置けたのは 0.03〜2.9%、外れ（> 32）27〜43%、PSNR −0.01〜−1.63 dB。harmonic で埋めてから追跡: 5〜17%、外れ 5〜42%、−0.43〜−3.0 dB。正解で追跡しても 61%、+0.11 dB、E_warp 3.11 → 22.01 |
 
-動画ごとの自己教師の学習（評価中、ADR 0022）。2026-10-08〜10、Linux・RTX 4070・PyTorch 2.11。その動画だけで小さな U-Net（3 段、32〜128 ch）を学習する。
+動画ごとの自己教師の学習（現方式は採用条件に届かず保留、ADR 0022）。2026-10-08〜10、Linux・RTX 4070・PyTorch 2.11。その動画だけで小さな U-Net（3 段、32〜128 ch）を学習する。
 穴と同じ形を穴の外にずらして置き、そこを当てる（損失はずらした穴のうち本物の穴の外だけ）。入力は −24・−8・0・+8・+24 フレーム（穴は 0）、
 穴、harmonic の埋め。出力は harmonic からの差。入力の先頭 150 フレーム、ROI ± 128 px から 128 px 四方、batch 8、10000 回、Adam 2e-4（cosine）。
 時間の項: t と t+1 を同じ穴で予測し、t+1 の出力を flow（入力の動画から RAFT large、穴の中は周りから補う）で t へ運び、穴の中の差の L1 を重み 0.5 で足す
